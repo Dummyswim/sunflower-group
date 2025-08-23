@@ -1,0 +1,59 @@
+example to use
+Quick Backtest with NIFTY
+
+# Backtest NIFTY for last 30 days with daily data
+python backtest_runner.py NIFTY
+
+# Backtest with specific dates
+python backtest_runner.py NIFTY --start-date 2024-01-01 --end-date 2024-10-31
+
+# Backtest with intraday data (if available)
+python backtest_runner.py NIFTY --interval 5m --start-date 2024-10-01
+
+
+ Backtest Individual Stocks
+ # Backtest Reliance
+python backtest_runner.py RELIANCE --interval 1d --start-date 2024-06-01
+
+# Backtest TCS with 15-minute data
+python backtest_runner.py TCS --interval 15m
+
+# Backtest multiple stocks
+for stock in RELIANCE TCS INFY HDFCBANK; do
+    python backtest_runner.py $stock --interval 1d
+done
+
+
+Advanced Backtesting
+# Full backtesting with detailed logging
+python backtest_runner.py BANKNIFTY \
+    --start-date 2024-01-01 \
+    --end-date 2024-10-31 \
+    --interval 1h \
+    --output-dir results/banknifty \
+    --log-level DEBUG
+
+
+Key Features:
+Multiple Data Sources
+Automatic fallback between nsepy, yfinance, and jugaad-data
+Caching to avoid repeated downloads
+Synthetic data generation for testing
+Comprehensive Backtesting
+Pattern detection accuracy tracking
+Confidence-based performance analysis
+Direction-specific accuracy (bullish vs bearish)
+Detailed Reporting
+JSON reports with all metrics
+Pattern-specific performance tracking
+High-confidence prediction analysis
+NSE-Specific Support
+Handles both indices (NIFTY, BANKNIFTY) and equities
+Automatic symbol mapping for different data sources
+Market hours filtering for intraday data
+Performance Metrics
+Overall prediction accuracy
+Win rate analysis
+Pattern hit-rate evolution
+Confidence correlation with accuracy
+The system will automatically fetch historical data from NSE (using available free sources), run the pattern recognition backtest, and provide comprehensive results including accuracy metrics and pattern performance statistics.

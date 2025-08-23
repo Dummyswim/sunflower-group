@@ -1,0 +1,456 @@
+📘 Usage Examples
+1. Basic System Startup
+bash
+
+
+# Set environment variables
+export DHAN_TOKEN_B64="your_base64_encoded_token"
+export DHAN_CLIENT_B64="your_base64_encoded_client_id"
+export TELEGRAM_TOKEN_B64="your_base64_encoded_bot_token"
+export TELEGRAM_CHAT_ID="your_telegram_chat_id"
+
+# Start the trading system
+python main.py
+2. Running with Custom Configuration
+python
+
+
+# custom_run.py - Run with modified settings
+import os
+import sys
+from pathlib import Path
+
+# Set custom configuration
+os.environ['MIN_SIGNAL_STRENGTH'] = '0.7'  # Increase minimum signal strength
+os.environ['COOLDOWN_SECONDS'] = '600'     # 10 minute cooldown
+os.environ['MIN_CONFIDENCE'] = '75'        # Higher confidence threshold
+
+# Import and run main
+from main import main
+main()
+3. Historical Backtesting
+bash
+
+
+# Run backtest with validation
+python historical_data.py \
+    --timeframe daily \
+    --from 2024-01-01 \
+    --to 2024-12-01 \
+    --validate \
+    --charts \
+    --output reports/backtest_2024.csv
+
+# Test specific indicator combinations
+python historical_data.py \
+    --indicators ichimoku,adx,bollinger \
+    --weights 0.4,0.3,0.3 \
+    --test-mode
+4. Signal Validation Testing
+python
+
+
+# test_signals.py - Test signal validation
+from signal_validator import SignalValidator
+from config import CONFIG
+import pandas as pd
+
+# Create test data
+test_df = pd.DataFrame({
+    'close': [19800, 19850, 19900, 19880, 19920],
+    'volume': [1000000, 1200000, 1500000, 1100000, 1300000]
+})
+
+# Initialize validator
+validator = SignalValidator(CONFIG)
+
+# Test signal
+test_signal = {
+    'composite_signal': 'STRONG BUY',
+    'weighted_score': 0.75,
+    'confidence': 80,
+    'active_indicators': 5
+}
+
+# Validate
+is_valid, details = validator.validate_signal(test_signal, test_df, {})
+print(f"Valid: {is_valid}")
+print(f"Details: {details}")
+5. Generate Performance Report
+bash
+
+
+# Generate HTML report with charts
+python generate_report.py \
+    --input data/ \
+    --output reports/performance.html \
+    --include-charts \
+    --date-range 30
+
+# Quick system health check
+python health_check.py --verbose
+📊 Enhanced System Flowchart
+mermaid
+
+
+flowchart TD
+    Start([🚀 System Start]) --> EnvCheck{Check Environment Variables}
+    EnvCheck -->|Missing| ErrorExit[❌ Exit with Error]
+    EnvCheck -->|Valid| InitConfig[Load CONFIG]
+    
+    InitConfig --> ValidateConfig{Validate Configuration}
+    ValidateConfig -->|Invalid| ErrorExit
+    ValidateConfig -->|Valid| InitLogging[Setup Logging]
+    
+    InitLogging --> InitTelegram[Initialize Telegram Bot]
+    InitTelegram --> TestTelegram{Test Telegram Connection}
+    TestTelegram -->|Failed| WarnContinue[⚠️ Warning & Continue]
+    TestTelegram -->|Success| SendStartup[📨 Send Startup Message]
+    
+    WarnContinue --> InitMonitor
+    SendStartup --> InitMonitor[Initialize Signal Monitor]
+    InitMonitor --> StartMonitorThread[Start Monitor Thread]
+    
+    StartMonitorThread --> InitWebSocket[Initialize WebSocket Client]
+    InitWebSocket --> ConnectWS{Connect to Dhan WebSocket}
+    ConnectWS -->|Failed| RetryLogic{Retry with Backoff?}
+    RetryLogic -->|Max Retries| ErrorNotify[Send Error to Telegram]
+    ErrorNotify --> ErrorExit
+    RetryLogic -->|Retry| ConnectWS
+    
+    ConnectWS -->|Success| Subscribe[Subscribe to NIFTY50]
+    Subscribe --> StartHeartbeat[Start Heartbeat Thread]
+    StartHeartbeat --> StartHealthMonitor[Start Health Monitor Thread]
+    
+    StartHealthMonitor --> DataLoop[📊 Data Reception Loop]
+    
+    DataLoop --> ReceivePacket[Receive Market Data Packet]
+    ReceivePacket --> ParsePacket{Parse Packet Type}
+    
+    ParsePacket -->|16 bytes| TickPacket[Parse Tick Data]
+    ParsePacket -->|32 bytes| DetailedPacket[Parse Detailed Data]
+    ParsePacket -->|JSON| JSONPacket[Parse JSON Data]
+    ParsePacket -->|Unknown| DropPacket[Drop Unknown Packet]
+    
+    TickPacket --> ValidatePrice{Price Sanity Check}
+    DetailedPacket --> ValidatePrice
+    JSONPacket --> ValidatePrice
+    DropPacket --> DataLoop
+    
+    ValidatePrice -->|Invalid| LogWarning[Log Warning]
+    LogWarning --> DataLoop
+    ValidatePrice -->|Valid| AddToBuffer[Add to Tick Buffer]
+    
+    AddToBuffer --> CheckMinute{New Minute?}
+    CheckMinute -->|No| DataLoop
+    CheckMinute -->|Yes| CreateCandle[Create OHLCV Candle]
+    
+    CreateCandle --> CheckDataPoints{≥ MIN_DATA_POINTS?}
+    CheckDataPoints -->|No| ShowProgress[Show Progress]
+    ShowProgress --> DataLoop
+    CheckDataPoints -->|Yes| CalcIndicators[Calculate All 6 Indicators]
+    
+    CalcIndicators --> Parallel{Parallel Calculation}
+    Parallel --> Ichimoku[📊 Ichimoku Cloud]
+    Parallel --> Stochastic[📊 Stochastic]
+    Parallel --> OBV[📊 OBV]
+    Parallel --> Bollinger[📊 Bollinger Bands]
+    Parallel --> ADX[📊 ADX]
+    Parallel --> ATR[📊 ATR]
+    
+    Ichimoku --> MergeResults[Merge Indicator Results]
+    Stochastic --> MergeResults
+    OBV --> MergeResults
+    Bollinger --> MergeResults
+    ADX --> MergeResults
+    ATR --> MergeResults
+    
+    MergeResults --> GenerateSignal[Generate Weighted Signal]
+    GenerateSignal --> ValidateSignal[🛡️ Validate Signal]
+    
+    ValidateSignal --> ValidationChecks{Multi-Factor Validation}
+    ValidationChecks --> VolumeCheck[Volume Confirmation]
+    ValidationChecks --> TrendCheck[Trend Alignment]
+    ValidationChecks --> VolatilityCheck[Volatility Check]
+    ValidationChecks --> DivergenceCheck[Divergence Check]
+    ValidationChecks --> SupportResistance[S/R Levels]
+    
+    VolumeCheck --> ValidationScore[Calculate Validation Score]
+    TrendCheck --> ValidationScore
+    VolatilityCheck --> ValidationScore
+    DivergenceCheck --> ValidationScore
+    SupportResistance --> ValidationScore
+    
+    ValidationScore --> IsValid{Valid Signal?}
+    IsValid -->|No| LogRejection[Log Rejection Reasons]
+    LogRejection --> DataLoop
+    
+    IsValid -->|Yes| PredictDuration[⏱️ Predict Signal Duration]
+    PredictDuration --> CheckAlertCriteria{Check Alert Criteria}
+    
+    CheckAlertCriteria --> StrengthCheck{Signal Strength ≥ MIN?}
+    StrengthCheck -->|No| DataLoop
+    StrengthCheck -->|Yes| ConfidenceCheck{Confidence ≥ MIN?}
+    ConfidenceCheck -->|No| DataLoop
+    ConfidenceCheck -->|Yes| IndicatorCheck{Active Indicators ≥ MIN?}
+    IndicatorCheck -->|No| DataLoop
+    IndicatorCheck -->|Yes| CooldownCheck{Cooldown Active?}
+    CooldownCheck -->|Yes| DataLoop
+    
+    CooldownCheck -->|No| GenerateChart{Generate Chart?}
+    GenerateChart -->|Disabled| FormatAlert
+    GenerateChart -->|Enabled| CreateChart[📈 Create Technical Chart]
+    CreateChart --> SaveChart[Save Chart Image]
+    SaveChart --> FormatAlert[Format Alert Message]
+    
+    FormatAlert --> SendTelegram[📨 Send Telegram Alert]
+    SendTelegram --> UpdateMonitor[Update Signal Monitor]
+    UpdateMonitor --> UpdateHistory[Update Alert History]
+    UpdateHistory --> DataLoop
+    
+    DataLoop --> HealthCheck{Health Check Due?}
+    HealthCheck -->|No| DataLoop
+    HealthCheck -->|Yes| CheckHealth[Check System Health]
+    CheckHealth --> Healthy{System Healthy?}
+    Healthy -->|No| RestartComponent[Restart Unhealthy Component]
+    RestartComponent --> DataLoop
+    Healthy -->|Yes| LogMetrics[Log Performance Metrics]
+    LogMetrics --> DataLoop
+    
+    DataLoop --> Shutdown{Shutdown Signal?}
+    Shutdown -->|No| DataLoop
+    Shutdown -->|Yes| Cleanup[Cleanup Resources]
+    Cleanup --> SendStats[Send Session Statistics]
+    SendStats --> End([🛑 System Stop])
+📁 Complete File Hierarchy
+text
+
+
+enhanced_trading_system/
+├── 📄 main.py                        # Entry point with health monitoring
+├── 📄 config.py                      # Unified configuration with CONFIG instance
+├── 📄 websocket_client.py            # Enhanced WebSocket with 6 indicators
+├── 📄 signal_monitor.py              # Signal tracking and performance monitoring
+├── 📄 technical_indicators.py        # All 6 indicator calculations
+├── 📄 signal_prediction.py           # Duration prediction system
+├── 📄 signal_validator.py            # Multi-factor signal validation
+├── 📄 chart_generator.py             # Technical analysis chart generation
+├── 📄 telegram_bot.py                # Alert notifications with charts
+├── 📄 logging_setup.py               # Centralized logging configuration
+├── 📄 historical_data.py             # Backtesting functionality
+├── 📄 health_check.py                # System health monitoring utility
+├── 📄 generate_report.py             # Performance report generator
+├── 📄 requirements.txt               # Python dependencies
+├── 📄 .env.example                   # Environment variables template
+├── 📄 README.md                      # Documentation
+│
+├── 📁 logs/                          # Log files directory
+│   ├── trading_system.log           # Main system log
+│   ├── backtest.log                 # Backtesting log
+│   └── error.log                    # Error-specific log
+│
+├── 📁 images/                        # Generated charts
+│   ├── 📁 signals/                  # Signal charts
+│   │   └── signal_YYYYMMDD_HHMMSS.png
+│   └── 📁 reports/                  # Report charts
+│       └── performance_chart.png
+│
+├── 📁 data/                          # Data storage
+│   ├── 📁 candles/                  # Historical candle data
+│   │   └── nifty50_candles.csv
+│   ├── 📁 signals/                  # Signal history
+│   │   └── signals_history.json
+│   └── 📁 backtest/                 # Backtest results
+│       └── backtest_results.csv
+│
+├── 📁 reports/                       # Generated reports
+│   ├── performance.html             # HTML performance report
+│   ├── backtest_2024.csv           # Backtest results
+│   └── daily_summary.pdf           # Daily summary report
+│
+└── 📁 tests/                         # Unit tests
+    ├── test_indicators.py            # Indicator tests
+    ├── test_validator.py             # Validator tests
+    └── test_signals.py               # Signal generation tests
+📨 Expected Alert Outputs
+1. Strong Buy Signal Alert
+text
+
+
+🚀 STRONG BUY SIGNAL
+━━━━━━━━━━━━━━━━━━━
+💰 Price: ₹19,845.50
+📊 Score: 0.825 (82.5%)
+🎯 Confidence: 87.5%
+✅ Active Indicators: 6/6
+
+⏱️ SIGNAL DURATION FORECAST:
+• Expected Duration: 8 candles
+• Confidence Level: HIGH (78.2%)
+• Strength Decay: -8.5%/candle
+• Validity Window: 5-12 candles
+
+📊 INDICATOR BREAKDOWN:
+• Ichimoku: BULLISH (0.18/0.20)
+• Stochastic: BUY (0.12/0.15)
+• OBV: POSITIVE (0.13/0.15)
+• Bollinger: OVERSOLD (0.14/0.15)
+• ADX: STRONG TREND (0.17/0.20)
+• ATR: NORMAL VOL (0.09/0.15)
+
+🎯 KEY LEVELS:
+• Resistance: ₹19,950.00
+• Support: ₹19,750.00
+• Stop Loss: ₹19,680.00
+• Target 1: ₹19,920.00
+• Target 2: ₹20,050.00
+
+📈 MARKET DYNAMICS:
+✅ Volume Confirmation: YES
+✅ Trend Alignment: BULLISH
+✅ Volatility: FAVORABLE
+⚠️ Near Resistance: 105 points
+
+⏰ Time: 10:35:42 IST
+
+[Technical Chart Attached]
+2. Sell Signal with Warning
+text
+
+
+🔴 SELL SIGNAL
+━━━━━━━━━━━━━━━━━━━
+💰 Price: ₹20,125.75
+📊 Score: -0.65 (65.0%)
+🎯 Confidence: 72.3%
+✅ Active Indicators: 5/6
+
+⏱️ SIGNAL DURATION FORECAST:
+• Expected Duration: 5 candles
+• Confidence Level: MEDIUM (65.0%)
+• Strength Decay: -12.0%/candle
+• Validity Window: 3-7 candles
+
+⚠️ VALIDATION WARNINGS:
+• Volume below average (-15%)
+• ADX showing weak trend
+• Possible support at ₹20,050
+
+📊 INDICATOR CONSENSUS:
+• BEARISH: 4 indicators
+• NEUTRAL: 1 indicator
+• BULLISH: 1 indicator
+
+💡 RECOMMENDATION:
+Consider partial position due to
+mixed signals and nearby support.
+
+⏰ Time: 14:22:15 IST
+3. Crossover Alert
+text
+
+
+🔄 GOLDEN CROSS DETECTED
+━━━━━━━━━━━━━━━━━━━
+📍 Crossover Type: Ichimoku Cloud
+💰 Price: ₹19,680.25
+📈 Tenkan crosses above Kijun
+
+📊 SIGNAL STRENGTH:
+• Primary Signal: BUY
+• Score: 0.71
+• Confidence: 75.8%
+
+⏱️ HISTORICAL ACCURACY:
+• This pattern: 78% success
+• Avg gain: +2.3% (10 candles)
+• Best timeframe: 8-15 candles
+
+🎯 SUGGESTED ACTION:
+Monitor for confirmation in next
+2-3 candles before entry.
+
+⏰ Time: 11:45:30 IST
+4. Signal Invalidation Alert
+text
+
+
+⚠️ SIGNAL REJECTED
+━━━━━━━━━━━━━━━━━━━
+Signal Type: BUY
+Score: 0.58 (Below threshold)
+
+❌ VALIDATION FAILED:
+• Bearish divergence detected
+• Volume not confirming move
+• Too close to resistance
+• Extreme volatility (ATR spike)
+
+📊 FAILED CHECKS: 4/7
+• ❌ Volume Confirmation
+• ✅ Trend Alignment  
+• ❌ Volatility Check
+• ❌ Divergence Check
+• ❌ Support/Resistance
+• ✅ Momentum Quality
+• ✅ Signal Consistency
+
+💡 Wait for better setup
+
+⏰ Time: 13:15:22 IST
+5. Performance Report (Periodic)
+text
+
+
+📊 PERFORMANCE REPORT
+━━━━━━━━━━━━━━━━━━━
+Period: Last 50 Signals
+
+📈 SIGNAL STATISTICS:
+• Total Signals: 50
+• Strong Signals: 12
+• Buy Signals: 28
+• Sell Signals: 22
+
+✅ ACCURACY METRICS:
+• Overall: 74.0%
+• Strong Signals: 83.3%
+• Buy Accuracy: 71.4%
+• Sell Accuracy: 77.3%
+
+⏱️ DURATION ACCURACY:
+• Within Range: 68%
+• Avg Deviation: ±2.3 candles
+• Best Predictor: ADX signals
+
+🏆 TOP PERFORMERS:
+1. Ichimoku: 78% accuracy
+2. ADX: 76% accuracy
+3. Bollinger: 72% accuracy
+
+📊 System Health: OPTIMAL
+⏰ Updated: 15:30:00 IST
+6. Market Condition Alert
+text
+
+
+⚡ MARKET CONDITION CHANGE
+━━━━━━━━━━━━━━━━━━━
+Previous: TRENDING
+Current: CHOPPY/WHIPSAW
+
+⚠️ DETECTED PATTERNS:
+• 7 signal changes in 10 candles
+• Increased false signals
+• Volatility spike detected
+
+📊 ADJUSTED PARAMETERS:
+• MIN_SIGNAL_STRENGTH: 0.7→0.8
+• COOLDOWN: 300s→600s
+• Required confirmations: 2→3
+
+💡 RECOMMENDATION:
+Reduce position sizes and wait
+for clearer market direction.
+
+⏰ Time: 10:00:45 IST

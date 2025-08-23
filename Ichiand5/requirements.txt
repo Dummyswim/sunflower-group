@@ -1,0 +1,107 @@
+websocket-client==1.6.4
+pandas==2.1.3
+numpy==1.24.3
+TA-Lib==0.4.28
+scipy==1.11.4
+requests==2.31.0
+python-dotenv==1.0.0
+matplotlib==3.8.1
+seaborn==0.13.0
+argparse
+
+
+Key Enhancements Made:
+All 6 Technical Indicators Integrated 
+:
+Ichimoku Cloud for trend analysis
+Stochastic Oscillator for momentum
+On-Balance Volume for volume trends
+Bollinger Bands for volatility
+ADX for trend strength
+ATR for risk management
+Robust Weighted Signal System:
+Configurable weights for each indicator
+Minimum 4 indicators must agree for alerts
+Confidence scoring system
+Consecutive signal tracking
+Enhanced Error Handling:
+Comprehensive try-catch blocks
+Detailed logging at all levels
+Packet validation and sanity checks
+Graceful reconnection logic
+Performance Optimizations:
+Efficient data structures (deque for buffers)
+Vectorized calculations using NumPy
+Processing time tracking
+Memory-efficient candle storage
+Strong Signal Alerts to Telegram:
+Clear formatted messages with emojis
+Individual indicator analysis
+Risk management suggestions
+Crossover detection
+Signal persistence tracking
+Best Practices Implementation:
+Modular design with separation of concerns
+Configuration externalized
+Environment variable usage for credentials
+Comprehensive logging
+Thread-safe operations
+The system now monitors all 6 indicators simultaneously, calculates weighted signals, and sends clear alerts to Telegram when strong buy/sell conditions are met based on the consensus of multiple indicators.
+
+
+
+
+########################
+
+Key Features of the Historical Data Module:
+1. Command-Line Interface:
+Accepts arguments for timeframe (daily/minute)
+Customizable date ranges
+Output options for CSV files
+Backtest capability flag
+2. Multiple Timeframes Supported:
+Intraday: 1min, 5min, 15min, 25min, 60min (last 5 trading days)
+Daily: Full historical data from inception
+Weekly/Monthly: For longer-term analysis
+3. Comprehensive Backtesting:
+Uses all 6 technical indicators
+Calculates performance metrics (Sharpe ratio, drawdown, etc.)
+Generates detailed reports
+Tracks equity curve and trades
+4. Data Validation:
+Date range validation
+Automatic adjustment for intraday limits (5 days max) Price sanity checks
+Error handling for API failures
+5. Integration Features:
+Works with existing indicator modules
+Telegram notifications for results
+CSV export for further analysis
+Detailed logging throughout
+6. Performance Metrics:
+Total return calculation
+Sharpe ratio for risk-adjusted returns
+Maximum drawdown analysis
+Win rate and trade statistics
+Signal effectiveness analysis
+7. Report Generation:
+Console output for quick viewing
+File output for documentation
+Telegram messages for remote monitoring
+CSV exports for Excel/data analysis
+Usage Instructions:
+Basic daily data fetch:
+bash
+
+
+python historical_data.py --timeframe daily --from 2023-01-01 --to 2024-01-01
+Minute data with output:
+bash
+
+
+python historical_data.py --timeframe 1min --from 2024-01-25 --to 2024-01-30 --output nifty_minutes.csv
+Run backtest with report:
+bash
+
+
+python historical_data.py --timeframe daily --from 2023-01-01 --to 2024-01-01 --backtest --telegram
+The module seamlessly integrates with your existing system, using the same configuration and indicator calculations, while providing powerful historical data analysis and backtesting capabilities for strategy validation

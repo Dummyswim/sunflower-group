@@ -1,0 +1,1 @@
+Recognize candle pattern and predict next candles
