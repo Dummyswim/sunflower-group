@@ -1,0 +1,15 @@
+# Ignore all log files
+*.log
+*.txt
+flowchart
+CandelPatterns/descript.txt
+
+
+# Optional: ignore log directories if you store them
+logs/
+log/
+images/
+images/*.png
+charts/
+__pycache__/
+backup

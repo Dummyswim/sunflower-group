@@ -59,9 +59,16 @@ class PredictionEngine:
             self.momentum_weight * momentum_score +
             self.volume_weight * volume_score
         )
+        logger.info(f"Pre-ATR score: {total_score:.3f}, ATR ratio: {atr_ratio:.3f}")
         
-        # Apply volatility adjustment
-        total_score *= atr_ratio
+        # Consider not multiplying, but adjusting instead
+        if atr_ratio < 0.5:  # Very low volatility
+            total_score *= 0.8
+        elif atr_ratio > 1.5:  # High volatility
+            total_score *= 1.2
+                    
+        # # Apply volatility adjustment
+        # total_score *= atr_ratio
         
         # Support/resistance adjustment
         sr_adjustment = self._calculate_sr_adjustment(support_resistance, total_score)
@@ -84,38 +91,63 @@ class PredictionEngine:
         }
         
         return prediction
-    
+
     def _calculate_pattern_score(self, patterns: List[Dict]) -> float:
-        """Calculate weighted score from pattern detections."""
         if not patterns:
             return 0.0
         
-        score = 0.0
-        total_weight = 0.0
+        bullish_score = 0.0
+        bearish_score = 0.0
         
         for pattern in patterns:
-            # Weight by confidence and strength
-            weight = pattern["confidence"] * pattern["strength"]
+            confidence = pattern["confidence"]
+            strength = pattern["strength"]
+            weight = confidence * strength
             
-            # Adjust for pattern type
-            if pattern["type"] == "reversal":
-                weight *= 1.2  # Reversals are stronger signals
-            elif pattern["type"] == "continuation":
-                weight *= 0.8  # Continuations are weaker
-            
-            # Add to score based on direction
             if pattern["direction"] == "bullish":
-                score += weight * (pattern["prior"] - 0.5)
+                bullish_score += weight
             else:
-                score -= weight * (pattern["prior"] - 0.5)
+                bearish_score += weight
+        
+        # Return net directional bias
+        total = bullish_score + bearish_score
+        if total > 0:
+            return (bullish_score - bearish_score) / total
+        return 0.0
+
+    
+    # def _calculate_pattern_score(self, patterns: List[Dict]) -> float:
+    #     """Calculate weighted score from pattern detections."""
+    #     if not patterns:
+    #         return 0.0
+        
+    #     score = 0.0
+    #     total_weight = 0.0
+        
+    #     for pattern in patterns:
+    #         # Weight by confidence and strength
+    #         weight = pattern["confidence"] * pattern["strength"]
             
-            total_weight += weight
+    #         # Adjust for pattern type
+    #         if pattern["type"] == "reversal":
+    #             weight *= 1.2  # Reversals are stronger signals
+    #         elif pattern["type"] == "continuation":
+    #             weight *= 0.8  # Continuations are weaker
+            
+    #         # Use theoretical_prob or confidence as the prior
+    #         prior = pattern.get("theoretical_prob", pattern.get("confidence", 0.5))
+    #         if pattern["direction"] == "bullish":
+    #             score += weight * (prior - 0.5)
+    #         else:
+    #             score -= weight * (prior - 0.5)            
+            
+    #         total_weight += weight
         
-        # Normalize
-        if total_weight > 0:
-            score /= total_weight
+    #     # Normalize
+    #     if total_weight > 0:
+    #         score /= total_weight
         
-        return np.clip(score, -1, 1)
+    #     return np.clip(score, -1, 1)
     
     def _calculate_momentum_score(self, momentum: float) -> float:
         """Convert momentum to normalized score."""

@@ -1,5 +1,6 @@
 """
 Signal monitoring module - complete implementation.
+Fixed version without encoding issues.
 """
 import logging
 import threading
@@ -62,19 +63,16 @@ class SignalMonitor:
         """Main monitoring loop."""
         while self.running:
             try:
-                # Update health status
                 self.last_health_check = datetime.now()
                 
-                # Periodic analysis
                 self._analyze_signal_performance()
                 self._check_signal_patterns()
                 self._cleanup_old_signals()
                 
-                # Send periodic report
                 if len(self.signal_history) > 0 and len(self.signal_history) % 50 == 0:
                     self._send_performance_report()
                 
-                time.sleep(60)  # Check every minute
+                time.sleep(60)
                 
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
@@ -85,17 +83,12 @@ class SignalMonitor:
         """Add a new signal to tracking."""
         with self._lock:
             try:
-                # Add timestamp if not present
                 if 'timestamp' not in signal_data:
                     signal_data['timestamp'] = datetime.now()
                 
-                # Add to history
                 self.signal_history.append(signal_data)
-                
-                # Update metrics
                 self.performance_metrics['total_signals'] += 1
                 
-                # Categorize signal
                 signal_type = signal_data.get('signal_type', '').upper()
                 if 'STRONG' in signal_type:
                     self.performance_metrics['strong_signals'] += 1
@@ -118,10 +111,8 @@ class SignalMonitor:
                 
                 recent_signals = list(self.signal_history)[-50:]
                 
-                # Calculate success rate (simplified)
                 successful = 0
                 for i, signal in enumerate(recent_signals[:-5]):
-                    # Check if signal was followed by favorable price movement
                     if 'price' in signal and i + 5 < len(recent_signals):
                         future_signal = recent_signals[i + 5]
                         if 'price' in future_signal:
@@ -134,7 +125,6 @@ class SignalMonitor:
                                 if price_change < 0:
                                     successful += 1
                 
-                # Update accuracy
                 if len(recent_signals) > 5:
                     self.performance_metrics['successful_signals'] = successful
                     self.performance_metrics['failed_signals'] = len(recent_signals) - 5 - successful
@@ -154,16 +144,15 @@ class SignalMonitor:
                 
                 recent = list(self.signal_history)[-10:]
                 
-                # Check for rapid signal changes (whipsawing)
                 signal_types = [s.get('signal_type', '') for s in recent]
                 changes = sum(1 for i in range(1, len(signal_types)) 
                              if signal_types[i] != signal_types[i-1])
                 
-                if changes > 7:  # Too many changes
+                if changes > 7:
                     logger.warning("Whipsaw pattern detected in signals")
                     if self.telegram_bot:
                         self.telegram_bot.send_message(
-                            "⚠️ <b>Market Alert</b>\n"
+                            "[WARNING] Market Alert\n"
                             "Whipsaw pattern detected - signals changing rapidly.\n"
                             "Consider waiting for clearer trend."
                         )
@@ -182,14 +171,14 @@ class SignalMonitor:
             metrics = self.get_metrics()
             
             message = (
-                "📊 <b>Signal Performance Report</b>\n"
-                "━━━━━━━━━━━━━━━━━━━\n"
-                f"📈 Total Signals: {metrics['total_signals']}\n"
-                f"💪 Strong Signals: {metrics['strong_signals']}\n"
-                f"🟢 Buy Signals: {metrics['buy_signals']}\n"
-                f"🔴 Sell Signals: {metrics['sell_signals']}\n"
-                f"✅ Accuracy: {metrics['accuracy']:.1f}%\n"
-                f"⏰ Updated: {metrics['last_update'].strftime('%H:%M:%S')}"
+                "[REPORT] Signal Performance Report\n"
+                "=" * 30 + "\n"
+                f"Total Signals: {metrics['total_signals']}\n"
+                f"Strong Signals: {metrics['strong_signals']}\n"
+                f"Buy Signals: {metrics['buy_signals']}\n"
+                f"Sell Signals: {metrics['sell_signals']}\n"
+                f"Accuracy: {metrics['accuracy']:.1f}%\n"
+                f"Updated: {metrics['last_update'].strftime('%H:%M:%S')}"
             )
             
             if self.telegram_bot:
@@ -201,14 +190,12 @@ class SignalMonitor:
     def is_healthy(self) -> bool:
         """Check if monitor is healthy."""
         try:
-            # Check if thread is alive
             if not self.running or not self.monitor_thread or not self.monitor_thread.is_alive():
                 self.health_status = "STOPPED"
                 return False
             
-            # Check last health check time
             time_since_check = (datetime.now() - self.last_health_check).seconds
-            if time_since_check > 300:  # More than 5 minutes
+            if time_since_check > 300:
                 self.health_status = "STALE"
                 return False
             

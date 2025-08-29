@@ -1,5 +1,6 @@
 """
-Main application with all references properly defined.
+Main application entry point for 5-minute candle trading system.
+All encoding issues fixed, removed indicator references updated.
 """
 import os
 import sys
@@ -132,8 +133,8 @@ def main():
         logger = logging.getLogger(__name__)
         
         logger.info("=" * 60)
-        logger.info("🚀 ENHANCED NIFTY50 TRADING SYSTEM V2.0")
-        logger.info("📊 6 Technical Indicators with Signal Validation")
+        logger.info("ENHANCED NIFTY50 TRADING SYSTEM V2.0")
+        logger.info("5 Technical Indicators: RSI, MACD, VWAP, Bollinger, OBV")
         logger.info("=" * 60)
         
         # Validate environment
@@ -157,20 +158,22 @@ def main():
             CONFIG.telegram_chat_id
         )
         
-        # Format startup message with all required variables defined
+        # Format startup message
         cooldown = CONFIG.COOLDOWN_SECONDS
         strength = CONFIG.MIN_SIGNAL_STRENGTH  
         confidence = CONFIG.MIN_CONFIDENCE
         
         startup_message = (
-            "🚀 <b>Enhanced Trading System V2.0</b>\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            "📊 Indicators: Ichimoku, Stochastic, OBV, Bollinger, ADX, ATR\n"
-            "✅ Signal Validation: Enabled\n"
-            "📈 Charts: Enabled\n"
-            f"⏱️ Alert Cooldown: {cooldown}s\n"
-            f"💪 Min Signal Strength: {strength}\n"
-            f"🎯 Min Confidence: {confidence}%"
+            "<b>Enhanced Trading System V2.0</b>\n"
+            "=" * 30 + "\n"
+            "Indicators: RSI, MACD, VWAP, Bollinger, OBV\n"
+            "[OK] Signal Validation: Enabled\n"
+            "[OK] Duration Prediction: 5-15 min\n"
+            "[OK] Charts: Enabled\n"
+            f"Alert Cooldown: {cooldown}s\n"
+            f"Min Signal Strength: {strength}\n"
+            f"Min Confidence: {confidence}%\n"
+            f"Candle Interval: 5 minutes"
         )
         
         if not telegram_bot.send_message(startup_message):
@@ -189,9 +192,9 @@ def main():
             telegram_bot
         )
         
-        # Add monitor to client if possible
-        if hasattr(client, 'signal_monitor'):
-            client.signal_monitor = monitor
+        # Add monitor to client
+        if hasattr(client, 'set_signal_monitor'):
+            client.set_signal_monitor(monitor)
         
         # Connect to WebSocket
         logger.info("Connecting to Dhan WebSocket...")
@@ -214,7 +217,7 @@ def main():
         
         if telegram_bot:
             try:
-                error_msg = f"❌ System Error: {str(e)[:200]}"
+                error_msg = f"[ERROR] System Error: {str(e)[:200]}"
                 telegram_bot.send_message(error_msg)
             except:
                 pass

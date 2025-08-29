@@ -1,1 +1,91 @@
-Recognize candle pattern and predict next candles
+NIFTY 50 Candlestick Pattern Recognition Trading System
+This is an automated trading alert system that monitors NIFTY 50 index in real-time, detects candlestick patterns, and sends trading alerts via Telegram when specific conditions are met.
+How The Automation Works
+Data Flow:
+Live Market Data → WebSocket receives price ticks from DhanHQ
+Candle Formation → Builds 5-minute OHLC candles from tick data
+Pattern Detection → Analyzes 61 TA-Lib patterns + 10 custom patterns
+Prediction Engine → Combines patterns with technical indicators
+Alert Decision → Evaluates if conditions meet threshold
+Notification → Sends Telegram alert with chart
+When You Should Expect Alerts
+Based on your configuration 
+, alerts trigger when ALL these conditions are met:
+Pattern Detection: At least 1 candlestick pattern detected
+Confidence Level: Pattern confidence > 20%
+Direction: Clear bullish or bearish signal (not neutral)
+Signal Strength: Must be "moderate" or "strong"
+Cooldown Period: 5 minutes since last alert
+Alert Conditions Breakdown
+The system evaluates multiple factors with weighted scoring 
+:
+Pattern Score (70% weight): Based on detected candlestick patterns
+Momentum Score (15% weight): Price momentum over last 3 candles
+Volume Score (15% weight): Volume profile analysis
+Example Alert Output
+Based on your system's message format 
+, here's what you'll receive:
+text
+
+
+[PATTERN ALERT]
+-------------------------
+Price: 24,550.30
+Time: 14:25:00 IST
+
+Patterns (3):
+  - HAMMER ↑ (68%)
+  - ENGULFING ↑ (72%)
+  - MORNINGSTAR ↑ (78%)
+
+Prediction:
+  - Direction: BULLISH
+  - Confidence: 72.3%
+  - Strength: STRONG
+
+Indicators:
+  - ATR: 125.50
+  - Momentum: 1.25%
+  - Volume: increasing
+
+Performance:
+  - Accuracy: 65.2%
+  - Win Rate: 58.3%
+  - Alerts: 12
+-------------------------
+
+Risk/Reward:
+  - Entry: 24,550
+  - Stop Loss: 24,425 (-0.5%)
+  - Target: 24,800 (+1.0%)
+  - R:R Ratio: 2.0
+Pattern Recognition Details
+Your system detects 
+:
+Reversal Patterns: Hammer, Shooting Star, Engulfing, Morning/Evening Star
+Continuation Patterns: Marubozu, Three Methods, Separating Lines
+Neutral Patterns: Doji, Spinning Top, High Wave
+Each pattern has historical probabilities - for example:
+Hammer: 68% bullish probability
+Engulfing: 72% reversal probability
+Morning Star: 78% bullish reversal
+Current System Status
+From your latest logs showing 70% confidence scores 
+, the system is working correctly and should trigger alerts when:
+Strong patterns align (multiple bullish or bearish patterns)
+Market shows clear directional movement
+Technical indicators confirm the pattern signal
+Signal Quality Metrics
+The system calculates 
+:
+Accuracy Score: Expected success rate based on pattern history
+Confidence Sustenance: How long the signal remains valid (typically 10-30 minutes)
+Expected Duration: 25 minutes base (5 candles), adjusted for volatility
+Risk/Reward Ratio: Calculated using ATR and support/resistance levels
+Self-Learning Capability
+The system continuously:
+Tracks pattern performance
+Updates accuracy rates
+Adjusts confidence scores based on historical hit rates
+Saves pattern history for improving predictions
+This automation essentially acts as a 24/7 pattern scanner that alerts you only when high-probability setups occur, eliminating the need for constant chart monitoring while ensuring you don't miss significant trading opportunities.

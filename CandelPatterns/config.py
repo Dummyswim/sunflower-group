@@ -25,7 +25,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # WebSocket Settings
 NIFTY_SECURITY_ID = 13
-NIFTY_EXCHANGE_SEGMENT = 0  # IDX_I
+NIFTY_EXCHANGE_SEGMENT = "IDX_I"  # 0
 EXCHANGE_SEGMENT_MAP = {
     "IDX_I": 0, "NSE_EQ": 1, "NSE_FNO": 2, "NSE_CURRENCY": 3,
     "BSE_EQ": 4, "BSE_FNO": 5, "BSE_CURRENCY": 6, "MCX": 7,
@@ -34,8 +34,8 @@ EXCHANGE_SEGMENT_MAP = {
 # Pattern Recognition Settings
 PATTERN_WINDOW = 100
 DEFAULT_PATTERN_PROB = 0.55
-MIN_PATTERNS_FOR_ALERT = 2
-PATTERN_CONFIDENCE_THRESHOLD = 0.6
+MIN_PATTERNS_FOR_ALERT = 1
+PATTERN_CONFIDENCE_THRESHOLD = 0.2
 
 # Technical Analysis Settings
 ATR_PERIOD = 14
@@ -52,10 +52,14 @@ VOLATILITY_BOOST_FACTOR = 1.2
 VOLATILITY_DAMPEN_FACTOR = 0.8
 
 # Data Management
-OHLC_WINDOW = 300
-MIN_CANDLES_FOR_ANALYSIS = 30
-COOLDOWN_SECONDS = 180
+OHLC_WINDOW = 100
+MIN_CANDLES_FOR_ANALYSIS = 10
+COOLDOWN_SECONDS = 300  # 5 minutes
 MAX_BUFFER_SIZE = 2000
+CANDLE_TIMEFRAME_MINUTES = 5  # 5-minute candles
+
+# Pattern window can stay the same (100 candles = 500 minutes of data)
+PATTERN_WINDOW = 100
 
 # Price Sanity Checks (for NIFTY)
 PRICE_SANITY_MIN = 10000
@@ -64,3 +68,4 @@ PRICE_SANITY_MAX = 30000
 def decode_b64(encoded: str) -> str:
     """Decode base64 encoded string."""
     return base64.b64decode(encoded).decode("utf-8")
+

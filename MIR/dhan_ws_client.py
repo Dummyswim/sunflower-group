@@ -14,16 +14,19 @@ import numpy as np
 import collections
 import websocket
 from typing import Optional, Dict, Any, List
-
-from technical_indicators import TechnicalIndicators, SignalGenerator
-from chart_utils import format_enhanced_alert, plot_enhanced_chart
+import os
+from technical_indicators import TechnicalIndicators, SignalGenerator, EnhancedSignalGenerator
+from chart_utils import format_enhanced_alert_with_duration, plot_enhanced_chart
 import config
 
 logger = logging.getLogger(__name__)
 
 class DhanWebSocketClient:
     def __init__(self, access_token_b64: str, client_id_b64: str, telegram_bot):
-        """Initialize enhanced WebSocket client."""
+        """Initialize enhanced WebSocket client with validation."""
+        # Validate config first
+        self._validate_config()
+        
         try:
             self.access_token = base64.b64decode(access_token_b64).decode("utf-8")
             self.client_id = base64.b64decode(client_id_b64).decode("utf-8")
@@ -31,14 +34,26 @@ class DhanWebSocketClient:
             logger.error(f"Failed to decode credentials: {e}")
             raise ValueError("Invalid base64 encoded credentials")
         
+        
+        # Initialize minute_ohlcv with proper dtypes
+        self.minute_ohlcv = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+        self.minute_ohlcv = self.minute_ohlcv.astype({
+            'open': 'float64',
+            'high': 'float64',
+            'low': 'float64', 
+            'close': 'float64',
+            'volume': 'int64'
+        })
+            
         self.telegram_bot = telegram_bot
         self.ws = None
         self.connected = False
         
         # Data storage
         self.tick_buffer = collections.deque(maxlen=config.MAX_BUFFER_SIZE)
-        self.minute_ohlcv = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+        self.minute_ohlcv = pd.DataFrame()
         self.last_minute_processed = None
+        self.current_minute_data = []
         
         # Alert management
         self.last_alert_time = None
@@ -49,113 +64,327 @@ class DhanWebSocketClient:
         self.connection_retry_count = 0
         self.max_retries = 5
         self.heartbeat_thread = None
-        self.data_thread = None
         
         # Initialize components
         self.signal_generator = SignalGenerator()
+        self.enhanced_generator = EnhancedSignalGenerator()
+        
+        # Track last known volume for estimation
+        self.last_known_volume = 0
+        self.volume_estimator = VolumeEstimator()
         
         logger.info("Enhanced DhanWebSocketClient initialized")
-    
+
+    def _validate_config(self):
+        """Validate required configuration fields."""
+        required_fields = [
+            'NIFTY_SECURITY_ID', 'NIFTY_EXCHANGE_SEGMENT',
+            'MIN_DATA_POINTS', 'MAX_BUFFER_SIZE',
+            'PRICE_SANITY_MIN', 'PRICE_SANITY_MAX'
+        ]
+        
+        for field in required_fields:
+            if not hasattr(config, field):
+                logger.error(f"Missing required config field: {field}")
+                raise ValueError(f"Configuration missing: {field}")
+            
+        logger.info("Configuration validation successful")
+
+
     def on_open(self, ws):
-        """Handle WebSocket connection opened."""
+        """Handle WebSocket connection with correct Dhan subscription."""
         logger.info("WebSocket connection established")
         self.connected = True
-        self.connection_retry_count = 0
         
-        # Start heartbeat
-        self.start_heartbeat()
-        
-        # Subscribe to Nifty50
+        # According to Dhan docs, subscription format for indices
         subscription = {
-            "RequestCode": 15,
+            "RequestCode": 15,  # Subscribe request
             "InstrumentCount": 1,
             "InstrumentList": [{
-                "ExchangeSegment": config.NIFTY_EXCHANGE_SEGMENT,
-                "SecurityId": str(config.NIFTY_SECURITY_ID)
+                "ExchangeSegment": "IDX_I",  # Index segment
+                "SecurityId": "13"  # NIFTY 50
             }]
         }
         
         ws.send(json.dumps(subscription))
-        logger.info(f"Subscribed to Nifty50 (ID: {config.NIFTY_SECURITY_ID})")
+        logger.info("Subscription sent for NIFTY50")
         
+        # After subscription, request full market data
+        time.sleep(0.5)
+        
+        mode_request = {
+            "RequestCode": 17,  # Mode change request
+            "InstrumentCount": 1,
+            "InstrumentList": [{
+                "ExchangeSegment": "IDX_I",
+                "SecurityId": "13",
+                "QuoteMode": 4  # Full quote mode
+            }]
+        }
+        
+        ws.send(json.dumps(mode_request))
+        logger.info("Requested full quote mode")
+
         # Send connection notification
         if self.telegram_bot:
             self.telegram_bot.send_message(
                 "✅ <b>WebSocket Connected</b>\n"
                 "📊 Monitoring Nifty50\n"
                 f"⚙️ Min Data Points: {config.MIN_DATA_POINTS}\n"
-                f"⏱️ Cooldown: {config.COOLDOWN_SECONDS}s"
+                f"⏱️ Cooldown: {config.COOLDOWN_SECONDS}s\n"
+                f"📈 Signal Thresholds: Buy={config.BUY_THRESHOLD}, Sell={config.SELL_THRESHOLD}"
             )
     
     def on_message(self, ws, message):
         """Process incoming WebSocket messages."""
         try:
-            data = self._parse_packet(message)
+            data = self._parse_message(message)
             if data:
                 self._process_tick(data)
         except Exception as e:
             logger.error(f"Message processing error: {e}", exc_info=True)
     
-    def _parse_packet(self, message) -> Optional[Dict]:
-        """Enhanced packet parsing with better error handling."""
+    def _parse_message(self, message) -> Optional[Dict]:
+        """Parse WebSocket message based on Dhan format."""
         try:
             if isinstance(message, bytes):
-                # Handle different packet structures based on length
-                packet_parsers = {
-                    16: self._parse_16_byte_packet,
-                    32: self._parse_32_byte_packet,
-                    44: self._parse_44_byte_packet,  # Add more packet types
-                    108: self._parse_108_byte_packet
-                }
-                
-                parser = packet_parsers.get(len(message))
-                if parser:
-                    return parser(message)
-                else:
-                    logger.debug(f"Unknown packet length: {len(message)} bytes")
-                    return None
+                # Log packet size for debugging
+                # logger.debug(f"Received binary packet of size: {len(message)} bytes")
+                return self._parse_binary_packet(message)
             else:
-                # JSON message
+                # Text/JSON message
                 return self._parse_json_message(message)
                 
         except Exception as e:
-            logger.error(f"Packet parsing error: {e}")
+            logger.error(f"Message parsing error: {e}")
             return None
-    
-    def _parse_16_byte_packet(self, data: bytes) -> Optional[Dict]:
-        """Parse 16-byte tick packet."""
+
+    def _parse_binary_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse binary packet based on size, not packet code."""
         try:
-            code, msg_len, exch_seg, sec_id, ltp, ltt = struct.unpack("<B H B I f I", data)
-            
-            if sec_id != config.NIFTY_SECURITY_ID:
-                return None
+            packet_size = len(data)
+            logger.debug(f"Received packet of size {packet_size} bytes")
+        
+            # Parse based on packet size patterns
+            if packet_size == 16:
+                # Could be ticker or minimal quote
+                return self._parse_16_byte_packet(data)
+            elif packet_size == 32:
+                return self._parse_32_byte_quote(data)
+            elif packet_size == 44:
+                return self._parse_quote_packet(data)
+            elif packet_size == 50:
+                return self._parse_50_byte_packet(data)
+            elif packet_size == 66:
+                return self._parse_66_byte_packet(data)
+            elif packet_size == 184:
+                return self._parse_full_quote(data)
+            elif packet_size == 492:
+                return self._parse_market_depth_full(data)
+            else:
+                # Try to extract at least LTP if possible
+                if packet_size >= 8:
+                    return self._parse_minimal_packet(data)
+                else:
+                    logger.debug(f"Unknown packet size: {packet_size}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Binary packet parsing error: {e}")
+            return None
+           
+
+    def _parse_minimal_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse minimal packet to extract LTP."""
+        try:
+            # Try to extract LTP from position 4-8 (common location)
+            if len(data) >= 8:
+                ltp = struct.unpack('<f', data[4:8])[0]
                 
-            if not (config.PRICE_SANITY_MIN <= ltp <= config.PRICE_SANITY_MAX):
-                logger.warning(f"Price sanity check failed: {ltp}")
-                return None
+                # Sanity check the price
+                if config.PRICE_SANITY_MIN <= ltp <= config.PRICE_SANITY_MAX:
+                    return {
+                        "timestamp": datetime.now(),
+                        "ltp": ltp,
+                        "volume": self.volume_estimator.get_current_estimate(),
+                        "packet_type": "minimal"
+                    }
+            return None
+        except:
+            return None
+
+    def _parse_16_byte_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse 16-byte packet from Dhan WebSocket."""
+        try:
+            logger.debug(f"16-byte packet hex: {data.hex()}")
             
-            return {
-                "timestamp": datetime.now(),
-                "ltp": ltp,
-                "ltt": ltt,
-                "packet_type": "tick_16"
-            }
+            # Dhan's 16-byte packet structure for indices
+            # Byte 0: Packet type (02, 06, etc.)
+            # Byte 1: Exchange segment code
+            # Bytes 2-3: Padding or flags
+            # Bytes 4-7: LTP (float, little-endian)
+            # Bytes 8-15: Additional data (timestamp, etc.)
+            
+            packet_type = data[0]
+            exchange_code = data[1]
+            
+            # For IDX_I (indices), exchange code should be 16 (0x10)
+            if exchange_code == 0x10:  # 16 in decimal for indices
+                # Extract LTP from bytes 4-7
+                try:
+                    ltp = struct.unpack('<f', data[4:8])[0]
+                    
+                    # Validate price
+                    if config.PRICE_SANITY_MIN <= ltp <= config.PRICE_SANITY_MAX:
+                        logger.info(f"Parsed packet type {packet_type}: LTP={ltp:.2f}")
+                        
+                        # Try to extract timestamp if available
+                        timestamp_val = struct.unpack('<I', data[8:12])[0]
+                        
+                        return {
+                            "timestamp": datetime.now(),
+                            "ltp": ltp,
+                            "ltt": timestamp_val,
+                            "volume": self.volume_estimator.estimate_volume(ltp, 0),
+                            "packet_type": f"idx_packet_{packet_type}"
+                        }
+                except:
+                    pass
+            
+            # Alternative parsing for different packet structures
+            # Try extracting float values from different positions
+            for offset in [4, 8]:
+                try:
+                    value = struct.unpack('<f', data[offset:offset+4])[0]
+                    if config.PRICE_SANITY_MIN <= value <= config.PRICE_SANITY_MAX:
+                        # logger.info(f"Found valid price at offset {offset}: {value:.2f}")
+                        return {
+                            "timestamp": datetime.now(),
+                            "ltp": value,
+                            "volume": self.volume_estimator.estimate_volume(value, 0),
+                            "packet_type": f"ticker_offset{offset}"
+                        }
+                except:
+                    continue
+            
+            logger.debug("Could not parse 16-byte packet")
+            return None
+            
         except Exception as e:
             logger.error(f"16-byte packet parse error: {e}")
             return None
-    
-    def _parse_32_byte_packet(self, data: bytes) -> Optional[Dict]:
-        """Parse 32-byte detailed tick packet."""
-        try:
-            unpacked = struct.unpack("<B H B I f h I f I I I", data)
-            code, msg_len, exch_seg, sec_id, ltp, ltq, ltt, atp, volume, total_sell, total_buy = unpacked
+
+
+
+
+    # def _parse_16_byte_packet(self, data: bytes) -> Optional[Dict]:
+    #     """Parse 16-byte ticker packet."""
+    #     try:
+    #         # Basic ticker format: exchange(1) + segment(1) + security_id(2) + ltp(4) + ltt(4) + padding(4)
+    #         packet_type, exchange, security_id_high, security_id_low = struct.unpack("<BBBB", data[:4])
+    #         security_id = (security_id_high << 8) | security_id_low
             
-            if sec_id != config.NIFTY_SECURITY_ID:
+    #         if security_id != config.NIFTY_SECURITY_ID:
+    #             return None
+            
+    #         ltp = struct.unpack("<f", data[4:8])[0]
+    #         ltt = struct.unpack("<I", data[8:12])[0]
+            
+    #         return {
+    #             "timestamp": datetime.now(),
+    #             "ltp": ltp,
+    #             "ltt": ltt,
+    #             "volume": self.volume_estimator.estimate_volume(ltp, 0),
+    #             "packet_type": "ticker_16"
+    #         }
+    #     except Exception as e:
+    #         logger.error(f"16-byte packet parse error: {e}")
+    #         return None
+
+
+    def _parse_50_byte_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse 50-byte packet."""
+        try:
+            logger.debug(f"50-byte packet first 16 bytes: {data[:16].hex()}")
+            
+            # Try to find price data in this packet
+            for offset in range(0, min(47, len(data)-3), 4):
+                try:
+                    value = struct.unpack('<f', data[offset:offset+4])[0]
+                    if config.PRICE_SANITY_MIN <= value <= config.PRICE_SANITY_MAX:
+                        # logger.info(f"Found price in 50-byte packet at offset {offset}: {value:.2f}")
+                        return {
+                            "timestamp": datetime.now(),
+                            "ltp": value,
+                            "volume": self.volume_estimator.estimate_volume(value, 0),
+                            "packet_type": "quote_50"
+                        }
+                except:
+                    continue
+            return None
+        except Exception as e:
+            logger.error(f"50-byte packet error: {e}")
+            return None
+
+    def _parse_66_byte_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse 66-byte packet."""
+        try:
+            # logger.debug(f"66-byte packet first 16 bytes: {data[:16].hex()}")
+            
+            # Try common positions for price data
+            for offset in [4, 8, 12, 16, 20, 24]:
+                try:
+                    value = struct.unpack('<f', data[offset:offset+4])[0]
+                    if config.PRICE_SANITY_MIN <= value <= config.PRICE_SANITY_MAX:
+                        # logger.info(f"Found price in 66-byte packet at offset {offset}: {value:.2f}")
+                        
+                        # Try to get volume if available
+                        volume = 0
+                        try:
+                            volume = struct.unpack('<I', data[offset+8:offset+12])[0]
+                        except:
+                            volume = self.volume_estimator.estimate_volume(value, 0)
+                        
+                        return {
+                            "timestamp": datetime.now(),
+                            "ltp": value,
+                            "volume": volume,
+                            "packet_type": "quote_66"
+                        }
+                except:
+                    continue
+            return None
+        except Exception as e:
+            logger.error(f"66-byte packet error: {e}")
+            return None
+
+    
+    def _parse_32_byte_quote(self, data: bytes) -> Optional[Dict]:
+        """Parse 32-byte quote packet with volume."""
+        try:
+            # Dhan 32-byte structure
+            if len(data) < 32:
                 return None
                 
-            if not (config.PRICE_SANITY_MIN <= ltp <= config.PRICE_SANITY_MAX):
-                logger.warning(f"Price sanity check failed: {ltp}")
+            # Parse based on expected structure
+            packet_type = data[0]
+            exchange = data[1]
+            security_id = struct.unpack("<H", data[2:4])[0]
+            
+            if security_id != config.NIFTY_SECURITY_ID:
                 return None
+            
+            ltp = struct.unpack("<f", data[4:8])[0]
+            ltq = struct.unpack("<I", data[8:12])[0]
+            ltt = struct.unpack("<I", data[12:16])[0]
+            atp = struct.unpack("<f", data[16:20])[0]
+            volume = struct.unpack("<I", data[20:24])[0]
+            
+            # Estimate volume if zero
+            if volume == 0:
+                volume = self.volume_estimator.estimate_volume(ltp, ltq)
+            else:
+                self.volume_estimator.update_last_volume(volume)
             
             return {
                 "timestamp": datetime.now(),
@@ -164,41 +393,242 @@ class DhanWebSocketClient:
                 "ltt": ltt,
                 "atp": atp,
                 "volume": volume,
-                "total_sell": total_sell,
-                "total_buy": total_buy,
-                "packet_type": "tick_32"
+                "packet_type": "quote_32"
             }
         except Exception as e:
-            logger.error(f"32-byte packet parse error: {e}")
+            logger.error(f"32-byte quote parse error: {e}")
             return None
     
-    def _parse_44_byte_packet(self, data: bytes) -> Optional[Dict]:
-        """Parse 44-byte market depth packet."""
-        # Implementation for 44-byte packets if needed
-        return None
+    def _parse_ticker_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse ticker packet (minimal data)."""
+        try:
+            if len(data) < 16:
+                return None
+                
+            # Ticker packet structure
+            packet_type, exchange = struct.unpack("<BB", data[:2])
+            security_id = struct.unpack("<H", data[2:4])[0]
+            
+            if security_id != config.NIFTY_SECURITY_ID:
+                return None
+            
+            ltp = struct.unpack("<f", data[4:8])[0]
+            ltt = struct.unpack("<I", data[8:12])[0]
+            
+            return {
+                "timestamp": datetime.now(),
+                "ltp": ltp,
+                "ltt": ltt,
+                "volume": self.volume_estimator.estimate_volume(ltp, 0),
+                "packet_type": "ticker"
+            }
+        except Exception as e:
+            logger.error(f"Ticker packet parse error: {e}")
+            return None
+
+    def _parse_quote_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse quote packet with OHLC."""
+        try:
+            if len(data) < 44:
+                return None
+                
+            # Quote packet structure  
+            packet_type = data[0]
+            security_id = struct.unpack('<I', data[4:8])[0]
+            
+            if security_id != config.NIFTY_SECURITY_ID:
+                return None
+                
+            ltp = struct.unpack('<f', data[8:12])[0]
+            open_p = struct.unpack('<f', data[12:16])[0]
+            high = struct.unpack('<f', data[16:20])[0]
+            low = struct.unpack('<f', data[20:24])[0]
+            close = struct.unpack('<f', data[24:28])[0]
+            volume = struct.unpack('<I', data[28:32])[0]
+            
+            if volume == 0:
+                volume = self.volume_estimator.estimate_volume(ltp, 0)
+            else:
+                self.volume_estimator.update_last_volume(volume)
+            
+            return {
+                "timestamp": datetime.now(),
+                "ltp": ltp,
+                "open": open_p,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "packet_type": "quote"
+            }
+        except Exception as e:
+            logger.error(f"Quote packet parse error: {e}")
+            return None
     
-    def _parse_108_byte_packet(self, data: bytes) -> Optional[Dict]:
-        """Parse 108-byte full market data packet."""
-        # Implementation for 108-byte packets if needed
+    def _parse_full_quote(self, data: bytes) -> Optional[Dict]:
+        """Parse 184-byte full quote packet."""
+        try:
+            # Parse key fields from full quote
+            security_id = struct.unpack('<I', data[4:8])[0]
+            
+            if security_id != config.NIFTY_SECURITY_ID:
+                return None
+            
+            ltp = struct.unpack('<f', data[8:12])[0]
+            ltq = struct.unpack('<I', data[12:16])[0]
+            ltt = struct.unpack('<I', data[16:20])[0]
+            
+            # OHLC data
+            open_price = struct.unpack('<f', data[20:24])[0]
+            high = struct.unpack('<f', data[24:28])[0]
+            low = struct.unpack('<f', data[28:32])[0]
+            close = struct.unpack('<f', data[32:36])[0]
+            
+            # Volume and value (64-bit)
+            volume = struct.unpack('<Q', data[36:44])[0]
+            value = struct.unpack('<d', data[44:52])[0]
+            
+            # Update volume estimator
+            if volume > 0:
+                self.volume_estimator.update_last_volume(volume)
+            else:
+                volume = self.volume_estimator.estimate_volume_with_value(ltp, value)
+            
+            return {
+                "timestamp": datetime.now(),
+                "ltp": ltp,
+                "ltq": ltq,
+                "ltt": ltt,
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "value": value,
+                "packet_type": "full_quote"
+            }
+        except Exception as e:
+            logger.error(f"Full quote parse error: {e}")
+            return None
+    
+    def _parse_market_depth_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse market depth packet."""
+        try:
+            if len(data) < 20:
+                return None
+                
+            security_id = struct.unpack('<I', data[4:8])[0]
+            if security_id != config.NIFTY_SECURITY_ID:
+                return None
+                
+            ltp = struct.unpack('<f', data[8:12])[0]
+            
+            return {
+                "timestamp": datetime.now(),
+                "ltp": ltp,
+                "volume": self.volume_estimator.get_current_estimate(),
+                "packet_type": "depth"
+            }
+        except Exception as e:
+            logger.error(f"Market depth parse error: {e}")
+            return None
+
+    def _parse_market_depth_full(self, data: bytes) -> Optional[Dict]:
+        """Parse full market depth packet (492 bytes)."""
+        try:
+            if len(data) < 492:
+                return None
+                
+            # Extract key fields
+            security_id = struct.unpack('<I', data[4:8])[0]
+            if security_id != config.NIFTY_SECURITY_ID:
+                return None
+                
+            ltp = struct.unpack('<f', data[8:12])[0]
+            
+            # Extract total buy/sell quantities for volume estimation
+            total_buy_qty = struct.unpack('<I', data[100:104])[0]
+            total_sell_qty = struct.unpack('<I', data[200:204])[0]
+            
+            estimated_volume = (total_buy_qty + total_sell_qty) // 2
+            if estimated_volume > 0:
+                self.volume_estimator.update_last_volume(estimated_volume)
+            else:
+                estimated_volume = self.volume_estimator.get_current_estimate()
+            
+            return {
+                "timestamp": datetime.now(),
+                "ltp": ltp,
+                "volume": estimated_volume,
+                "total_buy_qty": total_buy_qty,
+                "total_sell_qty": total_sell_qty,
+                "packet_type": "depth_full"
+            }
+        except Exception as e:
+            logger.error(f"Full depth parse error: {e}")
+            return None
+
+    def _parse_oi_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse open interest packet."""
+        # OI packets not relevant for Nifty50 index
         return None
+
+    def _parse_prev_close_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse previous close packet."""
+        try:
+            if len(data) < 12:
+                return None
+                
+            security_id = struct.unpack('<I', data[4:8])[0]
+            if security_id != config.NIFTY_SECURITY_ID:
+                return None
+                
+            prev_close = struct.unpack('<f', data[8:12])[0]
+            
+            # Store for reference
+            logger.info(f"Previous close: {prev_close:.2f}")
+            self.volume_estimator.set_previous_close(prev_close)
+            return None
+            
+        except Exception as e:
+            logger.error(f"Prev close parse error: {e}")
+            return None
+
+    def _parse_market_status_packet(self, data: bytes) -> Optional[Dict]:
+        """Parse market status packet."""
+        try:
+            if len(data) >= 2:
+                status = data[1]
+                status_map = {
+                    1: "Pre-Open",
+                    2: "Open",
+                    3: "Closed",
+                    4: "Post-Close"
+                }
+                logger.info(f"Market status: {status_map.get(status, f'Unknown ({status})')}")
+            return None
+        except Exception as e:
+            logger.error(f"Market status parse error: {e}")
+            return None
     
     def _parse_json_message(self, message: str) -> Optional[Dict]:
         """Parse JSON WebSocket message."""
         try:
             data = json.loads(message)
             
-            if "Touchline" in data:
-                touchline = data["Touchline"]
-                return {
-                    "timestamp": datetime.now(),
-                    "open": touchline.get("Open", 0),
-                    "high": touchline.get("High", 0),
-                    "low": touchline.get("Low", 0),
-                    "close": touchline.get("Close", 0),
-                    "ltp": touchline.get("LastTradedPrice", 0),
-                    "volume": touchline.get("TotalTradedQuantity", 0),
-                    "packet_type": "json_touchline"
-                }
+            # Handle different JSON message types
+            if "type" in data:
+                if data["type"] == "quote":
+                    return {
+                        "timestamp": datetime.now(),
+                        "ltp": data.get("ltp", 0),
+                        "volume": data.get("volume", 0),
+                        "packet_type": "json_quote"
+                    }
+                elif data["type"] == "error":
+                    logger.error(f"Server error: {data.get('message', 'Unknown error')}")
+                elif data["type"] == "subscription_status":
+                    logger.info(f"Subscription status: {data.get('status', 'Unknown')}")
             
             return None
             
@@ -209,8 +639,21 @@ class DhanWebSocketClient:
     def _process_tick(self, tick_data: Dict):
         """Process tick data and update minute candles."""
         try:
-            # Add to buffer
-            self.tick_buffer.append(tick_data)
+            ltp = tick_data.get("ltp", 0)
+            packet_type = tick_data.get("packet_type", "unknown")
+            
+            # Validate tick data
+            if ltp < config.PRICE_SANITY_MIN or ltp > config.PRICE_SANITY_MAX:
+                logger.warning(f"Price sanity check failed for {packet_type}: LTP={ltp} "
+                             f"(expected {config.PRICE_SANITY_MIN}-{config.PRICE_SANITY_MAX})")
+                logger.debug(f"Full tick data: {tick_data}")
+                return
+            logger.debug(f"Processing {packet_type} tick: LTP={ltp}, Volume={tick_data.get('volume', 0)}")            
+            
+            
+            
+            # Add to current minute data
+            self.current_minute_data.append(tick_data)
             
             # Get current minute
             current_minute = tick_data["timestamp"].replace(second=0, microsecond=0)
@@ -219,42 +662,90 @@ class DhanWebSocketClient:
             if self.last_minute_processed != current_minute:
                 if self.last_minute_processed is not None:
                     self._create_minute_candle(self.last_minute_processed)
+                
                 self.last_minute_processed = current_minute
+                self.current_minute_data = [tick_data]
                 
         except Exception as e:
             logger.error(f"Tick processing error: {e}")
-    
+            
+                
     def _create_minute_candle(self, minute_timestamp: datetime):
         """Create minute OHLCV candle from tick data."""
         try:
-            # Filter ticks for this minute
-            minute_ticks = [
-                t for t in self.tick_buffer 
-                if t["timestamp"].replace(second=0, microsecond=0) == minute_timestamp
-                and "ltp" in t
-            ]
-            
-            if not minute_ticks:
+            if not self.current_minute_data:
                 return
             
-            # Calculate OHLCV
-            prices = [t["ltp"] for t in minute_ticks]
-            volumes = [t.get("volume", 0) for t in minute_ticks if "volume" in t]
+            # Extract prices and volumes - ENSURE FLOAT CONVERSION
+            prices = []
+            volumes = []
             
+            for tick in self.current_minute_data:
+                if "ltp" in tick and tick["ltp"] > 0:
+                    # Convert to float explicitly
+                    price = float(tick["ltp"])
+                    prices.append(price)
+                if "volume" in tick:
+                    # Convert to int explicitly
+                    vol = int(tick["volume"])
+                    volumes.append(vol)
+            
+            if not prices:
+                return
+            
+            # Get volume (use last non-zero or estimate)
+            volume = 0
+            if volumes:
+                for v in reversed(volumes):
+                    if v > 0:
+                        volume = v
+                        break
+                
+                if volume == 0:
+                    volume = self.volume_estimator.estimate_from_price_action(prices)
+            else:
+                volume = self.volume_estimator.get_current_estimate()
+            
+            # Ensure all values are proper types
             candle = {
                 "timestamp": minute_timestamp,
-                "open": prices[0],
-                "high": max(prices),
-                "low": min(prices),
-                "close": prices[-1],
-                "volume": volumes[-1] if volumes else 0
+                "open": float(prices[0]),
+                "high": float(max(prices)),
+                "low": float(min(prices)),
+                "close": float(prices[-1]),
+                "volume": int(volume)
             }
+
+
+
+
+            # Create new candle DataFrame with explicit dtypes
+            new_candle_df = pd.DataFrame([candle]).set_index("timestamp")
+            new_candle_df = new_candle_df.astype({
+                'open': 'float64',
+                'high': 'float64', 
+                'low': 'float64',
+                'close': 'float64',
+                'volume': 'int64'
+            })
             
-            # Add to dataframe
-            self.minute_ohlcv = pd.concat([
-                self.minute_ohlcv,
-                pd.DataFrame([candle]).set_index("timestamp")
-            ]).tail(500)  # Keep last 500 candles
+            # If minute_ohlcv is empty, initialize with proper dtypes
+            if len(self.minute_ohlcv) == 0:
+                self.minute_ohlcv = new_candle_df
+            else:
+                # Ensure existing DataFrame has correct dtypes before concatenation
+                self.minute_ohlcv = self.minute_ohlcv.astype({
+                    'open': 'float64',
+                    'high': 'float64',
+                    'low': 'float64',
+                    'close': 'float64',
+                    'volume': 'int64'
+                })
+                self.minute_ohlcv = pd.concat([self.minute_ohlcv, new_candle_df], axis=0)
+                
+            
+            # Keep only last 500 candles
+            self.minute_ohlcv = self.minute_ohlcv.tail(500)
             
             logger.debug(f"Created minute candle: O={candle['open']:.2f}, H={candle['high']:.2f}, "
                         f"L={candle['low']:.2f}, C={candle['close']:.2f}, V={candle['volume']}")
@@ -264,94 +755,207 @@ class DhanWebSocketClient:
                 self._analyze_and_alert()
                 
         except Exception as e:
-            logger.error(f"Candle creation error: {e}")
-
-
+            logger.error(f"Candle creation error: {e}", exc_info=True)
+            
+    
+    # def _create_minute_candle(self, minute_timestamp: datetime):
+    #     """Create minute OHLCV candle from tick data."""
+    #     try:
+    #         if not self.current_minute_data:
+    #             return
+            
+    #         # Extract prices and volumes
+    #         prices = []
+    #         volumes = []
+            
+    #         for tick in self.current_minute_data:
+    #             if "ltp" in tick and tick["ltp"] > 0:
+    #                 prices.append(tick["ltp"])
+    #             if "volume" in tick:
+    #                 volumes.append(tick["volume"])
+            
+    #         if not prices:
+    #             return
+            
+    #         # Get volume (use last non-zero or estimate)
+    #         volume = 0
+    #         if volumes:
+    #             # Try to find last non-zero volume
+    #             for v in reversed(volumes):
+    #                 if v > 0:
+    #                     volume = v
+    #                     break
+                
+    #             if volume == 0:
+    #                 volume = self.volume_estimator.estimate_from_price_action(prices)
+    #         else:
+    #             volume = self.volume_estimator.get_current_estimate()
+            
+    #         candle = {
+    #             "timestamp": minute_timestamp,
+    #             "open": prices[0],
+    #             "high": max(prices),
+    #             "low": min(prices),
+    #             "close": prices[-1],
+    #             "volume": volume
+    #         }
+            
+    #         # Create new candle DataFrame
+    #         new_candle_df = pd.DataFrame([candle]).set_index("timestamp")
+            
+    #         # Append to minute_ohlcv
+    #         if len(self.minute_ohlcv) == 0:
+    #             self.minute_ohlcv = new_candle_df
+    #         else:
+    #             self.minute_ohlcv = pd.concat([self.minute_ohlcv, new_candle_df], axis=0)
+            
+    #         # Keep only last 500 candles
+    #         self.minute_ohlcv = self.minute_ohlcv.tail(500)
+            
+    #         logger.debug(f"Created minute candle: O={candle['open']:.2f}, H={candle['high']:.2f}, "
+    #                     f"L={candle['low']:.2f}, C={candle['close']:.2f}, V={candle['volume']}")
+            
+    #         # Check for signals
+    #         if len(self.minute_ohlcv) >= config.MIN_DATA_POINTS:
+    #             self._analyze_and_alert()
+                
+    #     except Exception as e:
+    #         logger.error(f"Candle creation error: {e}")
+    
     def _analyze_and_alert(self):
-        """Perform technical analysis and send alerts if conditions are met."""
+        """Enhanced analysis with predictive signal generation."""
         with self.alert_lock:
             try:
                 # Prepare data
                 df = self.minute_ohlcv.tail(config.MIN_DATA_POINTS)
-                prices = pd.Series(df['close'].values, index=df.index)
-                volumes = pd.Series(df['volume'].values, index=df.index)
-                highs = pd.Series(df['high'].values, index=df.index)
-                lows = pd.Series(df['low'].values, index=df.index)
                 
                 # Calculate all indicators
-                indicators = {
-                    "macd": TechnicalIndicators.calculate_macd(prices),
-                    "rsi": TechnicalIndicators.calculate_rsi(prices),
-                    "vwap": TechnicalIndicators.calculate_vwap(prices, volumes),
-                    "keltner": TechnicalIndicators.calculate_keltner_channels(prices, highs, lows),
-                    "supertrend": TechnicalIndicators.calculate_supertrend(prices, highs, lows),
-                    "impulse": TechnicalIndicators.calculate_impulse_macd(prices)
-                }
+                indicators = self._calculate_all_indicators(df)
                 
-                # Generate weighted signal with duration prediction
-                signal_result = self.signal_generator.calculate_weighted_signal_with_duration(
-                    indicators, 
-                    config.INDICATOR_WEIGHTS,
-                    self.minute_ohlcv.tail(100)  # Use last 100 candles for duration prediction
+                # Use enhanced signal generator for better predictions
+                signal_result = self.enhanced_generator.generate_trading_signal(
+                    indicators,
+                    df,
+                    config.INDICATOR_WEIGHTS
                 )
                 
-                # Log analysis
-                logger.info(f"Signal Analysis: {signal_result['composite_signal']} "
-                        f"(Score: {signal_result['weighted_score']}, "
-                        f"Confidence: {signal_result['confidence']}%)")
+                # Log analysis results
+                logger.info(f"Signal: {signal_result['composite_signal']} | "
+                           f"Confidence: {signal_result['confidence']:.1f}% | "
+                           f"Score: {signal_result['weighted_score']:.3f} | "
+                           f"Entry: {signal_result.get('entry_price', 0):.2f}")
                 
-                # Log duration prediction
-                if 'duration_prediction' in signal_result:
-                    duration = signal_result['duration_prediction']
-                    logger.info(f"Duration Prediction: {duration['estimated_minutes']} mins, "
-                            f"Confidence: {duration['confidence']}")
-                
-                # Check alert conditions
-                if self._should_alert(signal_result):
-                    self._send_alert(prices.iloc[-1], indicators, signal_result)
-                    
+                # Check alert conditions with market context
+                if self._should_alert_with_context(signal_result, df):
+                    self._send_alert(df['close'].iloc[-1], indicators, signal_result)
+                                    
             except Exception as e:
                 logger.error(f"Analysis error: {e}", exc_info=True)
 
-
-
-
-    def _should_alert(self, signal_result: Dict) -> bool:
-        """Determine if alert should be sent based on signal and cooldown."""
+    def _calculate_all_indicators(self, df: pd.DataFrame) -> Dict:
+        """Calculate all technical indicators with type validation."""
         try:
-            # Check signal strength
-            if abs(signal_result['weighted_score']) < 0.5:
+            # Ensure proper data types
+            df = df.copy()
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            for col in ['volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64')
+            
+            # Drop any rows with NaN prices
+            df = df.dropna(subset=['open', 'high', 'low', 'close'])
+            
+            if len(df) == 0:
+                logger.error("No valid data after type conversion")
+                return {}
+            
+            prices = pd.Series(df['close'].values, index=df.index)
+            volumes = pd.Series(df['volume'].values, index=df.index)
+            highs = pd.Series(df['high'].values, index=df.index)
+            lows = pd.Series(df['low'].values, index=df.index)
+            
+            return {
+                "macd": TechnicalIndicators.calculate_macd(prices),
+                "rsi": TechnicalIndicators.calculate_rsi(prices),
+                "vwap": TechnicalIndicators.calculate_vwap(prices, volumes),
+                "keltner": TechnicalIndicators.calculate_keltner_channels(prices, highs, lows),
+                "supertrend": TechnicalIndicators.calculate_supertrend(prices, highs, lows),
+                "impulse": TechnicalIndicators.calculate_impulse_macd(prices)
+            }
+        except Exception as e:
+            logger.error(f"Indicator calculation error: {e}", exc_info=True)
+            return {}
+
+    
+    # def _calculate_all_indicators(self, df: pd.DataFrame) -> Dict:
+    #     """Calculate all technical indicators."""
+    #     prices = pd.Series(df['close'].values, index=df.index)
+    #     volumes = pd.Series(df['volume'].values, index=df.index)
+    #     highs = pd.Series(df['high'].values, index=df.index)
+    #     lows = pd.Series(df['low'].values, index=df.index)
+        
+    #     return {
+    #         "macd": TechnicalIndicators.calculate_macd(prices),
+    #         "rsi": TechnicalIndicators.calculate_rsi(prices),
+    #         "vwap": TechnicalIndicators.calculate_vwap(prices, volumes),
+    #         "keltner": TechnicalIndicators.calculate_keltner_channels(prices, highs, lows),
+    #         "supertrend": TechnicalIndicators.calculate_supertrend(prices, highs, lows),
+    #         "impulse": TechnicalIndicators.calculate_impulse_macd(prices)
+    #     }
+    
+    def _should_alert_with_context(self, signal_result: Dict, df: pd.DataFrame) -> bool:
+        """Enhanced alert conditions with market context awareness."""
+        try:
+            # Get market context
+            price_change_pct = ((df['close'].iloc[-1] - df['close'].iloc[-5]) / df['close'].iloc[-5]) * 100
+            volatility = df['close'].pct_change().std() * 100
+            
+            # Dynamic thresholds based on market conditions
+            if abs(price_change_pct) > 0.5:  # Trending market
+                min_confidence = config.MIN_CONFIDENCE_FOR_ALERT * 0.75
+                min_score = config.MIN_SCORE_FOR_ALERT * 0.75
+            else:  # Ranging market
+                min_confidence = config.MIN_CONFIDENCE_FOR_ALERT
+                min_score = config.MIN_SCORE_FOR_ALERT
+            
+            # Check basic conditions
+            if signal_result['confidence'] < min_confidence:
+                logger.debug(f"Confidence too low: {signal_result['confidence']:.1f}% < {min_confidence}")
                 return False
             
-            # Check confidence
-            if signal_result['confidence'] < 60:
+            if abs(signal_result['weighted_score']) < min_score:
+                logger.debug(f"Score too low: {abs(signal_result['weighted_score']):.3f} < {min_score}")
                 return False
             
-            # Check cooldown
+            # Override for very strong signals
+            if signal_result['composite_signal'] in ['STRONG_BUY', 'STRONG_SELL']:
+                if signal_result['confidence'] > 60:
+                    logger.info("Strong signal detected - overriding cooldown")
+                    return True
+            
+            # Normal cooldown check
             if self.last_alert_time:
                 elapsed = (datetime.now() - self.last_alert_time).total_seconds()
-                if elapsed < config.COOLDOWN_SECONDS:
-                    logger.info(f"Alert suppressed - cooldown active ({config.COOLDOWN_SECONDS - elapsed:.0f}s remaining)")
+                
+                # Dynamic cooldown based on market volatility
+                cooldown = config.COOLDOWN_SECONDS
+                if volatility > 1.0:
+                    cooldown = cooldown // 2  # Halve cooldown in volatile markets
+                
+                if elapsed < cooldown:
+                    logger.info(f"Cooldown active ({cooldown - elapsed:.0f}s remaining)")
                     return False
-            
-            # Check for false positives
-            if signal_result['active_indicators'] < 4:
-                logger.info("Alert suppressed - insufficient active indicators")
-                return False
             
             return True
             
         except Exception as e:
-            logger.error(f"Alert condition check error: {e}")
+            logger.error(f"Alert condition error: {e}")
             return False
     
     def _send_alert(self, current_price: float, indicators: Dict, signal_result: Dict):
         """Send enhanced alert with detailed analysis."""
         try:
-            # Import the new formatting function
-            from chart_utils import format_enhanced_alert_with_duration
-            
-            # Format message with duration
+            # Format message
             message = format_enhanced_alert_with_duration(
                 current_price,
                 indicators,
@@ -377,17 +981,13 @@ class DhanWebSocketClient:
                         "timestamp": datetime.now(),
                         "signal": signal_result['composite_signal'],
                         "price": current_price,
-                        "duration_prediction": signal_result.get("duration_prediction", {})
+                        "confidence": signal_result['confidence']
                     })
                     logger.info("Alert sent successfully")
-                else:
-                    logger.error("Failed to send alert")
                     
         except Exception as e:
             logger.error(f"Alert sending error: {e}")
-
-
-
+    
     def start_heartbeat(self):
         """Start heartbeat thread to keep connection alive."""
         def heartbeat():
@@ -398,42 +998,38 @@ class DhanWebSocketClient:
                     time.sleep(30)
                 except Exception as e:
                     logger.error(f"Heartbeat error: {e}")
-                    
+        
         self.heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
         self.heartbeat_thread.start()
     
     def on_error(self, ws, error):
         """Handle WebSocket errors."""
         logger.error(f"WebSocket error: {error}")
-        
+    
     def on_close(self, ws, close_status_code, close_msg):
-        """Handle WebSocket closure with auto-reconnect."""
+        """Handle WebSocket closure."""
         logger.warning(f"WebSocket closed - Code: {close_status_code}, Message: {close_msg}")
         self.connected = False
         
+        # Send disconnection notification
+        if self.telegram_bot:
+            self.telegram_bot.send_message("⚠️ WebSocket disconnected - Attempting reconnection...")
+        
+        # Attempt reconnection
         if self.connection_retry_count < self.max_retries:
             self.connection_retry_count += 1
             wait_time = min(2 ** self.connection_retry_count, 60)
-            logger.info(f"Reconnection attempt {self.connection_retry_count}/{self.max_retries} in {wait_time}s")
-            
-            if self.telegram_bot:
-                self.telegram_bot.send_message(
-                    f"⚠️ WebSocket disconnected\n"
-                    f"🔄 Reconnecting in {wait_time}s..."
-                )
-            
+            logger.info(f"Reconnecting in {wait_time}s (Attempt {self.connection_retry_count}/{self.max_retries})...")
             time.sleep(wait_time)
             self.connect()
     
     def connect(self):
-        """Establish WebSocket connection with proper error handling."""
+        """Establish WebSocket connection."""
         try:
-            # Validate credentials first
-            if not self.access_token or not self.client_id:
-                raise ValueError("Missing credentials")
-            
-            ws_url = (f"wss://api-feed.dhan.co?version=2&token={self.access_token}"
-                     f"&clientId={self.client_id}&authType=2")
+            ws_url = (f"wss://api-feed.dhan.co?version=2"
+                     f"&token={self.access_token}"
+                     f"&clientId={self.client_id}"
+                     f"&authType=2")
             
             self.ws = websocket.WebSocketApp(
                 ws_url,
@@ -443,10 +1039,13 @@ class DhanWebSocketClient:
                 on_close=self.on_close
             )
             
-            # Run in separate thread
             wst = threading.Thread(
                 target=self.ws.run_forever,
-                kwargs={"sslopt": {"cert_reqs": ssl.CERT_NONE}}
+                kwargs={
+                    "sslopt": {"cert_reqs": ssl.CERT_NONE},
+                    "ping_interval": 30,
+                    "ping_timeout": 10
+                }
             )
             wst.daemon = True
             wst.start()
@@ -460,8 +1059,6 @@ class DhanWebSocketClient:
             if not self.connected:
                 raise ConnectionError("WebSocket connection timeout")
                 
-            logger.info("WebSocket connected successfully")
-            
         except Exception as e:
             logger.error(f"Connection error: {e}")
             raise
@@ -471,4 +1068,71 @@ class DhanWebSocketClient:
         if self.ws:
             self.connected = False
             self.ws.close()
-            logger.info("WebSocket disconnected by user")
+            logger.info("WebSocket disconnected")
+
+
+class VolumeEstimator:
+    """Estimate volume when not available from feed."""
+    
+    def __init__(self):
+        self.avg_volume_per_minute = 50000  # Average for Nifty
+        self.last_volume = 0
+        self.volume_history = collections.deque(maxlen=100)
+        self.previous_close = None
+        
+    def estimate_volume(self, price: float, quantity: int) -> int:
+        """Estimate volume based on price and quantity."""
+        if quantity > 0:
+            estimated = quantity * 100
+            self.last_volume = estimated
+            self.volume_history.append(estimated)
+            return estimated
+        
+        # Return moving average or default
+        if self.volume_history:
+            return int(np.mean(self.volume_history))
+        return self.avg_volume_per_minute
+    
+    def estimate_volume_with_value(self, price: float, value: float) -> int:
+        """Estimate volume from traded value."""
+        if value > 0 and price > 0:
+            estimated = int(value / price)
+            self.last_volume = estimated
+            self.volume_history.append(estimated)
+            return estimated
+        return self.get_current_estimate()
+    
+    def estimate_from_price_action(self, prices: List[float]) -> int:
+        """Estimate volume from price volatility."""
+        if len(prices) < 2:
+            return self.get_current_estimate()
+        
+        # Higher volatility usually means higher volume
+        volatility = np.std(prices) / np.mean(prices)
+        volume_multiplier = 1 + (volatility * 10)
+        
+        base_volume = self.avg_volume_per_minute
+        if self.volume_history:
+            base_volume = int(np.mean(self.volume_history))
+        
+        estimated = int(base_volume * volume_multiplier)
+        self.last_volume = estimated
+        return estimated
+    
+    def update_last_volume(self, volume: int):
+        """Update last known volume."""
+        if volume > 0:
+            self.last_volume = volume
+            self.volume_history.append(volume)
+    
+    def get_current_estimate(self) -> int:
+        """Get current volume estimate."""
+        if self.last_volume > 0:
+            return self.last_volume
+        if self.volume_history:
+            return int(np.mean(self.volume_history))
+        return self.avg_volume_per_minute
+    
+    def set_previous_close(self, price: float):
+        """Set previous close price for reference."""
+        self.previous_close = price

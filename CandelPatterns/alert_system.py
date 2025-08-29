@@ -5,7 +5,8 @@ Orchestrates all components for live trading and backtesting.
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+import pytz  # if you prefer pytz
 from typing import Optional, Dict, List, Tuple
 import pandas as pd
 
@@ -18,6 +19,7 @@ from ohlc_builder import OHLCBuilder
 from telegram_bot import TelegramBot
 from chart_utils import ChartGenerator
 from replay_engine import ReplayEngine
+from signal_analyzer import SignalQualityAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,13 @@ class AlertSystem:
     
     def _initialize_components(self):
         """Initialize all system components."""
-        self.ohlc_builder = OHLCBuilder(window=config.OHLC_WINDOW)
+        from enhanced_patterns import EnhancedPatternRecognition
+        self.enhanced_patterns = EnhancedPatternRecognition()
+        
+        self.ohlc_builder = OHLCBuilder(window=config.OHLC_WINDOW,
+            timeframe_minutes=5  # Changed from default 1 to 5
+        )
+            
         self.pattern_engine = PatternEngine(
             window=config.PATTERN_WINDOW,
             default_prob=config.DEFAULT_PATTERN_PROB,
@@ -64,7 +72,8 @@ class AlertSystem:
         self.prediction_engine = PredictionEngine()
         self.indicators = AdvancedIndicators()
         self.chart_generator = ChartGenerator()
-        
+        self.signal_analyzer = SignalQualityAnalyzer()
+
         # Initialize Telegram bot (optional)
         self.telegram = None
         if config.TELEGRAM_BOT_TOKEN_B64 and config.TELEGRAM_CHAT_ID:
@@ -165,7 +174,7 @@ class AlertSystem:
         analysis_result = self._perform_analysis(df)
         
         if analysis_result:
-            patterns, prediction, indicators_data = analysis_result
+            patterns, prediction, indicators_data, signal_metrics = analysis_result
             
             # Store current state
             self.last_prediction = {
@@ -173,8 +182,9 @@ class AlertSystem:
                 "price": df['close'].iloc[-1],
                 "patterns": patterns,
                 "prediction": prediction,
-                "indicators": indicators_data
-            }
+                "indicators": indicators_data,
+                "signal_metrics": signal_metrics
+            } 
             
             # Check alert conditions
             if self._should_send_alert(patterns, prediction):
@@ -191,11 +201,18 @@ class AlertSystem:
             Tuple of (patterns, prediction, indicators_data) or None
         """
         try:
-            # Detect patterns
-            patterns = self.pattern_engine.detect_patterns(df)
-            if patterns:
-                self.total_patterns_detected += len(patterns)
+
+            # Detect all patterns
+            talib_patterns = self.pattern_engine.detect_patterns(df)
+            enhanced_patterns = self.enhanced_patterns.detect_all_patterns(df) if hasattr(self, 'enhanced_patterns') else []
+            all_patterns = talib_patterns + enhanced_patterns
+
+
+            for pattern in all_patterns:
             
+                logger.info(f"Pattern: {pattern['name']} | Direction: {pattern['direction']} | Confidence: {pattern.get('confidence', 0):.2%}")
+                                        
+
             # Calculate indicators
             indicators_data = {
                 'atr': self.indicators.calculate_atr(df, config.ATR_PERIOD),
@@ -211,15 +228,20 @@ class AlertSystem:
             
             # Generate prediction
             prediction = self.prediction_engine.predict(
-                patterns,
+                all_patterns,
                 indicators_data['momentum'],
                 indicators_data['volume_profile'],
                 atr_ratio,
                 indicators_data['support_resistance']
             )
             
-            return patterns, prediction, indicators_data
+            # Calculate signal quality metrics
+            signal_metrics = self.signal_analyzer.calculate_signal_metrics(
+                all_patterns, df, prediction, indicators_data
+            )
             
+            return all_patterns, prediction, indicators_data, signal_metrics
+
         except Exception as e:
             logger.error(f"Analysis failed: {e}", exc_info=True)
             return None
@@ -353,35 +375,52 @@ class AlertSystem:
             
         except Exception as e:
             logger.error(f"Alert sending failed: {e}", exc_info=True)
-    
+
     def _format_alert_message(self, df: pd.DataFrame, patterns: List[Dict],
-                             prediction: Dict, indicators_data: Dict) -> str:
+                            prediction: Dict, indicators_data: Dict) -> str:
         """Format comprehensive alert message."""
         price = df['close'].iloc[-1]
         timestamp = df.index[-1]
-        
+
+        # Ensure timestamp is timezone-aware (assume UTC if not set)
+        ist = pytz.timezone("Asia/Kolkata")
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        timestamp_ist = timestamp.astimezone(ist)
+
+        # Format supporting details
         pattern_text = self._format_pattern_summary(patterns)
         accuracy = self._calculate_recent_accuracy()
         win_rate = self._calculate_win_rate()
-        
+
+        # Safe ATR formatting
+        atr_value = indicators_data.get("atr")
+        atr_str = f"{atr_value:.2f}" if atr_value is not None else "N/A"
+
+        # Safe momentum
+        momentum_str = f"{indicators_data.get('momentum', 0):.2%}"
+
+        # Safe volume trend
+        volume_trend = indicators_data.get("volume_profile", {}).get("volume_trend", "N/A")
+
         message = f"""
 <b>[PATTERN ALERT]</b>
 {'-' * 25}
 <b>Price:</b> {price:,.2f}
-<b>Time:</b> {timestamp.strftime('%Y-%m-%d %H:%M')}
+<b>Time:</b> {timestamp_ist.strftime('%H:%M:%S IST')}
 
 <b>Patterns ({len(patterns)}):</b>
 {pattern_text}
 
 <b>Prediction:</b>
-  - Direction: {prediction['direction'].upper()}
-  - Confidence: {prediction['confidence']:.1%}
-  - Strength: {prediction['strength'].upper()}
+  - Direction: {prediction.get('direction', 'UNKNOWN').upper()}
+  - Confidence: {prediction.get('confidence', 0):.1%}
+  - Strength: {prediction.get('strength', 'N/A').upper()}
 
 <b>Indicators:</b>
-  - ATR: {indicators_data['atr']:.2f if indicators_data['atr'] else 'N/A'}
-  - Momentum: {indicators_data['momentum']:.2%}
-  - Volume: {indicators_data['volume_profile']['volume_trend']}
+  - ATR: {atr_str}
+  - Momentum: {momentum_str}
+  - Volume: {volume_trend}
 
 <b>Performance:</b>
   - Accuracy: {accuracy:.1%}
@@ -389,7 +428,48 @@ class AlertSystem:
   - Alerts: {self.total_alerts_sent}
 {'-' * 25}
 """
-        return message
+        return message.strip()
+    
+#     def _format_alert_message(self, df: pd.DataFrame, patterns: List[Dict],
+#                              prediction: Dict, indicators_data: Dict) -> str:
+#         """Format comprehensive alert message."""
+#         price = df['close'].iloc[-1]
+#         timestamp = df.index[-1]
+        
+#         pattern_text = self._format_pattern_summary(patterns)
+#         accuracy = self._calculate_recent_accuracy()
+#         win_rate = self._calculate_win_rate()
+#         # Convert timestamp to IST
+#         ist = pytz.timezone("Asia/Kolkata")
+#         timestamp_ist = timestamp.astimezone(ist)
+        
+#         message = f"""
+# <b>[PATTERN ALERT]</b>
+# {'-' * 25}
+# <b>Price:</b> {price:,.2f}
+# <b>Time:</b> {timestamp_ist.strftime('%H:%M:%S IST')}
+        
+
+# <b>Patterns ({len(patterns)}):</b>
+# {pattern_text}
+
+# <b>Prediction:</b>
+#   - Direction: {prediction['direction'].upper()}
+#   - Confidence: {prediction['confidence']:.1%}
+#   - Strength: {prediction['strength'].upper()}
+
+# <b>Indicators:</b>
+#   - ATR: {indicators_data['atr']:.2f if indicators_data['atr'] else 'N/A'}
+#   - Momentum: {indicators_data['momentum']:.2%}
+#   - Volume: {indicators_data['volume_profile']['volume_trend']}
+
+# <b>Performance:</b>
+#   - Accuracy: {accuracy:.1%}
+#   - Win Rate: {win_rate:.1%}
+#   - Alerts: {self.total_alerts_sent}
+# {'-' * 25}
+# """
+#         return message
     
     def _format_pattern_summary(self, patterns: List[Dict]) -> str:
         """Format pattern summary for alert message."""

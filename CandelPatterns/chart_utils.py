@@ -33,15 +33,29 @@ class ChartGenerator:
             'volume_down': '#ff3030',
             'grid': '#e0e0e0'
         }
-
-        # Fix: Use updated style name
+       
+        # FIX: Use proper style configuration
         try:
+            # Try modern style name first
             plt.style.use('seaborn-v0_8-whitegrid')
         except:
-            plt.style.use('seaborn-whitegrid')  # Fallback for older versions
+            try:
+                # Fallback to older style name
+                plt.style.use('seaborn-whitegrid')
+            except:
+                # Use default if seaborn not available
+                plt.style.use('default')
+                logger.warning("Seaborn style not available, using default")
+        
+        # Set matplotlib parameters for better rendering
+        plt.rcParams['figure.facecolor'] = 'white'
+        plt.rcParams['axes.facecolor'] = 'white'
+        plt.rcParams['axes.edgecolor'] = '#cccccc'
+        plt.rcParams['grid.color'] = '#e0e0e0'
+        plt.rcParams['grid.linestyle'] = '--'
+        plt.rcParams['grid.linewidth'] = 0.5
+        
             
-                    
-    
     def create_pattern_chart(self, df: pd.DataFrame, patterns: List[Dict],
                             prediction: Dict, indicators: Dict,
                             output_path: str, last_n_bars: int = 50) -> bool:

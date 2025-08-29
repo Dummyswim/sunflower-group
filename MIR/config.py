@@ -20,10 +20,10 @@ TELEGRAM_BOT_TOKEN_B64 = os.getenv("TELEGRAM_TOKEN_B64", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # System Settings
-COOLDOWN_SECONDS = 180  # 3 minutes between alerts
-MIN_DATA_POINTS = 50  # Increased for better indicator accuracy
+COOLDOWN_SECONDS = 120  # Reduced from 180 for more frequent alerts
+MIN_DATA_POINTS = 35  # Increased for better indicator accuracy
 MAX_BUFFER_SIZE = 5000  # Increased buffer for more data
-LOG_FILE = "logs/trading_system.log"
+LOG_FILE = "logs/trading_system_1.log"
 
 # Technical Indicator Settings
 MACD_FAST = 12
@@ -47,9 +47,19 @@ INDICATOR_WEIGHTS = {
 }
 
 # Signal Thresholds
-BUY_THRESHOLD = 0.60  # 60% bullish signals needed
-SELL_THRESHOLD = -0.60  # 60% bearish signals needed
+BUY_THRESHOLD = 0.3           # Reduced from 0.60
+SELL_THRESHOLD = -0.3         # Reduced from -0.60
 STRONG_SIGNAL_THRESHOLD = 0.75  # 75% for strong signals
+
+# Enhanced Signal Thresholds
+STRONG_BUY_THRESHOLD = 0.6    # Reduced from 0.75 for more signals
+STRONG_SELL_THRESHOLD = -0.6  # Reduced from -0.75
+# Alert Settings
+MIN_CONFIDENCE_FOR_ALERT = 40  # Reduced from 60
+MIN_SCORE_FOR_ALERT = 0.3     # Reduced from 0.5
+
+
+
 
 # Market Data Settings
 NIFTY_SECURITY_ID = 13

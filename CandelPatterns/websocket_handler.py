@@ -1,6 +1,6 @@
 """
-DhanHQ WebSocket handler with robust packet handling and reconnection.
-Based on DhanHQ API v2 documentation.
+DhanHQ WebSocket handler - DhanHQ v2 compliant, robust, and async.
+Fixed packet parsing for correct NIFTY price extraction.
 """
 import asyncio
 import json
@@ -10,252 +10,249 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Any, List
 import websockets
-from websockets.exceptions import WebSocketException
-import base64
+from websockets.exceptions import WebSocketException, ConnectionClosed
 
 logger = logging.getLogger(__name__)
 
 class DhanWebSocketHandler:
     """
-    DhanHQ WebSocket handler with automatic reconnection and packet management.
+    DhanHQ WebSocket handler with proper v2 API implementation.
     """
-    
     def __init__(self, client_id: str, access_token: str):
-        """Initialize WebSocket handler with DhanHQ credentials."""
         self.client_id = client_id
         self.access_token = access_token
-        self.ws_url = "wss://api-feed.dhan.co"
-        
+        self.ws_url = (
+            f"wss://api-feed.dhan.co?version=2"
+            f"&token={access_token}"
+            f"&clientId={client_id}"
+            f"&authType=2"
+        )
         self.websocket = None
-        self.running = False
+        self.running = True
+        self.authenticated = False
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 10
         self.reconnect_delay = 5
-        
+        self._binary_buffer = b''
+
         # Callbacks
         self.on_tick = None
         self.on_connect = None
         self.on_disconnect = None
         self.on_error = None
-        
-        # Buffer for incomplete packets
-        self.packet_buffer = bytearray()
-        self.max_buffer_size = 1024 * 1024  # 1MB max buffer
-        
-        logger.info("DhanWebSocketHandler initialized")
-    
+
+        logger.info("[WS] DhanWebSocketHandler initialized (v2)")
+
     async def connect(self):
         """Establish WebSocket connection to DhanHQ."""
         try:
-            logger.info(f"Connecting to {self.ws_url}")
-            
-            # Build connection URL with auth
-            auth_header = {
-                "Authorization": f"Bearer {self.access_token}",
-                "Client-Id": self.client_id
-            }
-            
+            logger.info(f"[WS] Connecting to DhanHQ WebSocket...")
             self.websocket = await websockets.connect(
                 self.ws_url,
-                extra_headers=auth_header,
                 ping_interval=30,
                 ping_timeout=10,
-                close_timeout=10
+                close_timeout=10,
+                max_size=10 * 1024 * 1024
             )
-            
             self.running = True
+            self.authenticated = True
             self.reconnect_attempts = 0
-            
-            logger.info("WebSocket connected successfully")
-            
+            logger.info("[WS] ✅ WebSocket connected successfully to DhanHQ")
             if self.on_connect:
                 await self.on_connect()
-            
             return True
-            
         except Exception as e:
-            logger.error(f"Connection failed: {e}")
+            logger.error(f"[WS] Connection failed: {e}")
+            self.websocket = None
+            self.authenticated = False
             return False
-    
+
     async def subscribe(self, instruments: List[Dict]):
         """
         Subscribe to market data for instruments.
-        
-        Args:
-            instruments: List of dicts with 'securityId' and 'exchangeSegment'
         """
         if not self.websocket:
-            logger.error("WebSocket not connected")
+            logger.error("[WS] Cannot subscribe - not connected")
             return False
-        
+
         try:
             subscription_data = {
-                "RequestCode": 15,  # Subscribe request
+                "RequestCode": 15,  # 21 = Full Feed, 15 = Touchline
                 "InstrumentCount": len(instruments),
-                "InstrumentList": instruments
+                "InstrumentList": [
+                    {
+                        "ExchangeSegment": inst.get("exchangeSegment") or inst.get("ExchangeSegment"),
+                        "SecurityId": str(inst.get("securityId") or inst.get("SecurityId"))
+                    }
+                    for inst in instruments
+                ]
             }
             
             message = json.dumps(subscription_data)
+            logger.info(f"[WS][DEBUG] Sending subscription: {message}")
             await self.websocket.send(message)
-            
-            logger.info(f"Subscribed to {len(instruments)} instruments")
+            logger.info(f"[WS] ✅ Subscription request sent: {subscription_data}")
+            await asyncio.sleep(0.5)
             return True
-            
         except Exception as e:
-            logger.error(f"Subscription failed: {e}")
+            logger.error(f"[WS] Subscription failed: {e}", exc_info=True)
             return False
-    
+
     async def run(self):
         """Main WebSocket event loop."""
+        logger.info("[WS] Starting WebSocket event loop...")
         while self.running:
             try:
-                if not self.websocket:
-                    if not await self.connect():
+                if not self.websocket or getattr(self.websocket, "closed", True):
+                    logger.info("[WS] WebSocket not connected, attempting connection...")
+                    connected = await self.connect()
+                    if not connected:
+                        logger.error(f"[WS] Connection failed (attempt {self.reconnect_attempts + 1}/{self.max_reconnect_attempts})")
                         await self._handle_reconnect()
                         continue
-                
-                # Receive and process messages
-                async for message in self.websocket:
-                    await self._process_message(message)
-                    
-            except WebSocketException as e:
-                logger.error(f"WebSocket error: {e}")
-                await self._handle_disconnect()
-                
+
+                try:
+                    async for message in self.websocket:
+                        if isinstance(message, bytes):
+                            await self._process_binary_message(message)
+                        else:
+                            await self._process_text_message(message)
+                except ConnectionClosed as e:
+                    logger.warning(f"[WS] Connection closed: {e}")
+                    self.authenticated = False
+                    await self._handle_disconnect()
+                except Exception as e:
+                    logger.error(f"[WS] Error processing messages: {e}")
+                    await self._handle_disconnect()
             except Exception as e:
-                logger.error(f"Unexpected error: {e}", exc_info=True)
+                logger.error(f"[WS] Unexpected error in run loop: {e}", exc_info=True)
                 await asyncio.sleep(1)
-    
-    async def _process_message(self, message: bytes):
-        """Process incoming WebSocket message with proper packet handling."""
+        logger.info("[WS] Event loop ended")
+
+    async def _process_text_message(self, message: str):
+        """Process text/JSON messages from WebSocket."""
         try:
-            # Add to buffer
-            self.packet_buffer.extend(message)
-            
-            # Check buffer size limit
-            if len(self.packet_buffer) > self.max_buffer_size:
-                logger.warning("Buffer overflow, clearing")
-                self.packet_buffer.clear()
-                return
-            
-            # Process complete packets
-            while len(self.packet_buffer) >= 4:
-                # Read packet length (first 4 bytes)
-                packet_length = struct.unpack('<I', self.packet_buffer[:4])[0]
-                
-                # Check if we have complete packet
-                if len(self.packet_buffer) < packet_length:
-                    break  # Wait for more data
-                
-                # Extract packet
-                packet = self.packet_buffer[:packet_length]
-                self.packet_buffer = self.packet_buffer[packet_length:]
-                
-                # Parse packet
-                await self._parse_packet(packet)
-                
+            data = json.loads(message)
+            logger.debug(f"[WS] JSON message received: {data}")
+            if "ResponseCode" in data and data["ResponseCode"] == 200:
+                logger.info("[WS] ✅ Subscription confirmed")
+            if "error" in data or "Error" in data:
+                logger.error(f"[WS] Error message: {data}")
+                if self.on_error:
+                    await self.on_error(data)
+        except json.JSONDecodeError:
+            logger.debug(f"[WS] Non-JSON text message: {message[:100]}")
         except Exception as e:
-            logger.error(f"Message processing error: {e}")
-            self.packet_buffer.clear()
-    
-    async def _parse_packet(self, packet: bytes):
-        """Parse DhanHQ data packet."""
+            logger.error(f"[WS] Text message processing error: {e}")
+
+    async def _process_binary_message(self, message: bytes):
+        """Process binary messages with DhanHQ v2 fixed packet sizes."""
         try:
-            # Skip length prefix
-            data = packet[4:]
+            self._binary_buffer += message
             
-            # Parse based on packet type
-            packet_type = data[0] if data else 0
-            
-            if packet_type == 2:  # Tick data
-                tick_data = self._parse_tick_data(data[1:])
-                if tick_data and self.on_tick:
-                    await self.on_tick(tick_data)
+            while len(self._binary_buffer) > 0:
+                if len(self._binary_buffer) < 1:
+                    break
                     
-            elif packet_type == 4:  # Order update
-                logger.debug("Order update received")
+                packet_type = self._binary_buffer[0]
                 
-            else:
-                logger.debug(f"Unknown packet type: {packet_type}")
+                # DhanHQ v2 packet sizes
+                if packet_type == 1:  # Heartbeat
+                    packet_size = 1
+                elif packet_type == 2:  # Index/Touchline tick (16 bytes)
+                    packet_size = 16
+                elif packet_type == 3:  # Full tick
+                    packet_size = 44
+                elif packet_type == 6:  # Control/Status packet
+                    packet_size = 16
+                else:
+                    logger.warning(f"[WS] Unknown packet type: {packet_type}")
+                    self._binary_buffer = self._binary_buffer[1:]
+                    continue
                 
+                if len(self._binary_buffer) < packet_size:
+                    break
+                
+                # Extract complete packet
+                packet_data = self._binary_buffer[:packet_size]
+                self._binary_buffer = self._binary_buffer[packet_size:]
+                
+                # Parse based on type
+                if packet_type == 1:
+                    logger.debug("[WS] Heartbeat received")
+                elif packet_type == 2:
+                    tick = self._parse_index_tick_v2(packet_data)
+                    if tick and self.on_tick:
+                        await self.on_tick(tick)
+                elif packet_type == 6:
+                    logger.debug("[WS] Control packet received (ignored)")
+                    
         except Exception as e:
-            logger.error(f"Packet parsing error: {e}")
-    
-    def _parse_tick_data(self, data: bytes) -> Optional[Dict]:
-        """Parse tick data from binary format."""
+            logger.error(f"[WS] Binary message processing error: {e}")
+
+    def _parse_index_tick_v2(self, data: bytes) -> Optional[Dict]:
+        """
+        Parse 16-byte index tick packet.
+        CORRECTED: The price is stored as little-endian FLOAT directly!
+        """
+        if len(data) != 16:
+            return None
+        
         try:
-            # DhanHQ tick structure (adjust based on actual API)
-            if len(data) < 44:  # Minimum tick size
-                return None
+            # Byte 0: packet type (already processed)
+            # Bytes 1-3: padding/flags
+            # Bytes 4-7: Security ID (little-endian integer)
+            security_id = struct.unpack('<I', data[4:8])[0]
             
-            # Unpack tick data
-            tick = {}
-            offset = 0
+            # Bytes 8-11: LTP as little-endian FLOAT (not integer!)
+            ltp = struct.unpack('<f', data[8:12])[0]  # <-- THIS IS THE FIX!
+            # No division by 100 needed!
             
-            # Security ID (4 bytes)
-            tick['security_id'] = struct.unpack('<I', data[offset:offset+4])[0]
-            offset += 4
+            # Bytes 12-15: Timestamp (little-endian integer)
+            timestamp = struct.unpack('<I', data[12:16])[0]
             
-            # LTP (4 bytes, divide by 100 for actual price)
-            tick['ltp'] = struct.unpack('<I', data[offset:offset+4])[0] / 100
-            offset += 4
+            tick = {
+                'security_id': security_id,
+                'ltp': ltp,
+                'timestamp': timestamp,
+                'exchange_segment': 0  # IDX_I
+            }
             
-            # Timestamp (8 bytes)
-            tick['timestamp'] = struct.unpack('<Q', data[offset:offset+8])[0]
-            offset += 8
-            
-            # OHLC if available
-            if len(data) >= offset + 16:
-                tick['open'] = struct.unpack('<I', data[offset:offset+4])[0] / 100
-                offset += 4
-                tick['high'] = struct.unpack('<I', data[offset:offset+4])[0] / 100
-                offset += 4
-                tick['low'] = struct.unpack('<I', data[offset:offset+4])[0] / 100
-                offset += 4
-                tick['close'] = struct.unpack('<I', data[offset:offset+4])[0] / 100
-                offset += 4
-            
-            # Volume if available
-            if len(data) >= offset + 8:
-                tick['volume'] = struct.unpack('<Q', data[offset:offset+8])[0]
-            
+            logger.debug(f"[WS] Index tick: ID={security_id} @ {ltp:.2f}")
             return tick
             
         except Exception as e:
-            logger.error(f"Tick parsing error: {e}")
+            logger.error(f"[WS] Index tick parsing error: {e}")
             return None
-    
+
+
     async def _handle_disconnect(self):
         """Handle WebSocket disconnection."""
-        logger.warning("WebSocket disconnected")
-        
+        logger.warning("[WS] Handling disconnect...")
         if self.on_disconnect:
             await self.on_disconnect()
-        
         self.websocket = None
-        
+        self.authenticated = False
         if self.running:
             await self._handle_reconnect()
-    
+
     async def _handle_reconnect(self):
         """Handle reconnection with exponential backoff."""
         if self.reconnect_attempts >= self.max_reconnect_attempts:
-            logger.error("Max reconnection attempts reached")
+            logger.error("[WS] Max reconnection attempts reached. Stopping.")
             self.running = False
             return
-        
         self.reconnect_attempts += 1
         delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), 300)
-        
-        logger.info(f"Reconnecting in {delay}s (attempt {self.reconnect_attempts})")
+        logger.info(f"[WS] Reconnecting in {delay}s (attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})")
         await asyncio.sleep(delay)
-    
+
     async def disconnect(self):
         """Gracefully disconnect WebSocket."""
+        logger.info("[WS] Disconnecting...")
         self.running = False
-        
-        if self.websocket:
+        self.authenticated = False
+        if self.websocket and not getattr(self.websocket, "closed", True):
             await self.websocket.close()
             self.websocket = None
-        
-        logger.info("WebSocket disconnected")
+        logger.info("[WS] Disconnected.")

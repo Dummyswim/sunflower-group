@@ -1,13 +1,24 @@
 """
 Logging configuration module with enhanced error handling.
 Sets up file and console logging with proper formatting.
+Timestamps are recorded in IST (UTC+5:30).
 """
 import logging
 import logging.handlers
 import sys
-import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# Define IST timezone
+IST = timezone(timedelta(hours=5, minutes=30))
+
+class ISTFormatter(logging.Formatter):
+    """Custom formatter to show log timestamps in IST."""
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, IST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat()
 
 def setup_logging(logfile="logs/nifty_alerts.log", console_level=logging.INFO):
     """
@@ -22,8 +33,8 @@ def setup_logging(logfile="logs/nifty_alerts.log", console_level=logging.INFO):
         log_dir = Path(logfile).parent
         log_dir.mkdir(parents=True, exist_ok=True)
         
-        # Create formatter
-        formatter = logging.Formatter(
+        # Create formatter (with IST time conversion)
+        formatter = ISTFormatter(
             '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
@@ -54,7 +65,9 @@ def setup_logging(logfile="logs/nifty_alerts.log", console_level=logging.INFO):
         root_logger.addHandler(console_handler)
         
         # Log successful initialization
-        logging.info(f"Logging initialized - Log file: {logfile}, Console level: {logging.getLevelName(console_level)}")
+        logging.info(
+            f"Logging initialized (IST) - Log file: {logfile}, Console level: {logging.getLevelName(console_level)}"
+        )
         
     except PermissionError as e:
         print(f"ERROR: Permission denied creating log file: {e}", file=sys.stderr)

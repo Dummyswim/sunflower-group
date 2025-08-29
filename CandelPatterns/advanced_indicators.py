@@ -45,6 +45,7 @@ class AdvancedIndicators:
             return 1.0
         
         atr_pct = atr / last_price
+        logger.debug(f"ATR: {atr}, Price: {last_price}, ATR%: {atr_pct:.4f}")
         
         if atr_pct > 0.01:  # >1% volatility
             return 1.2  # Boost confidence
