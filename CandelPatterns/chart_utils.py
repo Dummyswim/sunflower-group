@@ -354,22 +354,37 @@ class ChartGenerator:
         if not indicators:
             return
         
-        atr = indicators.get('atr', 0)
+        # Safely get indicator values with proper None handling
+        atr = indicators.get('atr')
         momentum = indicators.get('momentum', 0)
         volume_trend = indicators.get('volume_profile', {}).get('volume_trend', 'neutral')
         
+        # Format ATR with None check
+        if atr is not None and not pd.isna(atr):
+            atr_str = f"{atr:.2f}"
+        else:
+            atr_str = "N/A"
+        
+        # Format momentum safely
+        if momentum is not None and not pd.isna(momentum):
+            momentum_str = f"{momentum:.2%}"
+        else:
+            momentum_str = "N/A"
+        
+        # Create text with safe formatting
         text = (
-            f"ATR: {atr:.2f}\n"
-            f"Momentum: {momentum:.2%}\n"
+            f"ATR: {atr_str}\n"
+            f"Momentum: {momentum_str}\n"
             f"Volume: {volume_trend}"
         )
         
         props = dict(boxstyle='round,pad=0.5', facecolor='white',
                     edgecolor='gray', linewidth=1, alpha=0.9)
         ax.text(0.98, 0.98, text, transform=ax.transAxes,
-               fontsize=9, verticalalignment='top',
-               horizontalalignment='right',
-               bbox=props, color='black')
+            fontsize=9, verticalalignment='top',
+            horizontalalignment='right',
+            bbox=props, color='black')
+
     
     def _finalize_chart(self, fig, axes, patterns, prediction):
         """Apply final styling to chart."""

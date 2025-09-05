@@ -20,7 +20,7 @@ class ISTFormatter(logging.Formatter):
             return dt.strftime(datefmt)
         return dt.isoformat()
 
-def setup_logging(logfile="logs/nifty_alerts.log", console_level=logging.INFO):
+def setup_logging(logfile="logs/trading_system.log", console_level=logging.INFO):
     """
     Configure logging for the application with enhanced error handling.
     
@@ -76,14 +76,3 @@ def setup_logging(logfile="logs/nifty_alerts.log", console_level=logging.INFO):
         print(f"ERROR: Failed to setup logging: {e}", file=sys.stderr)
         raise
 
-def get_logger(name: str) -> logging.Logger:
-    """
-    Get a logger instance with the given name.
-    
-    Args:
-        name: Logger name (usually __name__)
-    
-    Returns:
-        Logger instance
-    """
-    return logging.getLogger(name)

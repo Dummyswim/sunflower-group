@@ -89,3 +89,64 @@ Updates accuracy rates
 Adjusts confidence scores based on historical hit rates
 Saves pattern history for improving predictions
 This automation essentially acts as a 24/7 pattern scanner that alerts you only when high-probability setups occur, eliminating the need for constant chart monitoring while ensuring you don't miss significant trading opportunities.
+
+
+
+I require a detailed analysis of the code, logs, and images related to the project. The analysis should include the following sections:  
+1. Identification of issues present in the code and logs.  
+2. Evaluation of whether any alerts were missed for genuine signals and, if so, recommendations for fixing these issues.  
+3. Assessment of the performance of the predictions made for the data.  
+4. Investigation into whether the signals and alert messages were reversed, providing clarity on any discrepancies found.  
+
+Please present the findings in a structured format, including the following:  
+- A summary of the identified issues.  
+- A list of the missed alerts with details on the genuine signals (including examples).  
+- Recommendations for resolving the missed alerts (step-by-step actions).  
+- An evaluation of the prediction accuracy with supporting data (graphs, tables, or metrics).  
+- An analysis of any reversed signals and alert messages, with a brief explanation of the implications.  
+
+Ensure that the analysis is thorough and backed by appropriate evidence from the code, logs, and images. Avoid making assumptions without data support. This analysis will be used to improve the system's performance, so it should be clear and actionable, targeting a technical audience.
+
+
+
+
+
+
+
+
+You are a proficient software engineer with a deep understanding of code optimization and script consolidation. Your expertise lies in analyzing multiple scripts that perform similar functions, identifying their unique aspects, and proposing a unified solution that maintains their core functionalities. 
+
+Your task is to analyze the following scripts and provide insights on their similarities and differences, as well as suggest a single, consolidated script. The scripts fetch data from the URL: https://dhanhq.co/docs/v2/live-market-feed/. For context, one script may be fetching ticket data, another may be pulling quote data, and a third may be retrieving the full data set. 
+
+Script one, which uses main_mir.py and dhan_ws_client.py to apply MACD, RSI, VWAP, Keltner, Supertrend, Impulse MACD indicators on the collected data. Predicts if market will be bullish or bearis, sends Telegram alert with chart details and prediction
+
+Script two, which uses main_and5.py and websocket_client.py to apply MACD, RSI, VWAP, Bollinger, OBV indicators on the collected data. Predicts if market will be bullish or bearis, sends Telegram alert with chart details and prediction
+
+Take best practices from websocket_handler.py like async methods.
+
+---
+The output should be structured in a clear and logical manner, including:
+1. A summary of how each script operates.
+2. An explanation of the differences and similarities between the scripts.
+3. Suggestions on how to consolidate them into a single script, ideally utilizing either the quote or full packet data.
+4. A complete example of the consolidated script.
+
+---
+
+While providing your analysis, please keep in mind the following:
+- Focus on the core functionalities of each script.
+- Highlight any redundant operations that can be streamlined.
+- Ensure that the final consolidated script is efficient and easy to understand.
+
+---
+
+Examples may include:
+- A brief comparison chart of operations performed by each script.
+- A mock-up of the consolidated script.
+
+---
+
+Be cautious of maintaining the integrity of the original data fetching logic while optimizing the code. Ensure that the consolidated script does not lose any essential functionalities present in the individual scripts.
+
+
+

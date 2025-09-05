@@ -67,7 +67,6 @@ class SignalMonitor:
                 
                 self._analyze_signal_performance()
                 self._check_signal_patterns()
-                self._cleanup_old_signals()
                 
                 if len(self.signal_history) > 0 and len(self.signal_history) % 50 == 0:
                     self._send_performance_report()
@@ -159,11 +158,6 @@ class SignalMonitor:
                 
             except Exception as e:
                 logger.error(f"Pattern check error: {e}")
-    
-    def _cleanup_old_signals(self):
-        """Remove signals older than 24 hours from detailed tracking."""
-        # Deque handles this automatically with maxlen
-        pass
     
     def _send_performance_report(self):
         """Send performance report to Telegram."""

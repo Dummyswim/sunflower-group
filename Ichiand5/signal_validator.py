@@ -17,7 +17,6 @@ class SignalValidator:
         """Initialize validator with configuration."""
         self.config = config
         self.signal_history = deque(maxlen=100)
-        self.recent_trades = deque(maxlen=20)
         logger.info("SignalValidator initialized")
     
     def validate_signal(self, signal_result: Dict, df: pd.DataFrame, 
@@ -269,7 +268,7 @@ class SignalValidator:
         except Exception as e:
             logger.error(f"Consistency validation error: {e}")
             return {"passed": True, "error": str(e)}
-    
+
     def _validate_risk_management(self, signal_result: Dict, df: pd.DataFrame) -> Dict:
         """Validate risk parameters are acceptable."""
         try:
@@ -279,9 +278,13 @@ class SignalValidator:
             recent_returns = df['close'].pct_change().iloc[-20:]
             volatility = recent_returns.std() * 100
             
+            # FIX: Count only non-NEUTRAL signals from signal_history
             recent_signals = [s for s in self.signal_history 
-                            if (datetime.now() - s['timestamp']).seconds < 3600]
-            
+                if (datetime.now() - s['timestamp']).seconds < 3600 
+                and s.get('valid', True)  # Check if it WAS validated
+                and s.get('signal') not in ['NEUTRAL', 'NO_SIGNAL', 'ERROR']
+    ]
+                        
             signal_frequency = len(recent_signals)
             
             too_volatile = volatility > 3.0
@@ -294,7 +297,8 @@ class SignalValidator:
                 reason = f"High volatility: {volatility:.2f}%"
             elif too_frequent:
                 reason = f"Too frequent: {signal_frequency} signals/hour"
-            
+                
+            logger.debug(f"Passed: {passed}, Reason: {reason}, Risk check - Volatility: {volatility:.2f}%, Frequency: {signal_frequency}/hr")
             return {
                 "passed": passed,
                 "volatility": volatility,

@@ -35,19 +35,28 @@ class PredictionEngine:
             self.momentum_weight /= total
             self.pattern_weight /= total
             self.volume_weight /= total
-    
-    def predict(self, 
-                patterns: List[Dict],
-                momentum: float,
-                volume_profile: Dict,
-                atr_ratio: float,
-                support_resistance: Dict) -> Dict:
+            
+    def predict(self, patterns: List[Dict], momentum: float, volume_profile: Dict,
+            atr_ratio: float, support_resistance: Dict, 
+            df: pd.DataFrame = None, market_context: Dict = None) -> Dict:
+        
         """
         Generate prediction based on all signals.
         
         Returns:
             Dictionary with direction, confidence, and reasoning
         """
+        # Use market_context to adjust predictions
+        if market_context:
+            trend = market_context.get('trend', 'unknown')
+            if trend == 'bullish' and total_score < 0:
+                total_score *= 0.7  # Reduce bearish signals in bullish trend
+            elif trend == 'bearish' and total_score > 0:
+                total_score *= 0.7  # Reduce bullish signals in bearish trend
+                        
+        # Weight patterns by historical accuracy
+        patterns = self._weight_patterns_by_accuracy(patterns)
+        
         # Component scores
         pattern_score = self._calculate_pattern_score(patterns)
         momentum_score = self._calculate_momentum_score(momentum)
@@ -77,6 +86,13 @@ class PredictionEngine:
         # Convert score to prediction
         prediction = self._score_to_prediction(total_score)
         
+        # ADD THIS: Validate with higher timeframe if DataFrame provided
+        if df is not None and len(df) >= 15:  # Need at least 3 candles for 15-min timeframe
+            if not self._check_higher_timeframe(df, prediction):
+                # Reduce confidence if higher timeframe conflicts
+                prediction['confidence'] *= 0.7
+                prediction['warning'] = 'Higher timeframe conflict'
+                        
         # Add reasoning
         prediction["reasoning"] = self._generate_reasoning(
             patterns, momentum, volume_profile, support_resistance, pattern_score
@@ -116,46 +132,38 @@ class PredictionEngine:
         return 0.0
 
     
-    # def _calculate_pattern_score(self, patterns: List[Dict]) -> float:
-    #     """Calculate weighted score from pattern detections."""
-    #     if not patterns:
-    #         return 0.0
+    def _weight_patterns_by_accuracy(self, patterns: List[Dict]) -> List[Dict]:
+        """Weight patterns by their historical accuracy."""
+        weighted_patterns = []
         
-    #     score = 0.0
-    #     total_weight = 0.0
-        
-    #     for pattern in patterns:
-    #         # Weight by confidence and strength
-    #         weight = pattern["confidence"] * pattern["strength"]
+        for pattern in patterns:
+            # Get historical accuracy for this pattern
+            hit_rate = pattern.get('hit_rate', 0.5)
             
-    #         # Adjust for pattern type
-    #         if pattern["type"] == "reversal":
-    #             weight *= 1.2  # Reversals are stronger signals
-    #         elif pattern["type"] == "continuation":
-    #             weight *= 0.8  # Continuations are weaker
+            # Patterns with <50% accuracy get negative weight
+            if hit_rate < 0.5:
+                pattern['effective_confidence'] = pattern['confidence'] * (1 - hit_rate)
+                pattern['direction'] = 'bearish' if pattern['direction'] == 'bullish' else 'bullish'
+            else:
+                pattern['effective_confidence'] = pattern['confidence'] * hit_rate
             
-    #         # Use theoretical_prob or confidence as the prior
-    #         prior = pattern.get("theoretical_prob", pattern.get("confidence", 0.5))
-    #         if pattern["direction"] == "bullish":
-    #             score += weight * (prior - 0.5)
-    #         else:
-    #             score -= weight * (prior - 0.5)            
-            
-    #         total_weight += weight
+            weighted_patterns.append(pattern)
         
-    #     # Normalize
-    #     if total_weight > 0:
-    #         score /= total_weight
-        
-    #     return np.clip(score, -1, 1)
+        return weighted_patterns
+
     
     def _calculate_momentum_score(self, momentum: float) -> float:
         """Convert momentum to normalized score."""
         # Sigmoid-like transformation
         return np.tanh(momentum * 10)  # Scale and bound to [-1, 1]
     
+        
     def _calculate_volume_score(self, volume_profile: Dict) -> float:
         """Calculate score from volume analysis."""
+        # Check if real volume data exists
+        if not volume_profile.get("has_volume", False):
+            return 0.0  # Neutral score when no volume data
+        
         score = 0.0
         
         # Volume ratio contribution
@@ -172,8 +180,13 @@ class PredictionEngine:
         elif trend == "decreasing":
             score -= 0.2
         
+        # Price-volume correlation contribution
+        correlation = volume_profile.get("price_volume_correlation", 0)
+        score += correlation * 0.1
+        
         return np.clip(score, -1, 1)
-    
+
+
     def _calculate_sr_adjustment(self, sr: Dict, current_score: float) -> float:
         """Adjust score based on support/resistance levels."""
         position = sr.get("position", "middle")
@@ -243,3 +256,82 @@ class PredictionEngine:
             reasons.append(f"Price is {position.replace('_', ' ')}")
         
         return " | ".join(reasons) if reasons else "No clear signals"
+
+    def _check_higher_timeframe(self, df: pd.DataFrame, prediction: Dict) -> bool:
+        """Confirm signal with higher timeframe trend."""
+        # Create 15-minute candles from 5-minute data
+        df_15m = df.resample('15min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        })
+        
+        # Check if higher timeframe agrees
+        trend_15m = self._calculate_trend(df_15m.tail(10))
+        
+        if prediction['direction'] == 'bearish' and trend_15m > 0:
+            logger.warning("Bearish signal conflicts with 15m uptrend")
+            return False
+        
+        if not isinstance(df.index, pd.DatetimeIndex):
+            logger.warning("Cannot check higher timeframe - index is not DatetimeIndex")
+            
+        return True
+
+    def _calculate_trend(self, df: pd.DataFrame) -> float:
+        """Calculate trend using simple linear regression."""
+        if len(df) < 2:
+            return 0.0
+        x = np.arange(len(df))
+        y = df['close'].values
+        coeffs = np.polyfit(x, y, 1)
+        return coeffs[0]  # Slope indicates trend
+
+    def validate_with_higher_timeframe(self, signal: Dict, df: pd.DataFrame) -> bool:
+        """
+        Validate signal with higher timeframe analysis.
+        
+        Args:
+            signal: Current signal dictionary
+            df: DataFrame with OHLC data
+            
+        Returns:
+            True if higher timeframe confirms signal
+        """
+        if len(df) < 60:  # Need at least 60 5-min candles for hourly analysis
+            return True  # Can't validate, assume valid
+        
+        # Create 15-minute candles
+        df_15m = df.tail(30).resample('15min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }) if isinstance(df.index, pd.DatetimeIndex) else None
+        
+        # Create hourly candles
+        df_hourly = df.tail(60).resample('60T').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }) if isinstance(df.index, pd.DatetimeIndex) else None
+        
+        if df_15m is None or df_hourly is None:
+            return True
+        
+        # Calculate trends
+        trend_15m = self._calculate_trend(df_15m) if len(df_15m) > 1 else 0
+        trend_hourly = self._calculate_trend(df_hourly) if len(df_hourly) > 1 else 0
+        
+        # Validate signal direction
+        if signal['direction'] == 'bullish':
+            return trend_15m >= 0 and trend_hourly >= 0
+        elif signal['direction'] == 'bearish':
+            return trend_15m <= 0 and trend_hourly <= 0
+        
+        return True

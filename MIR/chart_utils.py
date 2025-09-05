@@ -81,15 +81,15 @@ Take Profit: <b>Rs {take_profit:,.2f}</b>
 Risk/Reward: <b>{risk_reward:.2f}</b>
 
 <b>[SIGNAL ACCURACY & CONFIDENCE]</b>
-📊 Signal Accuracy: <b>{signal_accuracy:.1f}%</b>
-🎯 Confidence of Sustenance: <b>{confidence_sustain:.1f}%</b>
-📈 Win Rate: <b>{win_rate:.1f}%</b>
-💪 Overall Confidence: <b>{confidence:.1f}%</b>
+Signal Accuracy: <b>{signal_accuracy:.1f}%</b>
+Confidence of Sustenance: <b>{confidence_sustain:.1f}%</b>
+Win Rate: <b>{win_rate:.1f}%</b>
+Overall Confidence: <b>{confidence:.1f}%</b>
 
 <b>[SIGNAL DURATION PREDICTION]</b>
-⏱️ Expected Duration: <b>{estimated_minutes} minutes</b>
-📍 Duration Confidence: <b>{duration_confidence}</b>
-📈 Strength Trend: <b>{strength_trend}</b>
+Expected Duration: <b>{estimated_minutes} minutes</b>
+Duration Confidence: <b>{duration_confidence}</b>
+Strength Trend: <b>{strength_trend}</b>
 
 <b>[TECHNICAL INDICATORS]</b>
 """
@@ -101,44 +101,44 @@ Risk/Reward: <b>{risk_reward:.2f}</b>
             
             if name == "macd" and indicators.get("macd"):
                 macd_val = indicators["macd"].get("macd", 0)
-                signal_line_val = indicators["macd"].get("signal", 0)
+                signal_line_val = indicators["macd"].get("signal_line", 0)  # Changed from "signal"
                 histogram = indicators["macd"].get("histogram", 0)
-                message += f"• MACD: {macd_val:.2f} (Signal: {signal_line_val:.2f}, Hist: {histogram:.2f}) - {indicator_signal.upper()}\n"
+                message += f"MACD: {macd_val:.2f} (Signal: {signal_line_val:.2f}, Hist: {histogram:.2f}) - {indicator_signal.upper()}\n"
 
             elif name == "rsi" and indicators.get("rsi"):
                 rsi_val = indicators["rsi"].get("rsi", 50)
-                message += f"• RSI: {rsi_val:.1f} - {indicator_signal.upper()}\n"
+                message += f"RSI: {rsi_val:.1f} - {indicator_signal.upper()}\n"
                 
             elif name == "vwap" and indicators.get("vwap"):
                 vwap_val = indicators["vwap"].get("vwap", 0)
                 deviation = indicators["vwap"].get("deviation", 0)
                 if not np.isnan(vwap_val):
-                    message += f"• VWAP: Rs {vwap_val:.2f} (Dev: {deviation:.1f}%) - {indicator_signal.upper()}\n"
+                    message += f"VWAP: Rs {vwap_val:.2f} (Dev: {deviation:.1f}%) - {indicator_signal.upper()}\n"
                 else:
-                    message += f"• VWAP: No volume data - NEUTRAL\n"
+                    message += f"VWAP: No volume data - NEUTRAL\n"
                 
             elif name == "keltner" and indicators.get("keltner"):
                 position = indicators["keltner"].get("position", "unknown")
                 upper = indicators["keltner"].get("upper", 0)
                 lower = indicators["keltner"].get("lower", 0)
-                message += f"• Keltner: {position} (U:{upper:.0f}/L:{lower:.0f}) - {indicator_signal.upper()}\n"
+                message += f"Keltner: {position} (U:{upper:.0f}/L:{lower:.0f}) - {indicator_signal.upper()}\n"
                 
             elif name == "supertrend" and indicators.get("supertrend"):
                 trend = indicators["supertrend"].get("trend", "unknown")
                 st_value = indicators["supertrend"].get("supertrend", 0)
-                message += f"• Supertrend: {trend} ({st_value:.2f}) - {indicator_signal.upper()}\n"
+                message += f"Supertrend: {trend} ({st_value:.2f}) - {indicator_signal.upper()}\n"
                 
             elif name == "impulse" and indicators.get("impulse"):
                 state = indicators["impulse"].get("state", "unknown")
-                message += f"• Impulse: {state} - {indicator_signal.upper()}\n"
+                message += f"Impulse: {state} - {indicator_signal.upper()}\n"
         
         # Add market structure
         market_structure = signal_result.get('market_structure', {})
         if market_structure:
             message += f"""
 <b>[MARKET STRUCTURE]</b>
-📊 Trend: <b>{market_structure.get('trend', 'unknown').upper()}</b>
-💪 Trend Strength: <b>{market_structure.get('trend_strength', 0):.1f}%</b>
+Trend: <b>{market_structure.get('trend', 'unknown').upper()}</b>
+Trend Strength: <b>{market_structure.get('trend_strength', 0):.1f}%</b>
 """
         
         # Add key levels
@@ -153,9 +153,9 @@ Risk/Reward: <b>{risk_reward:.2f}</b>
         if key_levels:
             message += f"""
 <b>[KEY PRICE LEVELS]</b>
-🔴 Resistance: <b>Rs {key_levels.get('resistance', 0):,.2f}</b>
-🟢 Support: <b>Rs {key_levels.get('support', 0):,.2f}</b>
-⚖️ Pivot: <b>Rs {key_levels.get('pivot', 0):,.2f}</b>
+Resistance: <b>Rs {key_levels.get('resistance', 0):,.2f}</b>
+Support: <b>Rs {key_levels.get('support', 0):,.2f}</b>
+Pivot: <b>Rs {key_levels.get('pivot', 0):,.2f}</b>
 """
         
         # Add recommendation
@@ -288,13 +288,13 @@ def plot_enhanced_chart(
         # Color based on signal
         if 'BUY' in signal_type:
             signal_color = 'green'
-            arrow = '↑'
+            arrow = '↑'  # Fixed
         elif 'SELL' in signal_type:
             signal_color = 'red'
-            arrow = '↓'
+            arrow = '↓'  # Fixed
         else:
             signal_color = 'gray'
-            arrow = '→'
+            arrow = '→'  # Fixed
         
         # Add signal box
         signal_text = f"{arrow} {signal_type}\nConfidence: {confidence:.1f}%"

@@ -27,6 +27,16 @@ class SignalPersistence:
     risk_factors: List[str]
 
 class SignalDurationPredictor:
+    
+    try:
+        import pytz
+        HAS_PYTZ = True
+    except ImportError:
+        HAS_PYTZ = False
+        from datetime import timezone, timedelta
+        IST = timezone(timedelta(hours=5, minutes=30))
+
+        
     """Predict signal duration for 5-15 minute windows."""
     
     def __init__(self):

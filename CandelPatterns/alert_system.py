@@ -29,6 +29,19 @@ class AlertSystem:
     Handles both live WebSocket data and CSV replay for backtesting.
     """
     
+    PATTERN_HIERARCHY = {
+        'CDLMORNINGSTAR': 10,      # 78% historical accuracy
+        'CDLEVENINGSTAR': 10,      # 75% historical accuracy
+        'CDL3BLACKCROWS': 9,       # 80% historical accuracy
+        'CDL3WHITESOLDIERS': 9,    # 82% historical accuracy
+        'CDLENGULFING': 8,         # 72% historical accuracy
+        'CDLHAMMER': 7,            # 68% historical accuracy
+        'CDLSHOOTINGSTAR': 7,      # 65% historical accuracy
+        'CDLHARAMI': 5,            # 55% historical accuracy
+        'CDLDOJI': 3,              # 50% historical accuracy
+        'CDLSPINNINGTOP': 2,       # 48% historical accuracy
+    }
+
     def __init__(self, mode: str = "live", replay_csv: Optional[str] = None):
         """
         Initialize alert system.
@@ -192,53 +205,68 @@ class AlertSystem:
             
             # Log summary
             self._log_analysis_summary(df, patterns, prediction)
-    
+        
     def _perform_analysis(self, df: pd.DataFrame) -> Optional[Tuple]:
         """
-        Perform complete technical and pattern analysis.
-        
-        Returns:
-            Tuple of (patterns, prediction, indicators_data) or None
+        Perform complete technical and pattern analysis with enhancements.
         """
         try:
-
             # Detect all patterns
             talib_patterns = self.pattern_engine.detect_patterns(df)
             enhanced_patterns = self.enhanced_patterns.detect_all_patterns(df) if hasattr(self, 'enhanced_patterns') else []
             all_patterns = talib_patterns + enhanced_patterns
+            all_patterns = self._filter_conflicting_patterns(all_patterns)
 
-
-            for pattern in all_patterns:
+            # Calculate indicators with volume profile
+            volume_profile = self.indicators.calculate_volume_profile(df)
             
-                logger.info(f"Pattern: {pattern['name']} | Direction: {pattern['direction']} | Confidence: {pattern.get('confidence', 0):.2%}")
-                                        
-
-            # Calculate indicators
             indicators_data = {
                 'atr': self.indicators.calculate_atr(df, config.ATR_PERIOD),
                 'momentum': self.indicators.calculate_momentum(df, config.MOMENTUM_LOOKBACK),
-                'volume_profile': self.indicators.calculate_volume_profile(df),
+                'volume_profile': volume_profile,  # Now properly defined
                 'support_resistance': self.indicators.calculate_support_resistance(df)
             }
+            
+            # Get enhanced market context
+            market_context = self.indicators.enhanced_market_context(
+                df, 
+                news_sentiment=None,  # Can be integrated with news API
+                vix_level=None  # Can be integrated with VIX data
+            )
             
             # Calculate volatility ratio
             atr_ratio = self.indicators.calculate_volatility_ratio(
                 df, indicators_data['atr']
             )
             
-            # Generate prediction
+            # Generate prediction with multi-timeframe validation
             prediction = self.prediction_engine.predict(
                 all_patterns,
                 indicators_data['momentum'],
                 indicators_data['volume_profile'],
                 atr_ratio,
-                indicators_data['support_resistance']
+                indicators_data['support_resistance'],
+                df,
+                market_context
             )
             
-            # Calculate signal quality metrics
+            # Validate with higher timeframe
+            if not self.prediction_engine.validate_with_higher_timeframe(prediction, df):
+                prediction['confidence'] *= 0.5
+                prediction['warning'] = 'Higher timeframe conflict'
+            
+            # Calculate signal quality metrics with position sizing
             signal_metrics = self.signal_analyzer.calculate_signal_metrics(
                 all_patterns, df, prediction, indicators_data
             )
+            
+            # Add position sizing
+            if hasattr(self, 'account_balance'):
+                signal_metrics['position_size'] = self.signal_analyzer.calculate_position_size(
+                    self.account_balance,
+                    0.02,  # 2% risk per trade
+                    signal_metrics.get('stop_loss', 100)
+                )
             
             return all_patterns, prediction, indicators_data, signal_metrics
 
@@ -319,7 +347,23 @@ class AlertSystem:
             if elapsed < config.COOLDOWN_SECONDS:
                 logger.debug(f"Alert suppressed - cooldown ({elapsed:.0f}s/{config.COOLDOWN_SECONDS}s)")
                 return False
-        
+
+        # Check pattern consensus
+        has_consensus, consensus_dir = self._check_pattern_consensus(patterns)
+        if not has_consensus:
+            logger.info("Alert suppressed - no pattern consensus")
+            return False
+
+        # ADD THIS CHECK:
+        if consensus_dir != prediction['direction']:
+            logger.warning(f"Alert suppressed - consensus ({consensus_dir}) != prediction ({prediction['direction']})")
+            return False
+                
+        # Apply risk filters
+        if not self._apply_risk_filters(prediction, patterns):
+            logger.info("Alert suppressed - risk filters not met")
+            return False
+            
         # Check pattern count
         if len(patterns) < config.MIN_PATTERNS_FOR_ALERT:
             return False
@@ -429,47 +473,6 @@ class AlertSystem:
 {'-' * 25}
 """
         return message.strip()
-    
-#     def _format_alert_message(self, df: pd.DataFrame, patterns: List[Dict],
-#                              prediction: Dict, indicators_data: Dict) -> str:
-#         """Format comprehensive alert message."""
-#         price = df['close'].iloc[-1]
-#         timestamp = df.index[-1]
-        
-#         pattern_text = self._format_pattern_summary(patterns)
-#         accuracy = self._calculate_recent_accuracy()
-#         win_rate = self._calculate_win_rate()
-#         # Convert timestamp to IST
-#         ist = pytz.timezone("Asia/Kolkata")
-#         timestamp_ist = timestamp.astimezone(ist)
-        
-#         message = f"""
-# <b>[PATTERN ALERT]</b>
-# {'-' * 25}
-# <b>Price:</b> {price:,.2f}
-# <b>Time:</b> {timestamp_ist.strftime('%H:%M:%S IST')}
-        
-
-# <b>Patterns ({len(patterns)}):</b>
-# {pattern_text}
-
-# <b>Prediction:</b>
-#   - Direction: {prediction['direction'].upper()}
-#   - Confidence: {prediction['confidence']:.1%}
-#   - Strength: {prediction['strength'].upper()}
-
-# <b>Indicators:</b>
-#   - ATR: {indicators_data['atr']:.2f if indicators_data['atr'] else 'N/A'}
-#   - Momentum: {indicators_data['momentum']:.2%}
-#   - Volume: {indicators_data['volume_profile']['volume_trend']}
-
-# <b>Performance:</b>
-#   - Accuracy: {accuracy:.1%}
-#   - Win Rate: {win_rate:.1%}
-#   - Alerts: {self.total_alerts_sent}
-# {'-' * 25}
-# """
-#         return message
     
     def _format_pattern_summary(self, patterns: List[Dict]) -> str:
         """Format pattern summary for alert message."""
@@ -663,3 +666,86 @@ class AlertSystem:
             self.telegram.send_message(message)
         
         logger.info("Shutdown complete")
+
+
+    def _filter_conflicting_patterns(self, patterns: List[Dict]) -> List[Dict]:
+        """Filter conflicting patterns based on hierarchy."""
+
+        if len(patterns) <= 1:
+            return patterns
+        
+        bullish = [p for p in patterns if p['direction'] == 'bullish']
+        bearish = [p for p in patterns if p['direction'] == 'bearish']
+        
+        if bullish and bearish:
+            max_bull = max(bullish, key=lambda x: self.PATTERN_HIERARCHY.get(x['name'], 1))
+            max_bear = max(bearish, key=lambda x: self.PATTERN_HIERARCHY.get(x['name'], 1))
+            
+            if self.PATTERN_HIERARCHY.get(max_bull['name'], 1) > self.PATTERN_HIERARCHY.get(max_bear['name'], 1):
+                return [max_bull]
+            else:
+                return [max_bear]
+        
+        return patterns
+
+
+    def _check_pattern_consensus(self, patterns: List[Dict]) -> Tuple[bool, str]:
+        """Check if patterns agree on direction."""
+        bullish_count = sum(1 for p in patterns if p['direction'] == 'bullish')
+        bearish_count = sum(1 for p in patterns if p['direction'] == 'bearish')
+        total = len(patterns)
+        
+        # Calculate consensus ratio
+        if total == 0:
+            return False, "neutral"
+        
+        consensus_ratio = max(bullish_count, bearish_count) / total
+        
+        # Require 70% agreement for valid signal
+        if consensus_ratio < 0.50:
+            logger.warning(f"Pattern conflict: {bullish_count} bull vs {bearish_count} bear")
+            return False, "conflicted"
+        
+        return True, "bullish" if bullish_count > bearish_count else "bearish"
+
+
+    def _apply_risk_filters(self, prediction: Dict, patterns: List[Dict]) -> bool:
+        """Apply risk management filters."""
+        # Rule 1: No trading on conflicting patterns
+        if any(p['name'] == 'three_drives' and p['direction'] != prediction['direction'] 
+            for p in patterns):
+            logger.warning("Three drives pattern conflicts with prediction")
+            return False
+        
+        # Rule 2: Minimum confidence
+        if prediction['confidence'] < config.MIN_CONFIDENCE_FOR_SIGNAL:
+            logger.info(f"Confidence too low: {prediction['confidence']:.1%}")
+            return False
+        
+        # Rule 3: Pattern consensus
+        directions = [p['direction'] for p in patterns]
+        if len(set(directions)) > 1:  # Mixed signals
+            consensus = directions.count(prediction['direction']) / len(directions)
+            if consensus < 0.70:
+                logger.warning(f"Weak consensus: {consensus:.1%}")
+                return False
+        
+        return True
+
+    def _filter_high_quality_patterns(self, patterns: List[Dict]) -> List[Dict]:
+        """Filter for high-quality patterns only."""
+        high_quality = []
+        
+        for pattern in patterns:
+            # Check if pattern is in high-confidence list
+            if pattern['name'] in config.HIGH_CONFIDENCE_PATTERNS:
+                quality_score = (
+                    pattern.get('confidence', 0) * 0.5 +
+                    pattern.get('hit_rate', 0.5) * 0.3 +
+                    pattern.get('strength', 0.5) * 0.2
+                )
+                
+                if quality_score >= 0.6:  # 60% quality threshold
+                    high_quality.append(pattern)
+        
+        return high_quality

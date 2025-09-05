@@ -28,8 +28,8 @@ class DhanWebSocketClient:
         self._validate_config()
         
         try:
-            self.access_token = base64.b64decode(access_token_b64).decode("utf-8")
-            self.client_id = base64.b64decode(client_id_b64).decode("utf-8")
+            self.access_token = base64.b64decode(access_token_b64.strip()).decode("utf-8").strip()
+            self.client_id = base64.b64decode(client_id_b64.strip()).decode("utf-8").strip()
         except Exception as e:
             logger.error(f"Failed to decode credentials: {e}")
             raise ValueError("Invalid base64 encoded credentials")
@@ -95,7 +95,13 @@ class DhanWebSocketClient:
         """Handle WebSocket connection with correct Dhan subscription."""
         logger.info("WebSocket connection established")
         self.connected = True
+
+        # # Fetch historical volume data on connection
+        # self.fetch_historical_volume()
         
+        # # Schedule periodic volume updates
+        # self._schedule_volume_fetch()
+                
         # According to Dhan docs, subscription format for indices
         subscription = {
             "RequestCode": 15,  # Subscribe request
@@ -107,7 +113,8 @@ class DhanWebSocketClient:
         }
         
         ws.send(json.dumps(subscription))
-        logger.info("Subscription sent for NIFTY50")
+        logger.info(f"Subscription sent: {json.dumps(subscription)}")
+        logger.debug(f"Subscription sent: {json.dumps(subscription)}")
         
         # After subscription, request full market data
         time.sleep(0.5)
@@ -123,7 +130,7 @@ class DhanWebSocketClient:
         }
         
         ws.send(json.dumps(mode_request))
-        logger.info("Requested full quote mode")
+        logger.info(f"Requested full quote mode {json.dumps(mode_request)}")
 
         # Send connection notification
         if self.telegram_bot:
@@ -163,8 +170,14 @@ class DhanWebSocketClient:
         """Parse binary packet based on size, not packet code."""
         try:
             packet_size = len(data)
-            logger.debug(f"Received packet of size {packet_size} bytes")
-        
+            # Add counter for debugging
+            if not hasattr(self, 'packet_count'):
+                self.packet_count = 0
+            self.packet_count += 1
+            
+            if self.packet_count % 100 == 0:  # Log every 100 packets
+                logger.info(f"Received {self.packet_count} packets, last size: {packet_size}")
+                
             # Parse based on packet size patterns
             if packet_size == 16:
                 # Could be ticker or minimal quote
@@ -756,81 +769,23 @@ class DhanWebSocketClient:
                 
         except Exception as e:
             logger.error(f"Candle creation error: {e}", exc_info=True)
-            
-    
-    # def _create_minute_candle(self, minute_timestamp: datetime):
-    #     """Create minute OHLCV candle from tick data."""
-    #     try:
-    #         if not self.current_minute_data:
-    #             return
-            
-    #         # Extract prices and volumes
-    #         prices = []
-    #         volumes = []
-            
-    #         for tick in self.current_minute_data:
-    #             if "ltp" in tick and tick["ltp"] > 0:
-    #                 prices.append(tick["ltp"])
-    #             if "volume" in tick:
-    #                 volumes.append(tick["volume"])
-            
-    #         if not prices:
-    #             return
-            
-    #         # Get volume (use last non-zero or estimate)
-    #         volume = 0
-    #         if volumes:
-    #             # Try to find last non-zero volume
-    #             for v in reversed(volumes):
-    #                 if v > 0:
-    #                     volume = v
-    #                     break
-                
-    #             if volume == 0:
-    #                 volume = self.volume_estimator.estimate_from_price_action(prices)
-    #         else:
-    #             volume = self.volume_estimator.get_current_estimate()
-            
-    #         candle = {
-    #             "timestamp": minute_timestamp,
-    #             "open": prices[0],
-    #             "high": max(prices),
-    #             "low": min(prices),
-    #             "close": prices[-1],
-    #             "volume": volume
-    #         }
-            
-    #         # Create new candle DataFrame
-    #         new_candle_df = pd.DataFrame([candle]).set_index("timestamp")
-            
-    #         # Append to minute_ohlcv
-    #         if len(self.minute_ohlcv) == 0:
-    #             self.minute_ohlcv = new_candle_df
-    #         else:
-    #             self.minute_ohlcv = pd.concat([self.minute_ohlcv, new_candle_df], axis=0)
-            
-    #         # Keep only last 500 candles
-    #         self.minute_ohlcv = self.minute_ohlcv.tail(500)
-            
-    #         logger.debug(f"Created minute candle: O={candle['open']:.2f}, H={candle['high']:.2f}, "
-    #                     f"L={candle['low']:.2f}, C={candle['close']:.2f}, V={candle['volume']}")
-            
-    #         # Check for signals
-    #         if len(self.minute_ohlcv) >= config.MIN_DATA_POINTS:
-    #             self._analyze_and_alert()
-                
-    #     except Exception as e:
-    #         logger.error(f"Candle creation error: {e}")
-    
+         
     def _analyze_and_alert(self):
         """Enhanced analysis with predictive signal generation."""
         with self.alert_lock:
             try:
                 # Prepare data
                 df = self.minute_ohlcv.tail(config.MIN_DATA_POINTS)
+
+                # Detect market regime
+                market_regime = self.detect_market_regime(df)
                 
                 # Calculate all indicators
                 indicators = self._calculate_all_indicators(df)
+                
+                # Add market regime to indicators for signal generation
+                indicators['market_regime'] = {'regime': market_regime}
+                                
                 
                 # Use enhanced signal generator for better predictions
                 signal_result = self.enhanced_generator.generate_trading_signal(
@@ -855,24 +810,32 @@ class DhanWebSocketClient:
     def _calculate_all_indicators(self, df: pd.DataFrame) -> Dict:
         """Calculate all technical indicators with type validation."""
         try:
-            # Ensure proper data types
-            df = df.copy()
-            for col in ['open', 'high', 'low', 'close']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            for col in ['volume']:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64')
+            # CRITICAL FIX: Create a fresh copy and force conversion
+            df_clean = pd.DataFrame()
+            df_clean['open'] = pd.to_numeric(df['open'], errors='coerce').astype('float64')
+            df_clean['high'] = pd.to_numeric(df['high'], errors='coerce').astype('float64')
+            df_clean['low'] = pd.to_numeric(df['low'], errors='coerce').astype('float64')
+            df_clean['close'] = pd.to_numeric(df['close'], errors='coerce').astype('float64')
+            df_clean['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0).astype('int64')
+            df_clean.index = df.index
             
             # Drop any rows with NaN prices
-            df = df.dropna(subset=['open', 'high', 'low', 'close'])
+            df_clean = df_clean.dropna(subset=['open', 'high', 'low', 'close'])
             
-            if len(df) == 0:
+            if len(df_clean) == 0:
                 logger.error("No valid data after type conversion")
                 return {}
             
-            prices = pd.Series(df['close'].values, index=df.index)
-            volumes = pd.Series(df['volume'].values, index=df.index)
-            highs = pd.Series(df['high'].values, index=df.index)
-            lows = pd.Series(df['low'].values, index=df.index)
+            # Use the clean DataFrame for calculations
+            prices = pd.Series(df_clean['close'].values, index=df_clean.index, dtype='float64')
+            volumes = pd.Series(df_clean['volume'].values, index=df_clean.index, dtype='int64')
+            highs = pd.Series(df_clean['high'].values, index=df_clean.index, dtype='float64')
+            lows = pd.Series(df_clean['low'].values, index=df_clean.index, dtype='float64')
+            
+            # Debug logging
+            logger.debug(f"DataFrame dtypes after cleaning: {df_clean.dtypes.to_dict()}")
+            logger.debug(f"Sample close values: {prices.head().tolist()}")
+            logger.debug(f"Close series dtype: {prices.dtype}")
             
             return {
                 "macd": TechnicalIndicators.calculate_macd(prices),
@@ -885,23 +848,6 @@ class DhanWebSocketClient:
         except Exception as e:
             logger.error(f"Indicator calculation error: {e}", exc_info=True)
             return {}
-
-    
-    # def _calculate_all_indicators(self, df: pd.DataFrame) -> Dict:
-    #     """Calculate all technical indicators."""
-    #     prices = pd.Series(df['close'].values, index=df.index)
-    #     volumes = pd.Series(df['volume'].values, index=df.index)
-    #     highs = pd.Series(df['high'].values, index=df.index)
-    #     lows = pd.Series(df['low'].values, index=df.index)
-        
-    #     return {
-    #         "macd": TechnicalIndicators.calculate_macd(prices),
-    #         "rsi": TechnicalIndicators.calculate_rsi(prices),
-    #         "vwap": TechnicalIndicators.calculate_vwap(prices, volumes),
-    #         "keltner": TechnicalIndicators.calculate_keltner_channels(prices, highs, lows),
-    #         "supertrend": TechnicalIndicators.calculate_supertrend(prices, highs, lows),
-    #         "impulse": TechnicalIndicators.calculate_impulse_macd(prices)
-    #     }
     
     def _should_alert_with_context(self, signal_result: Dict, df: pd.DataFrame) -> bool:
         """Enhanced alert conditions with market context awareness."""
@@ -987,6 +933,149 @@ class DhanWebSocketClient:
                     
         except Exception as e:
             logger.error(f"Alert sending error: {e}")
+
+    def fetch_historical_volume(self):
+        """Fetch real volume data from Dhan API if WebSocket fails."""
+        try:
+            import requests
+            from datetime import datetime, timedelta
+            
+            logger.info("Fetching historical volume data from REST API")
+            
+            # Get last 100 candles for volume reference
+            end_date = datetime.now()
+            start_date = end_date - timedelta(hours=24)
+            
+            # Dhan API endpoint for historical data
+            url = "https://api.dhan.co/marketfeed/historical"
+            
+            headers = {
+                "access-token": self.access_token,
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "securityId": str(config.NIFTY_SECURITY_ID),
+                "exchangeSegment": config.NIFTY_EXCHANGE_SEGMENT,
+                "instrument": "INDEX",
+                "fromDate": start_date.strftime("%Y-%m-%d"),
+                "toDate": end_date.strftime("%Y-%m-%d"),
+                "interval": "1"  # 1 minute interval
+            }
+            
+            response = requests.post(url, json=payload, headers=headers)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data and 'data' in data:
+                    volumes = []
+                    for candle in data['data']:
+                        if 'volume' in candle and candle['volume'] > 0:
+                            volumes.append(candle['volume'])
+                    
+                    if volumes:
+                        avg_volume = sum(volumes) / len(volumes)
+                        self.volume_estimator.avg_volume_per_minute = int(avg_volume)
+                        logger.info(f"Updated average volume: {avg_volume:,.0f}")
+                        
+                        # Update volume history
+                        for vol in volumes[-100:]:  # Keep last 100
+                            self.volume_estimator.volume_history.append(vol)
+                        
+                        return True
+                        
+            logger.warning(f"Failed to fetch volume data: {response.status_code}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error fetching historical volume: {e}")
+            return False
+    
+    def detect_market_regime(self, df: pd.DataFrame = None) -> str:
+        """
+        Detect if market is trending or ranging.
+        
+        Returns:
+            str: 'trending', 'ranging', or 'undefined'
+        """
+        try:
+            if df is None:
+                df = self.minute_ohlcv
+            
+            if len(df) < 20:
+                logger.debug("Insufficient data for regime detection")
+                return "undefined"
+            
+            # Method 1: ATR-based volatility analysis
+            atr = df['high'] - df['low']
+            atr_std = atr.rolling(20).std()
+            atr_mean = atr.mean()
+            
+            # Low volatility relative to mean indicates ranging
+            if atr_std.iloc[-1] < atr_mean * 0.3:
+                regime = "ranging"
+            else:
+                # Method 2: Directional movement analysis
+                closes = df['close'].values[-20:]
+                
+                # Calculate linear regression slope
+                x = np.arange(len(closes))
+                slope = np.polyfit(x, closes, 1)[0]
+                
+                # Calculate R-squared for trend strength
+                y_pred = np.polyval(np.polyfit(x, closes, 1), x)
+                ss_res = np.sum((closes - y_pred) ** 2)
+                ss_tot = np.sum((closes - np.mean(closes)) ** 2)
+                r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+                
+                # Strong directional movement with high R-squared = trending
+                if abs(slope) > df['close'].mean() * 0.001 and r_squared > 0.6:
+                    regime = "trending"
+                else:
+                    regime = "ranging"
+            
+            # Method 3: ADX indicator (if we want to add it)
+            # adx = self._calculate_adx(df)
+            # if adx > 25:
+            #     regime = "trending"
+            
+            logger.info(f"Market regime detected: {regime}")
+            
+            # Store regime in instance for other methods to use
+            self.current_market_regime = regime
+            
+            # Adjust parameters based on regime
+            if regime == "trending":
+                # In trending markets, be more responsive
+                self.signal_sensitivity = 1.2
+                logger.debug("Increased signal sensitivity for trending market")
+            else:
+                # In ranging markets, be more selective
+                self.signal_sensitivity = 0.8
+                logger.debug("Decreased signal sensitivity for ranging market")
+            
+            return regime
+            
+        except Exception as e:
+            logger.error(f"Market regime detection error: {e}")
+            return "undefined"
+    
+    def _schedule_volume_fetch(self):
+        """Schedule periodic volume data fetching."""
+        def fetch_volume_periodically():
+            while self.connected:
+                try:
+                    # Fetch every 30 minutes
+                    time.sleep(1800)
+                    self.fetch_historical_volume()
+                except Exception as e:
+                    logger.error(f"Periodic volume fetch error: {e}")
+        
+        # Start background thread for volume fetching
+        volume_thread = threading.Thread(target=fetch_volume_periodically, daemon=True)
+        volume_thread.start()
+        logger.info("Scheduled periodic volume fetching")
+
     
     def start_heartbeat(self):
         """Start heartbeat thread to keep connection alive."""

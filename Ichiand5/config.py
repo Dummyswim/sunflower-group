@@ -26,24 +26,23 @@ class TradingConfig:
     PRICE_SANITY_MAX: float = 30000.0
     
     # Data Management
-    MIN_DATA_POINTS: int = 30
+    MIN_DATA_POINTS: int = 5
     MAX_BUFFER_SIZE: int = 10000
-    CANDLE_INTERVAL: int = 300  # 5 minutes in seconds
+    CANDLE_INTERVAL: int = 120  # 5 minutes in seconds
     
     # Alert Management
     COOLDOWN_SECONDS: int = 60
-    MIN_SIGNAL_STRENGTH: float = 0.2
-    MIN_CONFIDENCE: int = 20
-    MIN_ACTIVE_INDICATORS: int = 2
+    MIN_SIGNAL_STRENGTH: float = 0.15  # Increased from 0.08
+    MIN_CONFIDENCE: int = 30  # Increased from 15
+    MIN_ACTIVE_INDICATORS: int = 3  # Increased from 2
     
     # Signal Duration
     SIGNAL_SUSTAIN_THRESHOLD: float = 0.6
-    SIGNAL_ACCURACY_WINDOW: int = 10
     MAX_SIGNAL_DURATION_MINUTES: int = 15
     MIN_SIGNAL_DURATION_MINUTES: int = 5
     
     # Signal Validation
-    SIGNAL_VALIDATION_SCORE: float = 0.4
+    SIGNAL_VALIDATION_SCORE: float = 0.25  # Reduced from 0.3
     VOLUME_MULTIPLIER: float = 1.2
     
     # Indicator Weights (must sum to 1.0)
@@ -57,27 +56,26 @@ class TradingConfig:
     
     # RSI Parameters
     RSI_PARAMS: Dict = field(default_factory=lambda: {
-        "period": 9,
+        "period": 14,
         "overbought": 75,
-        "oversold": 25,
-        "neutral_zone": (40, 60)
+        "oversold": 25
     })
     
     # MACD Parameters
     MACD_PARAMS: Dict = field(default_factory=lambda: {
-        "fastperiod": 8,
-        "slowperiod": 17,
+        "fastperiod": 12,
+        "slowperiod": 26,
         "signalperiod": 9
     })
     
     # VWAP Parameters
     VWAP_PARAMS: Dict = field(default_factory=lambda: {
-        "window": 3
+        "window": 5
     })
     
     # Bollinger Bands Parameters
     BOLLINGER_PARAMS: Dict = field(default_factory=lambda: {
-        "period": 10,
+        "period": 20,
         "stddev": 2
     })
     
@@ -92,12 +90,13 @@ class TradingConfig:
     chart_save_path: str = 'images/'
     
     # Logging Configuration
-    log_file: str = "logs/nifty_alerts.log"
+    log_file: str = "logs/trading_system.log"
     log_level: str = "INFO"
     
     # Performance Tracking
     track_performance: bool = True
     performance_report_interval: int = 3600
+
     
     def validate(self) -> bool:
         """Validate configuration parameters."""

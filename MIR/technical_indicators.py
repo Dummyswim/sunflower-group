@@ -388,17 +388,25 @@ class EnhancedSignalGenerator:
                          entry_points: Dict) -> Tuple[str, float]:
         """Determine signal type and confidence based on market conditions."""
         logger.debug("Determining signal from market conditions")
+        logger.info(f"Signal determination: trend={market_structure['trend']}, "
+                f"momentum={leading_signals['momentum']:.3f}")
         
         if market_structure['trend'] == 'uptrend':
             if leading_signals['momentum'] > 0.3 and entry_points['near_support']:
                 logger.info("Strong BUY signal detected - uptrend with support bounce")
                 return "STRONG_BUY", 80 + (leading_signals['strength'] * 15)
+            elif leading_signals['oversold'] and leading_signals['momentum'] > 0:
+                logger.info(f"BUY signal detected - uptrend with favorable {leading_signals['oversold']} and {leading_signals['momentum']} greater than 0")
+                return "BUY", 70  # Buy on oversold in uptrend
             elif leading_signals['momentum'] > 0 and entry_points['risk_reward_favorable']:
                 logger.info("BUY signal detected - uptrend with favorable R:R")
                 return "BUY", 65 + (leading_signals['strength'] * 10)
             elif leading_signals['momentum'] < -0.5 and entry_points['near_resistance']:
                 logger.debug("Weak SELL in uptrend - near resistance")
                 return "WEAK_SELL", 50
+            elif leading_signals['overbought']:
+                logger.info(f"HOLD signal detected - uptrend is favorable but {leading_signals['overbought']} condition")
+                return "HOLD", 40  # Don't sell immediately in uptrend
             else:
                 return "HOLD", 40
                 
@@ -749,38 +757,38 @@ class TechnicalIndicators:
             histogram = macd_line - signal_line
             
             # Determine signal
-            current_hist = histogram.iloc[-1]
-            prev_hist = histogram.iloc[-2]
-            
+            current_hist = float(histogram.iloc[-1])
+            prev_hist = float(histogram.iloc[-2])
+
             if current_hist > 0 and prev_hist <= 0:
-                signal_type = "buy"
-                logger.debug("MACD bullish crossover detected")
+                state = "buy"
+                logger.debug("MACD bullish crossover detected - {state}")
             elif current_hist < 0 and prev_hist >= 0:
-                signal_type = "sell"
-                logger.debug("MACD bearish crossover detected")
+                state = "sell"
+                logger.debug("MACD bearish crossover detected - {state}")
             elif current_hist > 0:
-                signal_type = "bullish"
+                state = "bullish"
+                logger.debug("MACD {state} detected")
             elif current_hist < 0:
-                signal_type = "bearish"
+                state = "bearish"
+                logger.debug("MACD {state} detected")
             else:
-                signal_type = "neutral"
-            
+                state = "neutral"
+                logger.debug("MACD {state} detected")
             result = {
-                "macd": macd_line.iloc[-1],
-                "signal": signal_line.iloc[-1],
-                "histogram": histogram.iloc[-1],
-                "signal": signal_type,
+                "macd": float(macd_line.iloc[-1]),
+                "signal_line": float(signal_line.iloc[-1]),
+                "histogram": float(histogram.iloc[-1]),
+                "state": state,
                 "macd_series": macd_line,
                 "signal_series": signal_line,
                 "histogram_series": histogram
             }
-            
-            logger.debug(f"MACD: {result['macd']:.2f}, Signal: {result['signal']:.2f}, Hist: {result['histogram']:.2f}")
+            logger.debug(f"MACD: {result['macd']:.2f}, SignalLine: {result['signal_line']:.2f}, Hist: {result['histogram']:.2f}")
             return result
-            
         except Exception as e:
             logger.error(f"MACD calculation error: {e}")
-            return {"signal": "neutral"}
+            return {"state": "neutral"}
     
     @staticmethod
     def calculate_rsi(prices: pd.Series, period: int = 14) -> Dict:
@@ -829,44 +837,64 @@ class TechnicalIndicators:
             if len(prices) < period:
                 logger.warning(f"Insufficient data for VWAP: {len(prices)} < {period}")
                 return {"signal": "neutral"}
+
+            tp = prices
+            vol_roll = volumes.rolling(window=period).sum()
+            tpv_roll = (tp * volumes).rolling(window=period).sum()
+
+            vwap_from_fallback = False
+            # If no volume info (sum=0) in the window, fallback to SMA
+            if vol_roll.iloc[-1] == 0 or np.isnan(vol_roll.iloc[-1]):
+                vwap = prices.rolling(window=period).mean()
+                vwap_from_fallback = True
+            else:
+                vwap = tpv_roll / vol_roll
+
+            current_price = float(prices.iloc[-1])
+            current_vwap = float(vwap.iloc[-1]) if not np.isnan(vwap.iloc[-1]) else current_price
+            deviation = ((current_price - current_vwap) / current_vwap) * 100 if current_vwap != 0 else 0.0
+
             
-            typical_price = prices
-            cumulative_tpv = (typical_price * volumes).rolling(window=period).sum()
-            cumulative_volume = volumes.rolling(window=period).sum()
+            # typical_price = prices
+            # cumulative_tpv = (typical_price * volumes).rolling(window=period).sum()
+            # cumulative_volume = volumes.rolling(window=period).sum()
             
             # Avoid division by zero
-            cumulative_volume = cumulative_volume.replace(0, 1)
-            vwap = cumulative_tpv / cumulative_volume
+            # cumulative_volume = cumulative_volume.replace(0, 1)
+            # vwap = cumulative_tpv / cumulative_volume
             
-            current_price = prices.iloc[-1]
-            current_vwap = vwap.iloc[-1]
+            # current_price = prices.iloc[-1]
+            # current_vwap = vwap.iloc[-1]
             
-            if np.isnan(current_vwap):
-                logger.warning("VWAP is NaN, using price as fallback")
-                current_vwap = current_price
+            # if np.isnan(current_vwap):
+            #     logger.warning("VWAP is NaN, using price as fallback")
+            #     current_vwap = current_price
             
-            deviation = ((current_price - current_vwap) / current_vwap) * 100
-            
-            if deviation > 2:
-                signal_type = "overbought"
-            elif deviation < -2:
-                signal_type = "oversold"
-            elif deviation > 0:
-                signal_type = "bullish"
-            elif deviation < 0:
-                signal_type = "bearish"
-            else:
+            # deviation = ((current_price - current_vwap) / current_vwap) * 100
+        
+            if vwap_from_fallback:
                 signal_type = "neutral"
+            else:
+                if deviation > 2:
+                    signal_type = "overbought"
+                elif deviation < -2:
+                    signal_type = "oversold"
+                elif deviation > 0:
+                    signal_type = "bullish"
+                elif deviation < 0:
+                    signal_type = "bearish"
+                else:
+                    signal_type = "neutral"
             
-            logger.debug(f"VWAP: {current_vwap:.2f}, Deviation: {deviation:.2f}%")
+            logger.debug(f"VWAP: {current_vwap:.2f}, Deviation: {deviation:.2f}%, fallback={vwap_from_fallback}")
             
             return {
                 "vwap": current_vwap,
-                "deviation": deviation,
+                "deviation": float(deviation),
                 "signal": signal_type,
-                "vwap_series": vwap
+                "vwap_series": vwap,
+                "fallback": vwap_from_fallback
             }
-            
         except Exception as e:
             logger.error(f"VWAP calculation error: {e}")
             return {"signal": "neutral"}

@@ -63,20 +63,28 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_vwap(df: pd.DataFrame, params: Dict) -> pd.Series:
-        """Calculate VWAP with validation."""
+        """Calculate VWAP correctly handling zero volume periods."""
         try:
-            window = params.get("window", 3)
+            window = params.get("window", 5)  # 5 periods for 5-min candles = 25 min
             
+            # Calculate typical price
             typical_price = (df['high'] + df['low'] + df['close']) / 3
+            
+            # DO NOT REPLACE ZEROS - they should have zero weight
             pv = typical_price * df['volume']
             
+            # Rolling sums
             pv_sum = pv.rolling(window=window, min_periods=1).sum()
             vol_sum = df['volume'].rolling(window=window, min_periods=1).sum()
             
+            # Calculate VWAP (will be NaN when vol_sum is 0, which is correct)
             vwap = pv_sum / vol_sum
-            vwap = vwap.fillna(df['close'])
             
-            logger.debug(f"VWAP calculated: {vwap.iloc[-1]:.2f}" if len(vwap) > 0 else "VWAP empty")
+            # Only fill NaN where no VWAP exists (no volume in window)
+            # Use forward fill first to maintain last valid VWAP
+            vwap = vwap.ffill().fillna(df['close'])
+            
+            logger.debug(f"VWAP: {vwap.iloc[-1]:.2f}, Close: {df['close'].iloc[-1]:.2f}")
             return vwap
             
         except Exception as e:
@@ -217,12 +225,14 @@ class SignalGenerator:
         """Get RSI signal and check for crossovers."""
         try:
             if 'rsi' not in indicators or indicators['rsi'].empty:
+                logger.debug("RSI data missing or empty")
                 return 0, None
             
             rsi = indicators['rsi'].iloc[-1]
             if np.isnan(rsi):
+                logger.debug("RSI value is NaN")
                 return 0, None
-                
+                                        
             prev_rsi = indicators['rsi'].iloc[-2] if len(indicators['rsi']) > 1 else rsi
             
             overbought = params['overbought']
@@ -276,10 +286,11 @@ class SignalGenerator:
                 crossover = "bearish"
             
             if hist > 0:
-                strength = min(abs(hist) / 0.1, 1.0)
+                # FIX: More reasonable scaling for MACD histogram
+                strength = min(abs(hist) / 2, 1.0)  # Changed from 0.1 to 2
                 return strength, crossover
             elif hist < 0:
-                strength = -min(abs(hist) / 0.1, 1.0)
+                strength = -min(abs(hist) / 2, 1.0)  # Changed from 0.1 to 10
                 return strength, crossover
             else:
                 return 0, crossover
@@ -390,20 +401,21 @@ class SignalGenerator:
     
     def _determine_composite_signal(self, score: float, active_count: int) -> str:
         """Determine composite signal from score and active indicators."""
-        if active_count == 0:
+        if active_count < 2:  # Need at least 2 indicators
             return "NO_SIGNAL"
         
-        if score >= 0.7:
+        # Adjusted thresholds for realistic scores
+        if score >= 0.25:
             return "STRONG_BUY"
-        elif score >= 0.3:
+        elif score >= 0.10:
             return "BUY"
-        elif score <= -0.7:
+        elif score <= -0.25:
             return "STRONG_SELL"
-        elif score <= -0.3:
+        elif score <= -0.10:
             return "SELL"
         else:
             return "NEUTRAL"
-    
+            
     def _get_default_signal_result(self) -> Dict:
         """Return default signal result on error."""
         return {

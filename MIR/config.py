@@ -14,9 +14,9 @@ Path("images").mkdir(exist_ok=True)
 
 # API Credentials (ensure these are properly encoded)
 # Example: base64.b64encode("your_actual_token".encode()).decode()
-DHAN_ACCESS_TOKEN_B64 = os.getenv("DHAN_TOKEN_B64", "")  # Use environment variables for security
-DHAN_CLIENT_ID_B64 = os.getenv("DHAN_CLIENT_B64", "")
-TELEGRAM_BOT_TOKEN_B64 = os.getenv("TELEGRAM_TOKEN_B64", "")
+DHAN_ACCESS_TOKEN_B64 = os.getenv("DHAN_TOKEN_B64", "").strip()  # Use environment variables for security
+DHAN_CLIENT_ID_B64 = os.getenv("DHAN_CLIENT_B64", "").strip()
+TELEGRAM_BOT_TOKEN_B64 = os.getenv("TELEGRAM_TOKEN_B64", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # System Settings
@@ -26,9 +26,9 @@ MAX_BUFFER_SIZE = 5000  # Increased buffer for more data
 LOG_FILE = "logs/trading_system_1.log"
 
 # Technical Indicator Settings
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
+MACD_FAST = 8
+MACD_SLOW = 17
+MACD_SIGNAL = 5
 RSI_PERIOD = 14
 VWAP_PERIOD = 20
 KELTNER_PERIOD = 20
@@ -36,14 +36,14 @@ KELTNER_MULTIPLIER = 2.0
 SUPERTREND_PERIOD = 10
 SUPERTREND_MULTIPLIER = 3.0
 
-# Indicator Weights for Signal Generation
+
 INDICATOR_WEIGHTS = {
-    "macd": 0.25,
-    "rsi": 0.20,
-    "vwap": 0.20,
-    "keltner": 0.15,
-    "supertrend": 0.15,
-    "impulse": 0.05
+    "macd": 0.20,      # Reduce from 0.25 after fix
+    "rsi": 0.20,       # Keep at 0.20
+    "vwap": 0.15,      # Reduce from 0.20 (unreliable)
+    "keltner": 0.15,   # Keep at 0.15
+    "supertrend": 0.25, # Increase from 0.15 (best performer)
+    "impulse": 0.05    # Keep at 0.05
 }
 
 # Signal Thresholds
@@ -55,9 +55,8 @@ STRONG_SIGNAL_THRESHOLD = 0.75  # 75% for strong signals
 STRONG_BUY_THRESHOLD = 0.6    # Reduced from 0.75 for more signals
 STRONG_SELL_THRESHOLD = -0.6  # Reduced from -0.75
 # Alert Settings
-MIN_CONFIDENCE_FOR_ALERT = 40  # Reduced from 60
-MIN_SCORE_FOR_ALERT = 0.3     # Reduced from 0.5
-
+MIN_CONFIDENCE_FOR_ALERT = 30  # Reduced from 60
+MIN_SCORE_FOR_ALERT = 0.5    # Reduced from 0.5
 
 
 

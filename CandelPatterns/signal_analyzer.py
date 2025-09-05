@@ -61,6 +61,12 @@ class SignalQualityAnalyzer:
         if not patterns or df.empty:
             return metrics
         
+        # ADD THIS: Adjust prediction for support/resistance
+        if len(df) > 0:
+            current_price = df['close'].iloc[-1]
+            sr = indicators.get('support_resistance', {})
+            prediction = self._adjust_for_support_resistance(prediction, sr, current_price)
+                    
         # Calculate accuracy score
         metrics['accuracy_score'] = self._calculate_accuracy_score(patterns, indicators)
         
@@ -240,9 +246,22 @@ class SignalQualityAnalyzer:
         
         current_price = float(df['close'].iloc[-1])
         
-        # Calculate ATR-based targets
-        atr = indicators.get('atr', current_price * 0.01)
-        
+        # FIX: Ensure ATR is never None
+        atr = indicators.get('atr')
+        if atr is None or pd.isna(atr):
+            # Calculate fallback ATR or use percentage-based default
+            if len(df) >= 14:
+                high_low = df['high'] - df['low']
+                high_close = np.abs(df['high'] - df['close'].shift())
+                low_close = np.abs(df['low'] - df['close'].shift())
+                ranges = pd.concat([high_low, high_close, low_close], axis=1)
+                true_range = ranges.max(axis=1)
+                atr = true_range.rolling(14).mean().iloc[-1]
+            
+            # If still None, use 0.5% of current price as default
+            if atr is None or pd.isna(atr):
+                atr = current_price * 0.005
+                
         # Get support/resistance levels with proper null checks
         sr = indicators.get('support_resistance', {})
         support = sr.get('support')
@@ -297,66 +316,28 @@ class SignalQualityAnalyzer:
             'take_profit': round(take_profit, 2)
         }
 
+    def _adjust_for_support_resistance(self, prediction: Dict, 
+                                    sr: Dict, current_price: float) -> Dict:
+        """Adjust prediction based on proximity to support/resistance."""
+        support = sr.get('support')
+        resistance = sr.get('resistance')
+        
+        if support and current_price <= support * 1.002:  # Within 0.2% of support
+            if prediction['direction'] == 'bearish':
+                # Reduce bearish confidence near support
+                prediction['confidence'] *= 0.5
+                prediction['warning'] = "Near support - reversal likely"
+                logger.warning(f"Bearish signal near support {support:.2f}")
+        
+        if resistance and current_price >= resistance * 0.998:  # Within 0.2% of resistance
+            if prediction['direction'] == 'bullish':
+                # Reduce bullish confidence near resistance
+                prediction['confidence'] *= 0.5
+                prediction['warning'] = "Near resistance - reversal likely"
+        
+        return prediction
 
-    # def _calculate_risk_reward(self, df: pd.DataFrame, 
-    #                           prediction: Dict,
-    #                           indicators: Dict) -> Dict:
-    #     """Calculate risk/reward ratio and price targets."""
-    #     if df.empty:
-    #         return {'risk_reward_ratio': 1.0, 'stop_loss': 0, 'take_profit': 0}
         
-    #     current_price = float(df['close'].iloc[-1])
-        
-    #     # Calculate ATR-based targets
-    #     atr = indicators.get('atr', current_price * 0.01)  # Default 1% if no ATR
-        
-    #     # Get support/resistance levels
-    #     sr = indicators.get('support_resistance', {})
-    #     support = sr.get('support', current_price * 0.98)
-    #     resistance = sr.get('resistance', current_price * 1.02)
-        
-    #     if prediction['direction'] == 'bullish':
-    #         recent_low = df['low'].tail(5).min() if len(df) >= 5 else current_price * 0.98
-    #             # Stop loss below recent low or support
-    #         stop_loss = min(
-    #             recent_low if recent_low is not None else current_price * 0.98,
-    #             support if support is not None else current_price * 0.98
-    #            ) * 0.995  # Small buffer
-            
-    #         # Take profit at resistance or ATR-based target
-    #         take_profit = max(
-    #             resistance,
-    #             current_price + (2 * atr)
-    #         )
-            
-    #     elif prediction['direction'] == 'bearish':
-    #         # Stop loss above recent high or resistance
-    #         stop_loss = max(
-    #             df['high'].tail(5).max(),
-    #             resistance
-    #         ) * 1.005  # Small buffer
-            
-    #         # Take profit at support or ATR-based target
-    #         take_profit = min(
-    #             support,
-    #             current_price - (2 * atr)
-    #         )
-    #     else:
-    #         return {'risk_reward_ratio': 1.0, 'stop_loss': 0, 'take_profit': 0}
-        
-    #     # Calculate risk and reward
-    #     risk = abs(current_price - stop_loss)
-    #     reward = abs(take_profit - current_price)
-        
-    #     # Calculate ratio
-    #     risk_reward_ratio = reward / risk if risk > 0 else 1.0
-        
-    #     return {
-    #         'risk_reward_ratio': round(risk_reward_ratio, 2),
-    #         'stop_loss': round(stop_loss, 2),
-    #         'take_profit': round(take_profit, 2)
-    #     }
-    
     def _determine_signal_strength(self, metrics: Dict) -> str:
         """Determine overall signal strength based on all metrics."""
         # Calculate composite score
@@ -453,3 +434,26 @@ class SignalQualityAnalyzer:
                 for pattern, durations in self.pattern_durations.items()
             }
         }
+
+    def calculate_position_size(self, account_balance: float, risk_per_trade: float, 
+                            stop_loss_points: float) -> int:
+        """
+        Calculate position size based on risk management rules.
+        
+        Args:
+            account_balance: Total account balance
+            risk_per_trade: Risk percentage per trade (e.g., 0.02 for 2%)
+            stop_loss_points: Stop loss distance in points
+            
+        Returns:
+            Position size (number of contracts/shares)
+        """
+        if stop_loss_points <= 0:
+            logger.warning("Invalid stop loss points, returning minimum position")
+            return 1
+        
+        risk_amount = account_balance * risk_per_trade
+        position_size = risk_amount / stop_loss_points
+        
+        # Ensure minimum position size
+        return max(1, int(position_size))
