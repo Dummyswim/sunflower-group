@@ -182,7 +182,7 @@ def setup_logging(
         if enable_colors:
             console_formatter = ColoredFormatter(
                 '%(asctime)s - %(levelname)-8s - [%(module_context)s] - %(message)s',
-                datefmt='%H:%M:%S'
+                datefmt='%Y-%m-%d %H:%M:%S'
             )
         else:
             console_formatter = ISTFormatter(
@@ -258,6 +258,8 @@ def setup_logging(
         logging.getLogger('websockets').setLevel(logging.WARNING)
         logging.getLogger('urllib3').setLevel(logging.WARNING)
         logging.getLogger('matplotlib').setLevel(logging.WARNING)
+        logging.getLogger("urllib3.connectionpool").setLevel(logging.INFO)
+
         
         # ========== LOG INITIALIZATION SUCCESS ==========
         logging.info("=" * 60)

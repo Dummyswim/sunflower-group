@@ -59,6 +59,8 @@ class EnhancedUnifiedTradingSystem:
         self.last_candle_ts_5m = None
         # Track live alerts outcomes (next 3 bars MFE/MAE)
         self.live_alerts = []
+        # Pre-close prepared signals cache 
+        self._preview_cache: Dict[datetime, Dict[str, Any]] = {}
 
         
         # Tracking
@@ -74,7 +76,7 @@ class EnhancedUnifiedTradingSystem:
         
         # Multi-timeframe data
         self.candle_aggregator_15m = []  # Aggregate 5-min candles to 15-min
-        
+
         logger.info("System components initialized")
     
     async def initialize(self) -> bool:
@@ -105,8 +107,17 @@ class EnhancedUnifiedTradingSystem:
             self.websocket_handler.on_candle = self.on_candle_complete
             self.websocket_handler.on_tick = self.on_tick_received
             self.websocket_handler.on_error = self.on_websocket_error
-            logger.info("✅ WebSocket handler initialized")
             
+
+                
+            # NEW: Set up pre-close handler AFTER websocket is initialized
+            
+            self.websocket_handler.on_preclose = self.on_preclose_predict 
+            logger.info("✓ Pre-close predictive handler wired (on_preclose=on_preclose_predict)")
+            
+
+            logger.info("✅ WebSocket handler initialized")
+
             # 4. Initialize Telegram bot
             logger.info("[4/9] Initializing Telegram bot...")
             self.telegram_bot = TelegramBot(
@@ -149,6 +160,8 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             )
             # Pass pattern detectors to signal analyzer
             self.signal_analyzer.pattern_detector = self.pattern_detector
+        
+
             self.signal_analyzer.resistance_detector = self.resistance_detector
             logger.info("✅ Signal analyzer initialized")
             
@@ -168,6 +181,293 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             logger.error(f"Initialization failed: {e}", exc_info=True)
             self.stats['errors'] += 1
             return False
+    
+    
+        
+    async def on_pre_close_analysis(self, temp_candle: pd.DataFrame, candle_start: datetime) -> None:
+        """
+        Analyze candle BEFORE it closes to predict the NEXT candle.
+        This runs 5-10 seconds before candle close.
+        """
+        try:
+            logger.info("=" * 60)
+            logger.info("=" * 60)
+            logger.info(f"🔮 PRE-CLOSE PREDICTIVE ANALYSIS")
+            logger.info(f"   Analyzing candle: {candle_start.strftime('%H:%M:%S')}")
+            logger.info(f"   Predicting for: {(candle_start + timedelta(seconds=300)).strftime('%H:%M:%S')}")
+            logger.info("=" * 60)
+            logger.info("=" * 60)
+            
+            if temp_candle.empty:
+                logger.warning("No temporary candle data for pre-close analysis")
+                return
+            
+            # Get current data and append temporary candle
+            df_5m = self.persistence_manager.get_data("5m", 99)  # Get 99 to make 100 with temp
+            
+            if not df_5m.empty:
+                # Append temp candle for analysis
+                df_5m_with_temp = pd.concat([df_5m, temp_candle])
+                df_5m_with_temp = df_5m_with_temp[~df_5m_with_temp.index.duplicated(keep='last')]
+                logger.info(f"Analyzing with {len(df_5m_with_temp)} candles (including temp)")
+            else:
+                df_5m_with_temp = temp_candle
+            
+            # Get 15m data
+            df_15m = self.persistence_manager.get_data("15m", 50)
+            
+            # Calculate indicators on incomplete data
+            logger.info("Calculating indicators on pre-close data...")
+            indicators_5m = await self.technical_analysis.calculate_all_indicators(df_5m_with_temp)
+            
+            indicators_15m = None
+            if not df_15m.empty:
+                indicators_15m = await self.calculate_15m_indicators(df_15m)
+            
+            # Generate PREDICTIVE signal
+            logger.info("Generating predictive signal for NEXT candle...")
+            predictive_signal = await self.signal_analyzer.analyze_and_generate_signal(
+                indicators_5m,
+                df_5m_with_temp,
+                indicators_15m,
+                df_15m
+            )
+            
+            if predictive_signal and predictive_signal.get('confidence', 0) >= self.config.min_confidence:
+                # Calculate next candle timing
+                next_candle_start = candle_start + timedelta(seconds=self.config.candle_interval_seconds)
+                next_candle_end = next_candle_start + timedelta(seconds=self.config.candle_interval_seconds)
+                
+                logger.info("=" * 60)
+                logger.info(f"🎯 PREDICTION GENERATED for {next_candle_start.strftime('%H:%M:%S')} candle:")
+                logger.info(f"   Signal: {predictive_signal.get('composite_signal')}")
+                logger.info(f"   Confidence: {predictive_signal.get('confidence', 0):.1f}%")
+                logger.info(f"   Score: {predictive_signal.get('weighted_score', 0):.3f}")
+                logger.info(f"   Prediction: {predictive_signal.get('next_candle_prediction')}")
+                logger.info("=" * 60)
+                
+                # Send predictive alert
+                await self.send_predictive_alert(predictive_signal, next_candle_start, df_5m_with_temp)
+                
+                # Store prediction for tracking
+                self.last_prediction = {
+                    'time': next_candle_start,
+                    'signal': predictive_signal.get('composite_signal'),
+                    'confidence': predictive_signal.get('confidence'),
+                    'predicted_at': datetime.now()
+                }
+            else:
+                logger.info("No high-confidence prediction for next candle")
+                
+        except Exception as e:
+            logger.error(f"Pre-close analysis error: {e}", exc_info=True)
+
+
+    async def send_predictive_alert(self, signal: Dict, next_candle_start: datetime, df: pd.DataFrame) -> None:
+        """Send alert PREDICTING the next candle."""
+        try:
+            import pytz
+            ist = pytz.timezone("Asia/Kolkata")
+            now_ist = datetime.now(ist)
+            
+            # Format next candle time window
+            next_candle_end = next_candle_start + timedelta(minutes=5)
+            
+            # Get current price
+            current_price = float(df['close'].iloc[-1]) if not df.empty else 0
+            
+            # Determine signal strength
+            signal_type = signal.get('composite_signal', 'UNKNOWN')
+            confidence = signal.get('confidence', 0)
+            weighted_score = signal.get('weighted_score', 0)
+            
+            if 'STRONG_BUY' in signal_type:
+                emoji = "🟢🟢🟢"
+                action = "STRONG BUY"
+                prediction = "Expecting +20-30 points"
+            elif 'BUY' in signal_type:
+                emoji = "🟢"
+                action = "BUY"
+                prediction = "Expecting +10-20 points"
+            elif 'STRONG_SELL' in signal_type:
+                emoji = "🔴🔴🔴"
+                action = "STRONG SELL"
+                prediction = "Expecting -20-30 points"
+            elif 'SELL' in signal_type:
+                emoji = "🔴"
+                action = "SELL"
+                prediction = "Expecting -10-20 points"
+            else:
+                logger.info("Neutral prediction - not sending alert")
+                return
+            
+            message = f"""
+    {emoji} <b>NEXT CANDLE PREDICTION</b> {emoji}
+
+    <b>⏰ PREDICTION FOR:</b>
+    {next_candle_start.strftime('%H:%M')}-{next_candle_end.strftime('%H:%M')} IST
+
+    <b>🎯 FORECAST:</b>
+    • Signal: {action}
+    • {prediction}
+    • Confidence: {confidence:.1f}%
+    • Score: {weighted_score:.3f}
+
+    <b>📊 CURRENT STATUS:</b>
+    • Price Now: ₹{current_price:,.2f}
+    • Analysis Time: {now_ist.strftime('%H:%M:%S')}
+    • Based on: Incomplete {next_candle_start.strftime('%H:%M')} candle
+
+    <b>💡 ENTRY STRATEGY:</b>
+    • Entry: At {next_candle_start.strftime('%H:%M:00')} candle open
+    • Stop Loss: {signal.get('stop_loss', 0):.2f}
+    • Target: {signal.get('take_profit', 0):.2f}
+    • Risk/Reward: {signal.get('risk_reward', 0):.2f} 
+    • Duration: ~{signal.get('duration_prediction', {}).get('estimated_minutes', 10)} min (e.g., {next_candle_start.strftime('%H:%M')}-{(next_candle_start + timedelta(minutes=signal.get('duration_prediction', {}).get('estimated_minutes', 10))).strftime('%H:%M')})
+
+    <b>📈 INDICATORS:</b>
+    • Active: {signal.get('active_indicators', 0)}/6
+    • MTF Aligned: {signal.get('mtf_analysis', {}).get('aligned', False)}
+
+    <i>⚠️ This is a PREDICTION for the upcoming candle</i>
+    <i>📍 Entry at candle open, not current price</i>
+    """
+            
+            # Send alert
+            success = self.telegram_bot.send_message(message)
+
+            if success:
+                logger.info(f"✅ Predictive alert sent → NEXT: {next_candle_start.strftime('%H:%M')}-{next_candle_end.strftime('%H:%M')} IST (entry at open) | {signal_type} @ {confidence:.1f}%")
+
+            else:
+                logger.error("Failed to send predictive alert")
+            
+        except Exception as e:
+            logger.error(f"Predictive alert error: {e}", exc_info=True)
+
+
+
+    async def on_preclose_predict(self, preview_candle: pd.DataFrame, all_candles: pd.DataFrame) -> None: 
+        """Prepare next-candle forecast before the current bar closes.""" 
+        try: 
+            if preview_candle is None or preview_candle.empty: 
+                return 
+            preview_start = preview_candle.index[0] 
+            preview_close = preview_start + timedelta(seconds=self.config.candle_interval_seconds)
+        
+            logger.info(f"🔔 PRE-CLOSE ANALYSIS: start={preview_start.strftime('%H:%M:%S')} "
+                        f"close={preview_close.strftime('%H:%M:%S')}")
+        
+            # Build working 5m = stored + preview (do not persist)
+            df_5m = self.persistence_manager.get_data("5m", 100)
+            try:
+                df_5m = pd.concat([df_5m, preview_candle]).sort_index()
+                df_5m = df_5m[~df_5m.index.duplicated(keep='last')]
+            except Exception:
+                pass
+
+            # Build 15m from stored 5m (resample) up to preview close
+            df_15m = pd.DataFrame()
+            try:
+                if not self.persistence_manager.data_5m.empty:
+                    df_15m_resampled = (
+                        self.persistence_manager.data_5m
+                        .resample('15min', label='left', closed='left', origin='start_day', offset='15min')
+                        .agg({'open': 'first', 'high':'max','low':'min','close':'last','volume':'sum'})
+                        .dropna()
+                    )
+                    df_15m_resampled.index = df_15m_resampled.index - pd.Timedelta(minutes=15)
+                    df_15m = df_15m_resampled[df_15m_resampled.index <= preview_close].tail(50).copy()
+            except Exception as e:
+                logger.debug(f"15m resample (preview) failed, fallback to stored 15m: {e}")
+                df_15m = self.persistence_manager.get_data("15m", 50)
+
+            # Indicators and analysis
+            indicators_5m = await self.technical_analysis.calculate_all_indicators(df_5m)
+            indicators_15m = await self.calculate_15m_indicators(df_15m) if not df_15m.empty else None
+
+
+            signal = await self.signal_analyzer.analyze_and_generate_signal(
+                indicators_5m, df_5m, indicators_15m, df_15m
+            )
+            if not signal:
+                logger.info("Pre-close: no actionable signal")
+                return
+
+            # STRICTER pre-close gating (forming bar is noisy)
+            try:
+                mtf_score = float(signal.get('mtf_analysis', {}).get('score', 0.0))
+                mtf_needed = float(getattr(self.config, 'preclose_min_mtf_score', self.config.trend_alignment_threshold))
+                comp = str(signal.get('composite_signal', 'NEUTRAL')).upper()
+                htf_macd_sig = str(indicators_15m.get('macd', {}).get('signal_type', indicators_15m.get('macd', {}).get('signal', 'neutral'))).lower() if indicators_15m else 'neutral'
+                htf_contra = (('BUY' in comp and 'bearish' in htf_macd_sig) or
+                            ('SELL' in comp and 'bullish' in htf_macd_sig))
+                
+                if mtf_score < mtf_needed or htf_contra:
+                    logger.info(f"❌ Pre-close suppressed: MTF {mtf_score:.2f} < {mtf_needed:.2f} or HTF MACD opposes ({htf_macd_sig})")
+                    return
+            except Exception as e:
+                logger.debug(f"Pre-close strict gate skipped: {e}")
+                
+            # Pre-Close extreme context visibility (one-line, high-signal)
+            try:
+                ec = signal.get('extreme_context', {}) or {}
+                rsi5 = float(indicators_5m.get('rsi', {}).get('value', 0))
+                rsi15 = float(indicators_15m.get('rsi', {}).get('value', 0)) if indicators_15m else 0
+                htf_price_pos = ec.get('htf_price_pos')
+                if htf_price_pos is not None:
+                    logger.info(f"[Pre-Close] ExtremeCtx: 15m_pos={htf_price_pos:.2f} top={ec.get('top_extreme')} bot={ec.get('bottom_extreme')} "
+                                f"rsi5={rsi5:.1f} rsi15={rsi15:.1f} S/R_room={'True' if not (ec.get('top_extreme') or ec.get('bottom_extreme')) else 'False'} "
+                                f"breakout={ec.get('breakout_evidence')} breakdown={ec.get('breakdown_evidence')}")
+                else:
+                    logger.debug("[Pre-Close] Extreme context not available yet")
+            except Exception as e:
+                logger.debug(f"Pre-Close extreme log skipped: {e}")
+
+
+
+            # Mark as preview and store for the exact close handler
+            signal['is_preview'] = True
+            signal['bar_start_time'] = str(preview_start)
+            signal['bar_close_time'] = str(preview_close)
+
+            self._preview_cache[preview_start] = {
+                'signal': signal,
+                'indicators_5m': indicators_5m,
+                'df_5m': df_5m
+            }
+
+
+            # Enhanced logging for prediction visibility
+            logger.info("=" * 60)
+            logger.info(f"PREDICTION SUMMARY for {preview_close.strftime('%H:%M:%S')} candle:")  # Use preview_close as next_candle_start
+            logger.info(f"   Signal: {signal.get('composite_signal')}")
+            logger.info(f"   Confidence: {signal.get('confidence', 0):.1f}%")
+            logger.info(f"   Score: {signal.get('weighted_score', 0):.3f}")
+            logger.info(f"   MTF Score: {signal.get('mtf_score', 0):.2f}")
+            logger.info(f"   Active Indicators: {signal.get('active_indicators', 0)}")
+            logger.info("=" * 60)
+
+
+            # Store for correctness tracking
+            try:
+                self.last_prediction = {
+                    'time': preview_close,  # next candle open time
+                    'signal': signal.get('composite_signal'),
+                    'confidence': signal.get('confidence'),
+                    'predicted_at': datetime.now()
+                }
+            except Exception:
+                pass
+
+            logger.info(f"✓ Pre-close signal prepared for {preview_start.strftime('%H:%M:%S')} → send at close")
+            
+        except Exception as e:
+            logger.error(f"Pre-close analysis error: {e}", exc_info=True)
+
+
+
+
     
     async def run_initial_analysis(self):
         """Run analysis on existing data from persistent storage."""
@@ -223,9 +523,20 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             self.last_candle_ts_5m = timestamp
             logger.info(f"{'=' * 50}")
             logger.info(f"📊 5-Min Candle Complete: {timestamp.strftime('%H:%M:%S')}")
-                    
-          
-          
+                
+
+            # If a pre-close signal was prepared for this start time, send it immediately 
+            preview = self._preview_cache.pop(timestamp, None) 
+            if preview: 
+                logger.info("Using pre-close prepared signal (no extra analysis)") 
+                prepared = preview['signal'] 
+                if await self._should_send_alert(prepared): 
+                    await self.send_alert(prepared, preview['indicators_5m'], preview['df_5m']) 
+                    return 
+                else: 
+                    logger.info("Prepared pre-close signal did not meet alert criteria; proceeding to full analysis")
+
+
             # Update persistent storage for 5-min
             self.persistence_manager.update_candle(candle, "5m")
             self.stats['candles_processed_5m'] += 1
@@ -247,21 +558,59 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             try:
                 if not self.persistence_manager.data_5m.empty:
 
+                    # Stable NSE quarter-hour bins: include right edge, then shift label to left edge 
+                    
+                    df_15m_resampled = ( self.persistence_manager.data_5m 
+                                        .resample('15min', label='left', closed='left', origin='start_day', offset='15min') 
+                                        .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}) 
+                                        .dropna() ) 
+                    
 
-                    # Anchor 15m bins to NSE session start (09:15 IST) so labels are 09:15/09:30/…
-                    tz = pytz.timezone('Asia/Kolkata')
-                    last_ist = self.persistence_manager.data_5m.index[-1].astimezone(tz)
-                    anchor = last_ist.normalize() + pd.Timedelta(hours=9, minutes=15)
+                    # Shift labels to bin start (e.g., 14:30 → 14:15) 
+                    df_15m_resampled.index = df_15m_resampled.index - pd.Timedelta(minutes=15) 
+                    
+                    logger.debug(f"15m resample built: {len(df_15m_resampled)} bars; " f"last={df_15m_resampled.index[-1].strftime('%H:%M:%S')}")
 
-                    df_15m_resampled = (
-                        self.persistence_manager.data_5m
-                        .resample('15min', label='left', closed='right', origin=anchor)
-                        .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
-                        .dropna()
-                    )
+                    # Persist the last fully closed 15m candle so metadata/stored 15m stay in sync
+                    try:
+                        if not df_15m_resampled.empty:
+                            last_15 = df_15m_resampled.tail(1)
+                            last_15_ts = last_15.index[0]
+                            if self.persistence_manager.data_15m.empty or last_15_ts not in self.persistence_manager.data_15m.index:
+                                
+ 
+                                self.persistence_manager.update_candle(last_15, "15m") 
+                                
+                                logger.info(f"📊 15-Min Candle Created: {last_15_ts.strftime('%H:%M:%S')}") 
+                                
+                                logger.info(f"Stored 15m last={self.persistence_manager.data_15m.index[-1].strftime('%H:%M:%S')} count={len(self.persistence_manager.data_15m)}") 
+                                
+                                logger.debug(f"Stored 15m last={self.persistence_manager.data_15m.index[-1].strftime('%H:%M:%S')} count={len(self.persistence_manager.data_15m)}")
+                                
+                                
+                    except Exception as e:
+                        logger.debug(f"Persisting resampled 15m failed (ignored): {e}")
+
+
+
+                    df_15m = df_15m_resampled.tail(50).copy()
+
+                # Track prediction accuracy
+                if hasattr(self, 'last_prediction') and self.last_prediction:
+                    # Check if previous prediction was correct
+                    predicted_time = self.last_prediction.get('time')
+                    if predicted_time and timestamp == predicted_time:
+                        actual_movement = df_5m['close'].iloc[-1] - df_5m['open'].iloc[-1]
+                        predicted_signal = self.last_prediction.get('signal', '')
+                        
+                        if 'BUY' in predicted_signal and actual_movement > 0:
+                            logger.info(f"✅ Prediction CORRECT: Expected UP, got +{actual_movement:.2f}")
+                        elif 'SELL' in predicted_signal and actual_movement < 0:
+                            logger.info(f"✅ Prediction CORRECT: Expected DOWN, got {actual_movement:.2f}")
+                        else:
+                            logger.info(f"❌ Prediction WRONG: Expected {predicted_signal}, got {actual_movement:.2f}")
 
                     
-                    df_15m = df_15m_resampled.tail(50).copy()
             except Exception as e:
                 logger.debug(f"15m resample failed, falling back to stored 15m: {e}")
                 df_15m = self.persistence_manager.get_data("15m", 50)
@@ -471,9 +820,46 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             else: 
                 base_ts_ist = base_ts.astimezone(ist) 
             
-            forecast_5m_start = base_ts_ist + timedelta(minutes=5) 
-            forecast_5m_end = forecast_5m_start + timedelta(minutes=5) 
-            forecast_15m_end = forecast_5m_start + timedelta(minutes=15) 
+            
+            # Since candle is now labeled by start time, the next candle starts at close time
+            current_candle_end = base_ts_ist + timedelta(minutes=5)
+            forecast_5m_start = current_candle_end
+            forecast_5m_end = forecast_5m_start + timedelta(minutes=5)
+            forecast_15m_end = forecast_5m_start + timedelta(minutes=15)
+
+ 
+            # Define timing variables clearly
+            current_candle_start = base_ts_ist
+            next_candle_start = current_candle_end
+            next_candle_end = next_candle_start + timedelta(minutes=5)
+
+            # Compute current price first (used as baseline for withdraw watch)
+            current_price = float(df['close'].iloc[-1]) if not df.empty else 0
+
+            # Arm withdraw watch for the predicted candle only
+            try:
+                next_start = forecast_5m_start
+                next_end = forecast_5m_end
+                entry_price = current_price
+                await self._start_withdraw_watch(signal, next_start, next_end, entry_price)
+            except Exception as e:
+                logger.debug(f"Withdraw watch not started: {e}")
+                
+
+            # message = f"""
+            # {emoji} <b>[{urgency}]</b> {emoji}
+
+            # <b>PREDICTION FOR NEXT CANDLE:</b>
+            # • Next Candle: {next_candle_start.strftime('%H:%M')}-{next_candle_end.strftime('%H:%M')} IST
+            # • Analysis Based On: {current_candle_start.strftime('%H:%M')}-{current_candle_end.strftime('%H:%M')} IST
+            # • Alert Sent: {datetime.now(ist).strftime('%H:%M:%S')} IST
+
+
+            # <b>FORECAST WINDOW:</b> 
+            # • 5m: {forecast_5m_start.strftime('%H:%M')}–{forecast_5m_end.strftime('%H:%M')} IST 
+            # • 15m: {forecast_5m_start.strftime('%H:%M')}–{forecast_15m_end.strftime('%H:%M')} IST
+            # ...
+            # """
 
             
             # ist = pytz.timezone("Asia/Kolkata") 
@@ -490,6 +876,11 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             confidence = signal.get('confidence', 0)
             active_indicators = signal.get('active_indicators', 0)
             
+            weighted_score = signal.get('weighted_score', 0)
+            next_candle = signal.get('next_candle_prediction', '')
+            action = signal.get('action_recommendation', '')
+            current_price = float(df['close'].iloc[-1]) if not df.empty else 0
+                        
             # Determine emoji and urgency
             if 'STRONG_SELL' in signal_type:
                 emoji = "🔴🔴🔴"
@@ -504,28 +895,31 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 emoji = "🟢"
                 urgency = "LONG OPPORTUNITY"
             else:
-                emoji = "⚪"
+                emoji = "⚠️"
                 urgency = "WAIT"
  
-      
+
+            # Now build the message with defined variables
+        
             message = f"""
     {emoji} <b>[{urgency}]</b> {emoji}
 
-<b>FORECAST WINDOW:</b> 
-• 5m: {forecast_5m_start.strftime('%H:%M')}–{forecast_5m_end.strftime('%H:%M')} IST 
-• 15m: {forecast_5m_start.strftime('%H:%M')}–{forecast_15m_end.strftime('%H:%M')} IST
+    <b>FORECAST WINDOW:</b> 
+    • 5m: {forecast_5m_start.strftime('%H:%M')}–{forecast_5m_end.strftime('%H:%M')} IST 
+    • 15m: {forecast_5m_start.strftime('%H:%M')}–{forecast_15m_end.strftime('%H:%M')} IST
       
 
     <b>SCALPING PREDICTION:</b>
     {next_candle}
 
-    <b>METRICS:</b>
-    • Timeframes: 5m base; 15m confirm — {signal.get('mtf_analysis', {}).get('description', 'MTF not checked')}
-    • Price: ₹{current_price:,.2f}
-    • Weighted Score: {weighted_score:.3f} ({'SELL bias' if weighted_score < 0 else 'BUY bias' if weighted_score > 0 else 'neutral'})
-    • Active Indicators: {active_indicators}/6
-    • Confidence: {confidence:.1f}%
-    • Candle close: {base_ts_ist.strftime('%H:%M IST')} | Sent: {now_ist.strftime('%H:%M:%S IST')}
+    <b>METRICS:</b> 
+    • Timeframes: 5m base; 15m confirm — {signal.get('mtf_analysis', {}).get('description', 'MTF not checked')} 
+    • Price: ₹{current_price:,.2f} 
+    • Weighted Score: {weighted_score:.3f} ({'SELL bias' if weighted_score < 0 else 'BUY bias' if weighted_score > 0 else 'neutral'}) 
+    • Active Indicators: {active_indicators}/6 
+    • Confidence: {confidence:.1f}% 
+    • Candle close: {base_ts_ist.strftime('%H:%M IST')} | Sent: {now_ist.strftime('%H:%M:%S IST')} 
+    • Duration: ~{signal.get('duration_prediction', {}).get('estimated_minutes', 10)} min (e.g., {forecast_5m_start.strftime('%H:%M')}-{(forecast_5m_start + timedelta(minutes=signal.get('duration_prediction', {}).get('estimated_minutes', 10))).strftime('%H:%M')})
 
 
     <b>ACTION:</b>
@@ -559,13 +953,14 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                     logger.debug("Could not update signal_analyzer.last_alert_time (ignored)")
                 
                 self.stats['alerts_sent'] += 1
-                logger.info(f"Scalping alert sent: {urgency}")
-                
-                # Start outcome tracking for next 3 bars 
+            
+            
+                logger.info(f"✅ At-close predictive alert sent → NEXT: {forecast_5m_start.strftime('%H:%M')}-{forecast_5m_end.strftime('%H:%M')} IST ({urgency})")
                 try: 
                     self.live_alerts.append({ 'time': self.last_candle_ts_5m, 'price': current_price, 'bars_left': 3, 'mfe': 0.0, 'mae': 0.0, 'dir': 'BUY' if 'BUY' in signal_type else 'SELL' }) 
                 except Exception as e: 
                     logger.debug(f"Outcome tracker init failed (ignored): {e}")
+                
 
             else:
                 logger.error("Failed to send scalping alert via Telegram")
@@ -586,29 +981,164 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
         logger.error(f"WebSocket error: {error}")
         self.stats['errors'] += 1
     
+    # async def run(self):
+    #     """Main run loop."""
+    #     try:
+    #         if not await self.initialize():
+    #             logger.error("Initialization failed")
+    #             return
+            
+    #         # Connect WebSocket
+    #         logger.info("Connecting to WebSocket...")
+    #         if not await self.websocket_handler.connect():
+    #             logger.error("WebSocket connection failed")
+    #             return
+            
+    #         logger.info("Starting message processing...")
+    #         # Process messages
+    #         await self.websocket_handler.process_messages()
+
     async def run(self):
         """Main run loop."""
         try:
             if not await self.initialize():
                 logger.error("Initialization failed")
                 return
-            
-            # Connect WebSocket
+        
+                
             logger.info("Connecting to WebSocket...")
-            if not await self.websocket_handler.connect():
-                logger.error("WebSocket connection failed")
-                return
-            
-            logger.info("Starting message processing...")
-            # Process messages
-            await self.websocket_handler.process_messages()
-            
+            # Run connector+processor with auto-reconnect until shutdown
+            try:
+                await self.websocket_handler.run_forever()
+            except Exception as e:
+                logger.error(f"WebSocket run_forever error: {e}", exc_info=True)
+     
+
         except KeyboardInterrupt:
             logger.info("Shutdown requested by user")
         except Exception as e:
             logger.error(f"Fatal error in run loop: {e}", exc_info=True)
         finally:
             await self.shutdown()
+    
+        
+
+    async def _start_withdraw_watch(self, signal: Dict, window_start, window_end, entry_price: float):
+        """Start a short-lived monitor for the predicted candle window only."""
+        try:
+            if not getattr(self.config, 'withdraw_monitor_enabled', True):
+                return
+            if float(signal.get('confidence', 0)) < float(self.config.withdraw_confidence_min):
+                logger.debug("Withdraw watch skipped: confidence below threshold")
+                return
+            # Arm the monitor
+            asyncio.create_task(self._monitor_predicted_candle(signal, window_start, window_end, entry_price))
+            logger.info(f"[WithdrawWatch] Armed for {window_start.strftime('%H:%M:%S')}–{window_end.strftime('%H:%M:%S')} (predicted window only)")
+        except Exception as e:
+            logger.debug(f"Withdraw watch arm failed: {e}")
+
+    async def _monitor_predicted_candle(self, signal: Dict, window_start, window_end, entry_price: float):
+        """Monitor only the predicted candle; issue one Withdraw/Reduce if reversal guards trip."""
+        try:
+            direction_buy = 'BUY' in str(signal.get('composite_signal','')).upper()
+            min_dwell = int(getattr(self.config, 'withdraw_min_dwell_sec', 10))
+            check_ivl = int(getattr(self.config, 'withdraw_check_interval_sec', 5))
+            adverse_pts = float(getattr(self.config, 'withdraw_adverse_points', 12.0))
+            frac_tp = float(getattr(self.config, 'withdraw_adverse_pct_of_tp', 0.40))
+            tp = float(signal.get('take_profit', 0))
+            bad_move_tp = max(adverse_pts, abs(tp - entry_price) * frac_tp) if tp > 0 else adverse_pts
+
+            # Delay until window_start
+            while datetime.now(pytz.timezone("Asia/Kolkata")) < window_start:
+                await asyncio.sleep(0.2)
+
+            # Begin watch inside the predicted window
+            ist = pytz.timezone("Asia/Kolkata")
+            first_ts = datetime.now(ist)
+            last_ltps: List[float] = []
+            adverse_cluster = 0
+            decision_sent = False
+
+            while datetime.now(ist) <= window_end:
+                await asyncio.sleep(check_ivl)
+
+                # Pull recent ticks during this window (simple read of tail)
+                try:
+                    tail = self.websocket_handler.tick_buffer[-50:] if self.websocket_handler and self.websocket_handler.tick_buffer else []
+                    # Filter to window
+                    ticks = [t for t in tail if t.get('timestamp') and window_start <= t['timestamp'] <= window_end]
+                except Exception:
+                    ticks = []
+
+                if not ticks:
+                    continue
+
+                ltp = float(ticks[-1].get('ltp', entry_price))
+                last_ltps.append(ltp)
+                if len(last_ltps) > 20:
+                    last_ltps = last_ltps[-20:]
+
+                # Guard 1: adverse tick cluster / direction
+                # move = ltp - entry_price
+                # adverse_now = (move < 0) if direction_buy else (move > 0)
+                # if adverse_now:
+                #     adverse_cluster += 1
+                # else:
+                #     adverse_cluster = max(0, adverse_cluster - 1)
+                    
+                    
+
+                move = ltp - entry_price
+                adverse_now = (move < 0) if direction_buy else (move > 0)
+                if adverse_now:
+                    adverse_cluster += 1
+                    logger.debug(f"Adverse tick: cluster={adverse_cluster}, move={move:.2f}")
+                else:
+                    adverse_cluster = max(0, adverse_cluster - 1)
+                    logger.debug(f"Non-adverse tick: cluster={adverse_cluster}, move={move:.2f}")
+
+                # Tune for subtle downtrend: lower cluster threshold if consecutive small adverse
+                if adverse_cluster >= 2 and len(last_ltps) >= 3 and all(m < 0 for m in [l - entry_price for l in last_ltps[-3:]]) if direction_buy else all(m > 0 for m in [l - entry_price for l in last_ltps[-3:]]):
+                    logger.info(f"Subtle reversal: {adverse_cluster} adverse with 3 down ticks")
+                    reason.append("subtle downtrend (3 adverse)")
+
+                                    
+
+                # Guard 2: fast MAE breach relative to TP
+                mae = abs(min(0.0, move)) if direction_buy else abs(max(0.0, move))
+                mae_pts = mae
+                mae_hit = mae_pts >= bad_move_tp
+
+                # Minimal dwell before acting unless very adverse
+                dwell_ok = (datetime.now(ist) - first_ts).total_seconds() >= min_dwell
+
+                # Decision: Withdraw/Reduce
+                if not decision_sent and dwell_ok and (adverse_cluster >= int(self.config.withdraw_adverse_ticks_cluster) or mae_hit):
+                    reason = []
+                    if adverse_cluster >= int(self.config.withdraw_adverse_ticks_cluster):
+                        reason.append(f"adverse_ticks≥{self.config.withdraw_adverse_ticks_cluster}")
+                    if mae_hit:
+                        reason.append(f"MAE {mae_pts:.1f}≥{bad_move_tp:.1f}")
+                    text = f"[WITHDRAW] {'LONG' if direction_buy else 'SHORT'}: early reversal in predicted window — " + ", ".join(reason) + f" | ltp={ltp:.2f} entry={entry_price:.2f}"
+                    logger.info(text)
+                    try:
+                        self.telegram_bot.send_message(text)
+                    except Exception:
+                        pass
+                    decision_sent = True
+                    break  # only one decision
+
+            # High-visibility wrap-up log
+            if not decision_sent:
+                logger.info("[WithdrawWatch] Window expired: no reversal detected")
+            else:
+                logger.info(f"[WithdrawWatch] Alert sent: {reason}")
+
+        except Exception as e:
+            logger.debug(f"Withdraw watch error: {e}")
+
+
+    
     
     async def shutdown(self):
         """Gracefully shutdown with data persistence."""

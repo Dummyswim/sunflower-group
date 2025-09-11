@@ -56,13 +56,17 @@ class UnifiedTradingConfig:
     
     # ============== SIGNAL VALIDATION ==============
     signal_validation_score: float = 0.4
-    trend_alignment_threshold: float = 0.6
+    trend_alignment_threshold: float = 0.6  # More reasonable threshold
+    debug_mode: bool = True  # Enable debug logging
     multi_timeframe_alignment: bool = True  # NEW
-    
-    # ============== RISK MANAGEMENT ==============
-    stop_loss_percentage: float = 1.0  # 1% stop loss
-    take_profit_percentage: float = 2.0  # 2% take profit
-    trailing_stop_percentage: float = 0.5  # 0.5% trailing stop
+
+    # ============== RISK MANAGEMENT ============== 
+    stop_loss_percentage: float = 1.0 # 1% stop loss 
+    take_profit_percentage: float = 2.0 # 2% take profit 
+    trailing_stop_percentage: float = 0.5 # 0.5% trailing stop 
+    min_risk_reward_floor: float = 1.0 # NEW: hard floor for actionable alerts
+    # Minimum volatility range as % of price for 5m scalps (keeps SL/TP realistic) 
+    min_volatility_range_pct: float = 0.002 # 0.20%
     
     # ============== SIGNAL DURATION ==============
     signal_sustain_threshold: float = 0.6
@@ -70,6 +74,18 @@ class UnifiedTradingConfig:
     max_signal_duration_minutes: int = 15
     min_signal_duration_minutes: int = 5
     
+    
+    # Volatility caps for intraday scalps (constrain TP/SL by local vol)
+    tp_volatility_cap_multiple: float = 1.8  # TP cannot be farther than 1.8× recent 5m volatility range
+    sl_volatility_cap_multiple: float = 1.0  # SL cannot be farther than 1.0× recent 5m volatility range
+
+    # Stricter gate for pre-close predictions (forming bar is noisier)
+    preclose_min_mtf_score: float = 0.6
+
+    # Require more breadth for directional alerts; candidates can use the lower global value
+    min_active_indicators_for_alert: int = 4
+
+
     # ============== OPTIMIZED RSI PARAMETERS (5m/15m) ==============
     # rsi_params_5m: Dict = field(default_factory=lambda: {
     #     "period": 10,  # OPTIMIZED FOR 5-MIN
@@ -203,6 +219,23 @@ class UnifiedTradingConfig:
     mtf_alignment_required: bool = True
     mtf_trend_weight: float = 0.7  # Weight of higher timeframe trend
     
+    
+    # ============== EXTREME CONTEXT & WITHDRAW MONITOR ==============
+    extreme_price_pos_hi: float = 0.95
+    extreme_price_pos_lo: float = 0.05
+    extreme_rsi_5m: float = 85.0
+    extreme_rsi_15m: float = 75.0
+    confidence_cap_at_extreme: float = 78.0  # cap unless breakout evidence
+
+    withdraw_monitor_enabled: bool = True
+    withdraw_confidence_min: float = 70.0
+    withdraw_min_dwell_sec: int = 10        # wait at least this much after open
+    withdraw_window_sec: int = 300          # one 5m candle
+    withdraw_adverse_points: float = 12.0   # e.g., NIFTY pts
+    withdraw_adverse_pct_of_tp: float = 0.40
+    withdraw_adverse_ticks_cluster: int = 3
+    withdraw_check_interval_sec: int = 5
+
     # ============== OTHER CONFIGURATIONS ==============
     enable_charts: bool = True
     chart_style: str = 'seaborn-v0_8'
@@ -219,7 +252,7 @@ class UnifiedTradingConfig:
     performance_window: int = 100
     performance_report_interval: int = 3600
     
-    log_file: str = "logs/unified_trading.log"
+    log_file: str = "logs/unified_trading_1.log"
     log_level: str = "INFO"
     log_rotation_size: int = 10485760
     log_backup_count: int = 5
@@ -228,6 +261,11 @@ class UnifiedTradingConfig:
     enable_market_structure: bool = True
     enable_signal_validation: bool = True
     enable_risk_management: bool = True
+    
+    
+    # Pre-close alerts (analyze about-to-close bar before boundary) 
+    preclose_lead_seconds: int = 10 # analyze N seconds before close (min 5s)
+    
     
     def get_rsi_params(self, timeframe: str) -> Dict:
         """Get RSI parameters for timeframe."""
@@ -279,13 +317,21 @@ class UnifiedTradingConfig:
             # Create required directories
             for path in [self.log_file, self.chart_save_path, "data"]:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
-            
-            logger.info("Configuration validated successfully")
-            logger.info(f"✓ Min Confidence: {self.min_confidence}%")
-            logger.info(f"✓ Min Active Indicators: {self.min_active_indicators}")
-            logger.info(f"✓ Price Action Validation: {self.price_action_validation}")
-            logger.info(f"✓ Multi-Timeframe Alignment: {self.multi_timeframe_alignment}")
+
+
+            logger.info("Configuration validated successfully") 
+            logger.info(f"✓ Min Confidence: {self.min_confidence}%") 
+            logger.info(f"✓ Min Active Indicators: {self.min_active_indicators}") 
+            logger.info(f"✓ Price Action Validation: {self.price_action_validation}") 
+            logger.info(f"✓ Multi-Timeframe Alignment: {self.multi_timeframe_alignment}") 
             logger.info(f"✓ Persistent Storage: {self.use_persistent_storage}")
+            
+            logger.info(f"✓ R:R Floor: {self.min_risk_reward_floor:.2f}")
+            mv = float(getattr(self, 'min_volatility_range_pct', 0.002))
+            logger.info(f"✓ Min Volatility Range (pct): {mv:.3f}")
+            logger.info(f"✓ MTF Threshold (at-close): {self.trend_alignment_threshold:.2f}")
+
+
             
             return True
             

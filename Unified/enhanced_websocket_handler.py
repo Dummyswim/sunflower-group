@@ -6,7 +6,6 @@ import asyncio
 import struct
 import json
 import logging
-from datetime import datetime
 from typing import Dict, Optional, Any, List
 import websockets
 import pandas as pd
@@ -64,10 +63,12 @@ class EnhancedWebSocketHandler:
         self.current_period_volume = 0
         self.synthetic_volume_base = 1000  # Base synthetic volume
         
-        # Callbacks
-        self.on_tick = None
-        self.on_candle = None
-        self.on_error = None
+        
+        # Callbacks 
+        self.on_tick = None 
+        self.on_candle = None 
+        self.on_error = None 
+        self.on_preclose = None # NEW: pre-close analysis callback
         
         # Statistics
         self.packet_stats = {packet_type: 0 for packet_type in self.PACKET_TYPES.values()}
@@ -75,6 +76,17 @@ class EnhancedWebSocketHandler:
         self.last_packet_time = None
         self.tick_count = 0
         self._diag_ticks_left = 50  # one-time startup diagnostic
+        
+
+        self.boundary_task = None
+        self.data_watchdog_task = None
+        self._last_subscribe_time = None
+
+
+
+        # Pre-close and boundary close state 
+        self._preclose_fired_for_bucket = None 
+        self._bucket_closed = False
         
         logger.info(f"Configuration: SecurityId={config.nifty_security_id}, "
                    f"Interval={config.candle_interval_seconds}s, "
@@ -89,12 +101,130 @@ class EnhancedWebSocketHandler:
         now_ist = datetime.now(IST)
         ts_utc_to_ist = datetime.fromtimestamp(ltt, tz=timezone.utc).astimezone(IST)
         ts_direct_ist = datetime.fromtimestamp(ltt, tz=IST)
+
         # Choose the ts closer to current IST time
         if abs((now_ist - ts_utc_to_ist).total_seconds()) <= abs((now_ist - ts_direct_ist).total_seconds()):
             return ts_utc_to_ist
         return ts_direct_ist
+        
+
 
     
+    
+
+    
+    
+
+    def _assemble_candle(self, start_time: datetime, ticks: List[Dict]) -> pd.DataFrame: 
+        """Build an OHLCV candle from accumulated ticks for this bucket.""" 
+        try: 
+            prices = [t.get('ltp', 0.0) for t in ticks if t.get('ltp', 0.0) > 0] 
+            if not prices: 
+                return pd.DataFrame() 
+            open_price = float(prices[0]) 
+            high = float(max(prices)) 
+            low = float(min(prices)) 
+            close = float(prices[-1])
+            if self.current_period_volume > 0:
+                candle_volume = int(self.current_period_volume)
+            else:
+                price_range = max(high - low, 0.0)
+                volatility = (price_range / close) * 100 if close > 0 else 0
+                candle_volume = 5000 + int(volatility * 10000) + len(ticks) * 100
+
+            return pd.DataFrame([{
+                'timestamp': start_time,
+                'open': open_price,
+                'high': high,
+                'low': low,
+                'close': close,
+                'volume': candle_volume,
+                'tick_count': len(ticks)
+            }]).set_index('timestamp')
+        except Exception as e:
+            logger.debug(f"_assemble_candle error: {e}")
+            return pd.DataFrame()
+
+
+    async def _maybe_fire_preclose(self, now_ts: datetime): 
+        """Trigger a pre-close preview once per bucket near its end.""" 
+        try: 
+            if not self.on_preclose or not self.current_candle['start_time']: 
+                return 
+            start = self.current_candle['start_time'] 
+            interval_min = max(1, self.config.candle_interval_seconds // 60) 
+            close_time = start + timedelta(minutes=interval_min) 
+            # lead = max(5, min(self.config.candle_interval_seconds - 1, getattr(self.config, 'preclose_lead_seconds', 10))) 
+            lead = getattr(self.config, 'preclose_lead_seconds', 10)  # Use config value directly
+            preclose_time = close_time - timedelta(seconds=lead)
+            
+            logger.debug(f"Pre-close check → now={now_ts.strftime('%H:%M:%S')}, "
+                        f"start={start.strftime('%H:%M:%S')}, close={close_time.strftime('%H:%M:%S')}, "
+                        f"lead={lead}s")
+
+
+
+            # High-visibility logging for pre-close decisions
+            preclose_time_ist = preclose_time.astimezone(IST) if getattr(preclose_time, 'tzinfo', None) else preclose_time
+            delta_to_pre = (preclose_time_ist - now_ts).total_seconds()
+            delta_to_close = (close_time - now_ts).total_seconds()
+            has_ticks = bool(self.current_candle.get('ticks'))
+            fired = self._preclose_fired_for_bucket == start
+            
+            # logger.info(f"[PreClose DBG] delta_pre={delta_to_pre:.0f}s, delta_close={delta_to_close:.0f}s, has_ticks={has_ticks}, fired={fired}")
+            if delta_to_pre <= 0 and has_ticks and not fired:
+                logger.warning("[PreClose MISS] Should fire but not: reviewing bucket")
+            else:
+                logger.debug("[PreClose] Waiting: not yet time or no ticks")
+
+
+            
+            if now_ts >= preclose_time and self._preclose_fired_for_bucket != start and self.current_candle['ticks']:
+                preview = self._assemble_candle(start, self.current_candle['ticks'])
+                if not preview.empty:
+                    logger.info(f"⏳ Pre-close checkpoint: start={start.strftime('%H:%M:%S')} "
+                                f"close={close_time.strftime('%H:%M:%S')} fired at {now_ts.strftime('%H:%M:%S')}")
+                    await self.on_preclose(preview, self.candle_data.copy() if not self.candle_data.empty else preview.copy())
+                    self._preclose_fired_for_bucket = start
+        except Exception as e:
+            logger.debug(f"Pre-close skipped: {e}")
+
+
+    async def _boundary_close_loop(self): 
+        """Close the current bucket at the time boundary without waiting for the next tick.""" 
+        logger.info("Starting boundary close loop") 
+
+        
+        while self.running: 
+            try: 
+                await asyncio.sleep(1.0) 
+                # Check every second
+                now_ts = datetime.now(IST) 
+                start = self.current_candle.get('start_time')
+                            
+                # Heartbeat every 30s
+                if int(now_ts.timestamp()) % 30 == 0:
+                    logger.debug(f"Boundary loop alive at {now_ts.strftime('%H:%M:%S')}")
+
+                # Always check boundary close each second
+                if start and self.current_candle.get('ticks'):
+                    close_time = start + timedelta(seconds=self.config.candle_interval_seconds)
+                    if now_ts >= close_time and not self._bucket_closed:
+                        logger.info(f"⏱️ Boundary close {start.strftime('%H:%M:%S')}→{close_time.strftime('%H:%M:%S')} — creating candle and dispatching callbacks")
+                        await self._create_candle(start, self.current_candle['ticks'])
+                        self._bucket_closed = True
+
+                          
+                            
+                            
+                    
+                        
+            except Exception as e: 
+                logger.error(f"Boundary close loop error: {e}", exc_info=True) 
+                await asyncio.sleep(1.0)
+
+
+        
     def _calculate_synthetic_volume(self, ltp: float) -> int:
         """Calculate synthetic volume based on price movement (from websocket_client.py)."""
         try:
@@ -134,6 +264,16 @@ class EnhancedWebSocketHandler:
         logger.info("Starting WebSocket connection to DhanHQ v2")
         max_attempts = self.config.max_reconnect_attempts
         attempt = 0
+
+        # Reset per-connection state
+        self.tick_buffer.clear()
+        self.candle_data = pd.DataFrame()
+        self.current_candle = {'ticks': [], 'start_time': None}
+        self.current_period_volume = 0
+        self._preclose_fired_for_bucket = None
+        self._bucket_closed = False
+        logger.debug("Per-connection state reset")
+
         
         while attempt < max_attempts and self.running:
             try:
@@ -165,13 +305,31 @@ class EnhancedWebSocketHandler:
                 
                 self.authenticated = True
                 logger.info("WebSocket connected successfully")
+
+                # Reset per-connection timing state for watchdog/metrics (expanded to reset more states if needed)
+                self.last_packet_time = None
+                self._last_subscribe_time = None  # Additional reset for subscribe timestamp to handle edge cases [[5]]
+                logger.debug("Per-connection timing reset (last_packet_time=None, _last_subscribe_time=None)")
+
                 
                 # Subscribe to market data
                 await self.subscribe()
-                
+
+
                 logger.info("WebSocket connection established and subscribed")
+                # Start boundary close loop once with error handling
+                if not self.boundary_task or self.boundary_task.done():
+                    self.boundary_task = asyncio.create_task(self._boundary_close_loop())
+                    self.boundary_task.add_done_callback(self._handle_task_exception)
+                # Start data-stall watchdog once
+                if not self.data_watchdog_task or self.data_watchdog_task.done():
+                    self.data_watchdog_task = asyncio.create_task(self._data_watchdog_loop())
+                    self.data_watchdog_task.add_done_callback(self._handle_task_exception)
+
                 return True
-                
+
+
+
             except Exception as e:
                 logger.error(f"Connection attempt {attempt} failed: {e}")
                 
@@ -183,6 +341,18 @@ class EnhancedWebSocketHandler:
         logger.error("Failed to establish WebSocket connection after all attempts")
         return False
     
+    
+    def _handle_task_exception(self, task):
+        """Handle exceptions from background tasks."""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass  # Task was cancelled, this is expected
+        except Exception as e:
+            logger.error(f"Background task error: {e}", exc_info=True)
+            
+            
+
     async def subscribe(self):
         """Subscribe to NIFTY50 market data feed - request Quote packets for volume."""
         logger.info("Subscribing to NIFTY50 market data")
@@ -194,12 +364,37 @@ class EnhancedWebSocketHandler:
                 "InstrumentCount": 1,
                 "InstrumentList": [{
                     "ExchangeSegment": self.config.nifty_exchange_segment,
-                    "SecurityId": str(self.config.nifty_security_id)
+                    "SecurityId": str(self.config.nifty_security_id)  # int, not str str(self.config.nifty_security_id)
                 }]
             }
-            
-            await self.websocket.send(json.dumps(subscription))
-            logger.info(f"Subscription request sent for SecurityId: {self.config.nifty_security_id}")
+
+            logger.info(f"[Subscribe] Sending subscription at {datetime.now(IST).strftime('%H:%M:%S')} with params: {subscription}")
+
+            # Send subscription and wait for response
+            try:
+                await self.websocket.send(json.dumps(subscription))
+                self._last_subscribe_time = datetime.now(IST)
+                logger.info(f"[Subscribe] _last_subscribe_time set to {self._last_subscribe_time.strftime('%H:%M:%S')}")
+                
+                # Wait for subscription confirmation
+                await asyncio.sleep(2)
+                
+                # Check if we received any response
+                if self.tick_count == 0:
+                    logger.warning("[Subscribe] No ticks received after subscription - checking market status")
+                    # Try sending a heartbeat/status request
+                    status_request = {"RequestCode": 7}  # Market status request
+                    await self.websocket.send(json.dumps(status_request))
+                    logger.info("[Subscribe] Sent market status request")
+                    
+            except Exception as e:
+                logger.error(f"[Subscribe] Error during subscription: {e}")
+                raise
+
+            logger.info("[Subscribe] Waiting for market data...")
+
+
+
             
         except Exception as e:
             logger.error(f"Subscription error: {e}")
@@ -489,6 +684,7 @@ class EnhancedWebSocketHandler:
             return
         
         try:
+
             # Update last packet time
             self.last_packet_time = datetime.now(IST)
             self.tick_count += 1
@@ -524,25 +720,26 @@ class EnhancedWebSocketHandler:
                             f"ticks={len(self.current_candle['ticks']) if self.current_candle['ticks'] else 0}")
 
                 
-            
-            # Check if new candle period
-            if self.current_candle['start_time'] != candle_start:
-                # Complete previous candle
-                if self.current_candle['start_time'] and self.current_candle['ticks']:
-                    await self._create_candle(
-                        self.current_candle['start_time'],
-                        self.current_candle['ticks']
-                    )
-                
-                # Start new candle and reset period volume
+
+            if self.current_candle['start_time'] != candle_start: 
+                # Complete previous candle if not already boundary-closed 
+                if self.current_candle['start_time'] and self.current_candle['ticks'] and not self._bucket_closed: 
+                    await self._create_candle(self.current_candle['start_time'], self.current_candle['ticks'])
+
+                # Start new candle and reset state
                 self.current_candle = {
                     'start_time': candle_start,
                     'ticks': [tick_data]
                 }
-                self.current_period_volume = 0  # Reset for new period
+                self.current_period_volume = 0
+                self._bucket_closed = False
+                self._preclose_fired_for_bucket = None
                 logger.debug(f"New candle period started: {candle_start.strftime('%H:%M:%S')}")
             else:
                 self.current_candle['ticks'].append(tick_data)
+
+            
+        
         
             # Safety flush: if the current bucket exceeds interval and has ticks, close it
             try:
@@ -564,6 +761,18 @@ class EnhancedWebSocketHandler:
                     self.current_period_volume = 0
             except Exception as e:
                 logger.debug(f"Safety flush skipped: {e}")
+
+
+
+            # Pre-close preview 
+            try: 
+                await self._maybe_fire_preclose(current_time) 
+            except Exception as e: 
+                logger.debug(f"Pre-close check failed: {e}")
+
+        
+
+
 
 
             # Trigger tick callback
@@ -614,27 +823,53 @@ class EnhancedWebSocketHandler:
                 logger.info(f"Skipping candle outside market hours: {timestamp.strftime('%H:%M:%S')}")
                 return
             
-            # Create candle
+            # # Create candle
+            # candle = pd.DataFrame([{
+            #     'timestamp': timestamp,
+            #     'open': open_price,
+            #     'high': high,
+            #     'low': low,
+            #     'close': close,
+            #     'volume': candle_volume,  # Always has value for indicators
+            #     'tick_count': len(ticks)
+            # }]).set_index('timestamp')
+            
+            # logger.info(f"Candle Created: {timestamp.strftime('%H:%M:%S')} | "
+            #            f"O:{open_price:.2f} H:{high:.2f} L:{low:.2f} C:{close:.2f} | "
+            #            f"Volume:{candle_volume:,} (synthetic) | Ticks:{len(ticks)}")
+            
+             
+
+            # Label candle by START time for real-time context
+            interval_min = max(1, self.config.candle_interval_seconds // 60) 
+            candle_start = timestamp 
             candle = pd.DataFrame([{
-                'timestamp': timestamp,
+                'timestamp': candle_start,  # Use start time for immediate context
                 'open': open_price,
                 'high': high,
                 'low': low,
                 'close': close,
-                'volume': candle_volume,  # Always has value for indicators
+                'volume': candle_volume,
                 'tick_count': len(ticks)
             }]).set_index('timestamp')
-            
-            logger.info(f"Candle Created: {timestamp.strftime('%H:%M:%S')} | "
-                       f"O:{open_price:.2f} H:{high:.2f} L:{low:.2f} C:{close:.2f} | "
-                       f"Volume:{candle_volume:,} (synthetic) | Ticks:{len(ticks)}")
-            
+
+
+            # Update logging to show both times
+            candle_end = candle_start + timedelta(minutes=interval_min)
+            logger.info(f"Candle Created: {candle_start.strftime('%H:%M:%S')}-{candle_end.strftime('%H:%M:%S')} | "
+                    f"O:{open_price:.2f} H:{high:.2f} L:{low:.2f} C:{close:.2f} | "
+                    f"Volume:{candle_volume:,} (synthetic) | Ticks:{len(ticks)}")
+
+                        
             # Update candle data
             if self.candle_data.empty:
                 self.candle_data = candle
             else:
                 self.candle_data = pd.concat([self.candle_data, candle])
                 self.candle_data = self.candle_data.tail(self.config.max_candles_stored)
+            
+            
+            self._bucket_closed = True
             
             # Trigger candle callback
             if self.on_candle:
@@ -654,9 +889,11 @@ class EnhancedWebSocketHandler:
         try:
             async for message in self.websocket:
                 message_count += 1
-                
+                if message_count <= 10:
+                    logger.info(f"[process_messages] Received message #{message_count} at {datetime.now(IST).strftime('%H:%M:%S')}")
                 try:
                     if isinstance(message, bytes):
+                        # logger.info(f"[DEBUG] Binary message size: {len(message)} bytes, first byte: {message[0] if message else 'empty'}")
                         # Binary packet - market data
                         packet_size = len(message)
                         tick_data = None
@@ -704,6 +941,7 @@ class EnhancedWebSocketHandler:
                             
                     else:
                         # Text message - control messages
+                        logger.info(f"[DEBUG] Text message: {message[:200] if message else 'empty'}")
                         await self._handle_text_message(message)
                     
                     # Periodic status logging (every 60 seconds)
@@ -728,6 +966,109 @@ class EnhancedWebSocketHandler:
             logger.error(f"Fatal error in message loop: {e}", exc_info=True)
             if self.on_error:
                 await self.on_error(e)
+    
+
+
+    async def _data_watchdog_loop(self):
+        """Monitor for data stall; resubscribe once, then reconnect if still stalled."""
+        stall_secs = int(getattr(self.config, 'data_stall_seconds', 15))
+        retry_secs = int(getattr(self.config, 'data_stall_reconnect_seconds', 30))
+        did_resubscribe = False
+        logger.info("Starting data-stall watchdog")
+                
+        while self.running:
+            try:
+                await asyncio.sleep(1)
+                now = datetime.now(IST)
+                logger.debug(
+                    f"[Watchdog] now={now.strftime('%H:%M:%S')}, "
+                    f"_last_subscribe_time={self._last_subscribe_time.strftime('%H:%M:%S') if self._last_subscribe_time else 'None'}, "
+                    f"last_packet_time={self.last_packet_time.strftime('%H:%M:%S') if self.last_packet_time else 'None'}, "
+                    f"did_resubscribe={did_resubscribe}"
+                )
+                
+
+                # If we never got any packets since connect
+                if self.last_packet_time is None:
+                    if self._last_subscribe_time:
+                        since_sub = (now - self._last_subscribe_time).total_seconds()
+                        logger.info(f"[Watchdog] {since_sub:.1f}s since subscribe, no packets yet.")
+                        
+                        
+                        
+                    # After stall_secs from subscribe, try resubscribe once
+                    if self._last_subscribe_time and (now - self._last_subscribe_time).total_seconds() >= stall_secs and not did_resubscribe:
+                        logger.warning(f"No market data for {stall_secs}s after subscribe — re-subscribing")
+                        try:
+                            await self.subscribe()
+                            logger.info(f"[Watchdog] Resubscribe triggered at {now.strftime('%H:%M:%S')}")
+                            did_resubscribe = True
+                        except Exception as e:
+                            logger.error(f"Resubscribe failed: {e}")
+                    # After retry_secs, still no packets — reconnect
+                    if self._last_subscribe_time and (now - self._last_subscribe_time).total_seconds() >= retry_secs:
+
+                        logger.warning(f"No market data for {retry_secs}s — reconnecting WebSocket")
+                        try:
+                            await self.disconnect(stop_running=False)  # Keep running for internal retry [[8]]
+                        finally:
+                            logger.info(f"[Watchdog] Reconnect triggered at {now.strftime('%H:%M:%S')}")
+                            break
+
+  
+                else:
+                    # Got data — reset watchdog state
+                    did_resubscribe = False
+                    since_last_packet = (now - self.last_packet_time).total_seconds()
+                    logger.debug(f"[Watchdog] Last packet received {since_last_packet:.1f}s ago.")
+            except asyncio.CancelledError:
+                logger.debug("Data-stall watchdog cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Data-stall watchdog error: {e}", exc_info=True)
+                await asyncio.sleep(2)
+
+
+        
+    
+        
+    async def run_forever(self):
+        """Connect, process, and auto-reconnect until self.running is False."""
+        backoff = self.config.reconnect_delay_base
+        while self.running:
+            try:
+                ok = await self.connect()
+                if not ok:
+                    logger.error("Connect failed, honoring backoff")
+                    await asyncio.sleep(min(backoff, 60))
+                    backoff = min(backoff * 2, 60)
+                    continue
+
+                # Reset backoff after a successful connect
+                backoff = self.config.reconnect_delay_base
+
+                await self.process_messages()
+
+                # If process_messages returns without exception, it means the server closed or loop ended
+                    
+                if self.running:
+                    logger.warning("Message loop ended; attempting reconnection")
+                    await self.disconnect(stop_running=False)  # Internal reconnect without shutdown [[2]]
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)  # Exponential backoff for resilience [[4]]
+
+
+                    
+            except asyncio.CancelledError:
+                logger.info("run_forever cancelled")
+                break
+            except Exception as e:
+                logger.error(f"run_forever error: {e}", exc_info=True)
+                if self.running:
+                    await asyncio.sleep(min(backoff, 60))
+                    backoff = min(backoff * 2, 60)
+    
+    
     
     # Include remaining methods from original file...
     def _parse_ticker_8(self, data: bytes) -> Optional[Dict]:
@@ -1055,20 +1396,50 @@ class EnhancedWebSocketHandler:
         except Exception as e:
             logger.error(f"Error handling text message: {e}")
     
-    async def disconnect(self):
-        """Gracefully disconnect from WebSocket."""
+
+
+    async def disconnect(self, stop_running: bool = True):
+        """Gracefully disconnect from WebSocket.
+        stop_running=True → full shutdown
+        stop_running=False → internal reconnect (keep run_forever alive)
+        """
         logger.info("Disconnecting from DhanHQ WebSocket")
-        self.running = False
-        
+        if stop_running:
+            self.running = False
+            logger.debug("Disconnect mode: full shutdown (running=False)")
+        else:
+            logger.debug("Disconnect mode: internal reconnect (running=True)")
+
+        # Cancel boundary loop if running (enhanced with safer exception handling)
+        try:
+            if getattr(self, 'boundary_task', None) and not self.boundary_task.done():
+                self.boundary_task.cancel()
+                await self.boundary_task  # Await to ensure clean cancellation [[3]]
+        except asyncio.CancelledError:
+            logger.debug("Boundary loop task cancelled")
+        except Exception as e:
+            logger.debug(f"Boundary task cancel failed (ignored): {e}")
+
+        # Cancel data-stall watchdog if running (enhanced similarly)
+        try:
+            if getattr(self, 'data_watchdog_task', None) and not self.data_watchdog_task.done():
+                self.data_watchdog_task.cancel()
+                await self.data_watchdog_task  # Await for proper cleanup [[6]]
+        except asyncio.CancelledError:
+            logger.debug("Data-stall watchdog cancelled")
+        except Exception as e:
+            logger.debug(f"Data watchdog cancel failed (ignored): {e}")
+
         if self.websocket:
             try:
-                # Log final statistics
+                logger.info(f"[Subscribe] WebSocket state: open={self.websocket.open}, closed={self.websocket.closed}")
+                
                 logger.info(f"Final packet statistics: {self.packet_stats}")
                 logger.info(f"Total ticks processed: {self.tick_count}")
                 logger.info(f"Final synthetic volume: {self.current_period_volume:,}")
-                
-                await self.websocket.close()
+                await self.websocket.close()  # Ensure async close to avoid abnormal errors [[7]]
                 logger.info("WebSocket disconnected successfully")
-                
             except Exception as e:
                 logger.error(f"Error during disconnect: {e}")
+
+        self.authenticated = False

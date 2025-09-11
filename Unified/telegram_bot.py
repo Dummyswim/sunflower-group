@@ -10,6 +10,9 @@ from pathlib import Path
 import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from http.client import RemoteDisconnected
+from requests.exceptions import ChunkedEncodingError, SSLError
+
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +42,26 @@ class TelegramBot:
         session = requests.Session()
         
         # Configure retry strategy - FIXED for urllib3 2.0+
+        # retry_strategy = Retry(
+        #     total=5,  # Increased retries
+        #     status_forcelist=[429, 500, 502, 503, 504, 104],
+        #     allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"],  # Changed from method_whitelist
+        #     backoff_factor=2,
+        #     respect_retry_after_header=True  # Added this for better rate limit handling
+        # )
+        
         retry_strategy = Retry(
-            total=5,  # Increased retries
-            status_forcelist=[429, 500, 502, 503, 504, 104],
-            allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"],  # Changed from method_whitelist
-            backoff_factor=2,
-            respect_retry_after_header=True  # Added this for better rate limit handling
+            total=5,
+            connect=5,
+            read=5,
+            status=5,
+            backoff_factor=1.5,
+            allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"],
+            status_forcelist=[429, 500, 502, 503, 504],
+            respect_retry_after_header=True,
+            raise_on_status=False
         )
+
         
         adapter = HTTPAdapter(
             max_retries=retry_strategy,
@@ -76,6 +92,7 @@ class TelegramBot:
                 clean_message = self._clean_message(message)
                 logger.debug(f"Message cleaned, attempt {attempt + 1}/{retry_count}")
                 
+
                 url = f"{self.base_url}/sendMessage"
                 payload = {
                     "chat_id": self.chat_id,
@@ -83,26 +100,21 @@ class TelegramBot:
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True
                 }
-                
-                # Use timeout for this specific request
-                response = self.session.post(
-                    url, 
-                    json=payload, 
-                    timeout=(5, 15)  # Connection and read timeout
-                )
-                
-                if response.status_code == 200:
+                timeout = (5, 15)
+                self._log_http_attempt("sendMessage", url, attempt + 1, timeout)
+                resp = self.session.post(url, json=payload, timeout=timeout)
+                self._log_http_response("sendMessage", resp)
+                if resp.status_code == 200:
                     logger.info(f"Telegram message sent successfully on attempt {attempt + 1}")
                     return True
-                else:
-                    logger.warning(f"Telegram API returned {response.status_code}: {response.text}")
-                    
-                    # Handle rate limiting
-                    if response.status_code == 429:
-                        retry_after = int(response.headers.get('Retry-After', 5))
-                        logger.warning(f"Rate limited. Waiting {retry_after} seconds")
-                        time.sleep(retry_after)
-                        continue
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get('Retry-After', 5))
+                    logger.warning(f"[TG] Rate limited (429). Backing off {retry_after}s")
+                    time.sleep(retry_after)
+                    continue
+                logger.warning(f"[TG] Non-200 from Telegram: {resp.status_code} {resp.text[:140]}")
+                            
+
                         
             except requests.exceptions.ConnectionError as e:
                 logger.error(f"Connection error on attempt {attempt + 1}: {e}")
@@ -122,12 +134,42 @@ class TelegramBot:
                     time.sleep(2 ** attempt)
                     
             except Exception as e:
-                logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+                et = type(e).__name__
+                logger.warning(f"[TG] sendMessage exception on attempt {attempt + 1}: {et} → {e}")
+                if attempt < retry_count - 1 and self._is_transient_exc(e):
+                    wait_time = 2 ** attempt
+                    logger.info(f"[TG] Transient error; retrying in {wait_time}s")
+                    time.sleep(wait_time)
+                    if attempt == 1:
+                        logger.info("[TG] Recreating session after repeated transient errors")
+                        try:
+                            self.session.close()
+                        except Exception:
+                            pass
+                        self.session = self._create_robust_session()
+                    continue
                 if attempt < retry_count - 1:
                     time.sleep(1)
+
+
         
         logger.error(f"Failed to send message after {retry_count} attempts")
         return False
+
+
+    def _log_http_attempt(self, action: str, url: str, attempt: int, timeout: tuple):
+        logger.info(f"[TG] {action} attempt {attempt} → url={url}, timeout={timeout}")
+
+    def _log_http_response(self, action: str, resp: requests.Response):
+        try:
+            logger.info(f"[TG] {action} response → status={resp.status_code}, ok={resp.ok}, len={len(resp.content)}")
+        except Exception:
+            logger.info(f"[TG] {action} response → status={getattr(resp,'status_code',None)}, ok={getattr(resp,'ok',None)}")
+
+    def _is_transient_exc(self, e: Exception) -> bool:
+        return isinstance(e, (RemoteDisconnected, ChunkedEncodingError, SSLError, requests.exceptions.ConnectionError))
+
+
     
     def send_photo(self, photo_path: str, caption: str = "", retry_count: int = 3) -> bool:
         """Send photo with optional caption and retry mechanism."""
@@ -140,10 +182,11 @@ class TelegramBot:
         for attempt in range(retry_count):
             try:
                 clean_caption = self._clean_message(caption)
+                
+                
                 url = f"{self.base_url}/sendPhoto"
-                
-                logger.debug(f"Sending photo attempt {attempt + 1}/{retry_count}")
-                
+                timeout = (10, 60)
+                self._log_http_attempt("sendPhoto", url, attempt + 1, timeout)
                 with open(photo_path, 'rb') as photo:
                     files = {'photo': photo}
                     data = {
@@ -151,19 +194,13 @@ class TelegramBot:
                         'caption': clean_caption,
                         'parse_mode': 'HTML'
                     }
-                    
-                    response = self.session.post(
-                        url, 
-                        files=files, 
-                        data=data, 
-                        timeout=(10, 60)  # Longer timeout for file uploads
-                    )
-                
-                if response.status_code == 200:
+                    resp = self.session.post(url, files=files, data=data, timeout=timeout)
+                self._log_http_response("sendPhoto", resp)
+                if resp.status_code == 200:
                     logger.info(f"Telegram photo sent successfully on attempt {attempt + 1}")
                     return True
-                else:
-                    logger.warning(f"Photo upload failed with status {response.status_code}")
+                logger.warning(f"[TG] sendPhoto non-200 → status={resp.status_code}, body={resp.text[:140]}")
+                logger.warning(f"Photo upload failed with status {resp.status_code}")
                     
             except requests.exceptions.ConnectionError as e:
                 logger.error(f"Connection error uploading photo on attempt {attempt + 1}: {e}")
@@ -174,9 +211,23 @@ class TelegramBot:
                         self.session = self._create_robust_session()
                         
             except Exception as e:
-                logger.error(f"Photo upload error on attempt {attempt + 1}: {e}")
+                et = type(e).__name__
+                logger.warning(f"[TG] sendPhoto exception on attempt {attempt + 1}: {et} → {e}")
+                if attempt < retry_count - 1 and self._is_transient_exc(e):
+                    wait_time = 2 ** attempt
+                    logger.info(f"[TG] Transient error; retrying in {wait_time}s")
+                    time.sleep(wait_time)
+                    if attempt == 1:
+                        logger.info("[TG] Recreating session after repeated transient errors (photo)")
+                        try:
+                            self.session.close()
+                        except Exception:
+                            pass
+                        self.session = self._create_robust_session()
+                    continue
                 if attempt < retry_count - 1:
                     time.sleep(2)
+
         
         logger.error(f"Failed to send photo after {retry_count} attempts")
         return False

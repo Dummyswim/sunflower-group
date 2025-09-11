@@ -530,13 +530,15 @@ class ConsolidatedTechnicalAnalysis:
                 current_direction = 0
                 trend = 'neutral'
             
-            return {
-                'value': current_st,
-                'direction': current_direction,
-                'trend': trend,
-                'supertrend_series': supertrend.ffill(),
-                'direction_series': direction.fillna(0)
-            }
+            return { 
+                    'value': current_st, 
+                    'direction': current_direction, 
+                    'trend': trend, 
+                    'signal': trend, # expose as signal so analyzer and consensus read it 
+                    'supertrend_series': supertrend.ffill(), 
+                    'direction_series': direction.fillna(0) 
+                }
+                    
         except Exception as e:
             logger.error(f"Supertrend calculation error: {e}")
             return self._get_default_supertrend()
@@ -661,13 +663,16 @@ class ConsolidatedTechnicalAnalysis:
         }
     
     def _get_default_supertrend(self) -> Dict:
-        return {
-            'value': 0,
-            'direction': 0,
-            'trend': 'neutral',
-            'supertrend_series': pd.Series([0]),
-            'direction_series': pd.Series([0])
-        }
+
+        return { 
+                'value': 0, 
+                'direction': 0, 
+                'trend': 'neutral', 
+                'signal': 'neutral', 
+                'supertrend_series': pd.Series([0]), 
+                'direction_series': pd.Series([0]) 
+                }
+    
     
     def _get_default_impulse(self) -> Dict:
         return {

@@ -59,27 +59,82 @@ class CandlestickPatternDetector:
         
         return {'pattern': 'none', 'signal': 'neutral', 'confidence': 0}
     
-    def _detect_three_soldiers(self, df: pd.DataFrame) -> bool:
-        """Three consecutive green candles with increasing closes."""
-        if len(df) < 3:
-            return False
+    # def _detect_three_soldiers(self, df: pd.DataFrame) -> bool:
+    #     """Three consecutive green candles with increasing closes."""
+    #     if len(df) < 3:
+    #         return False
         
-        last_3 = df.tail(3)
-        all_green = all(last_3['close'] > last_3['open'])
-        increasing = all(last_3['close'].diff().dropna() > 0)
+    #     last_3 = df.tail(3)
+    #     all_green = all(last_3['close'] > last_3['open'])
+    #     increasing = all(last_3['close'].diff().dropna() > 0)
         
-        return all_green and increasing
+    #     return all_green and increasing
     
-    def _detect_three_crows(self, df: pd.DataFrame) -> bool:
-        """Three consecutive red candles with decreasing closes."""
-        if len(df) < 3:
-            return False
-            
-        last_3 = df.tail(3)
-        all_red = all(last_3['close'] < last_3['open'])
-        decreasing = all(last_3['close'].diff().dropna() < 0)
+    
+    def _detect_three_soldiers(self, df: pd.DataFrame) -> bool: 
+        """Three White Soldiers: 3 green candles; opens inside prior body; strong bodies; small upper wicks.""" 
+        if len(df) < 3: 
+            return False 
         
-        return all_red and decreasing
+        last_3 = df.tail(3).copy()
+        if not all(last_3['close'] > last_3['open']):
+            return False
+        if not all(last_3['close'].diff().dropna() > 0):
+            return False
+
+        for i in range(-2, 1):
+            prev = last_3.iloc[i-1]
+            cur = last_3.iloc[i]
+            body_prev = abs(prev['close'] - prev['open'])
+            range_prev = max(prev['high'] - prev['low'], 1e-6)
+            if body_prev / range_prev < 0.5:
+                return False
+            lo_body = min(prev['open'], prev['close'])
+            hi_body = max(prev['open'], prev['close'])
+            if not (lo_body <= cur['open'] <= hi_body):
+                return False
+            cur_body = cur['close'] - cur['open']
+            upper_wick = cur['high'] - max(cur['close'], cur['open'])
+            if cur_body <= 0 or upper_wick > 0.5 * cur_body:
+                return False
+        logger.debug("Pattern OK: Three White Soldiers")
+        return True
+
+    
+    
+    def _detect_three_crows(self, df: pd.DataFrame) -> bool: 
+        """Three Black Crows: 3 red candles; opens inside prior body; strong bodies; small lower wicks.""" 
+        if len(df) < 3: 
+            return False 
+        
+        last_3 = df.tail(3).copy()
+    
+        if not all(last_3['close'] < last_3['open']):
+            return False
+        if not all(last_3['close'].diff().dropna() < 0):
+            return False
+        for i in range(-2, 1):
+            prev = last_3.iloc[i-1]
+            cur = last_3.iloc[i]
+            body_prev = abs(prev['close'] - prev['open'])
+            range_prev = max(prev['high'] - prev['low'], 1e-6)
+            if body_prev / range_prev < 0.5:
+                return False
+            lo_body = min(prev['open'], prev['close'])
+            hi_body = max(prev['open'], prev['close'])
+            if not (lo_body <= cur['open'] <= hi_body):
+                return False
+            
+            cur_body = cur['open'] - cur['close'] 
+            lower_wick = min(cur['open'], cur['close']) - cur['low'] 
+            if cur_body <= 0 or lower_wick > 0.5 * cur_body: 
+                return False
+            
+            
+            
+        logger.debug("Pattern OK: Three Black Crows")
+        return True
+
     
     def _detect_momentum_burst(self, df: pd.DataFrame) -> dict:
         """Detect sudden momentum increase."""
@@ -100,37 +155,120 @@ class CandlestickPatternDetector:
         
         return {'detected': False}
     
+
+
+
     def _detect_sr_test(self, df: pd.DataFrame) -> dict:
-        """Detect support/resistance test."""
+        """Detect support/resistance test with longer momentum and breakout evidence.
+
+        Rules:
+        - At resistance + bullish momentum + breakout evidence at day high → breakout_potential (LONG)
+        - At resistance without breakout evidence or with bearish momentum → resistance_test (SHORT)
+        - At support + bearish momentum + breakdown evidence at day low → breakdown_potential (SHORT)
+        - At support without breakdown evidence or with bullish momentum → support_test (LONG)
+        """
         if len(df) < 20:
             return {'detected': False}
-        
-        # Find recent highs/lows
-        recent_high = df['high'].tail(20).max()
-        recent_low = df['low'].tail(20).min()
-        current = df['close'].iloc[-1]
-        
-        # Test resistance
-        if abs(current - recent_high) / recent_high < 0.001:  # Within 0.1%
-            return {
-                'detected': True,
-                'name': 'resistance_test',
-                'signal': 'SHORT',
-                'confidence': 70,
-                'level': recent_high
-            }
-        
-        # Test support
-        if abs(current - recent_low) / recent_low < 0.001:  # Within 0.1%
-            return {
-                'detected': True,
-                'name': 'support_test',
-                'signal': 'LONG',
-                'confidence': 70,
-                'level': recent_low
-            }
-        
+
+        window = df.tail(20).copy()
+        recent_high = float(window['high'].max())
+        recent_low = float(window['low'].min())
+        current = float(df['close'].iloc[-1])
+
+        # Proximity thresholds
+        tol_res = 0.001
+        tol_sup = 0.001
+        near_resistance = (recent_high > 0) and (abs(current - recent_high) / recent_high < tol_res)
+        near_support = (recent_low > 0) and (abs(current - recent_low) / recent_low < tol_sup)
+
+        # Momentum: 20-bar slope + RSI(14)
+        closes_short = df['close'].tail(12).astype(float).values
+        closes_long = df['close'].tail(20).astype(float).values
+        try:
+            x_short = np.arange(len(closes_short))
+            x_long = np.arange(len(closes_long))
+            slope_short = float(np.polyfit(x_short, closes_short, 1)[0])
+            slope_long = float(np.polyfit(x_long, closes_long, 1)[0])
+        except Exception:
+            slope_short, slope_long = 0.0, 0.0
+
+        try:
+            delta14 = pd.Series(df['close'].tail(30).astype(float).values).diff()
+            gain14 = delta14.clip(lower=0).rolling(14).mean()
+            loss14 = (-delta14.clip(upper=0)).rolling(14).mean().replace(0, 1e-10)
+            rs14 = (gain14 / loss14).fillna(0)
+            rsi14 = float((100 - (100 / (1 + rs14))).iloc[-1])
+        except Exception:
+            rsi14 = 50.0
+
+        # Recent pressure
+        recent = df.tail(2)
+        recent_green = int((recent['close'] > recent['open']).sum())
+        recent_red = 2 - recent_green
+
+        # Momentum decision (longer horizon)
+        bullish_mom = ((slope_long > 0 and rsi14 > 50) or (recent_green >= 2))
+        bearish_mom = ((slope_long < 0 and rsi14 < 50) or (recent_red >= 2))
+
+        # Day high/low context
+        try:
+            day_mask = df.index.date == df.index[-1].date()
+            day_high = float(df.loc[day_mask, 'high'].max())
+            day_low = float(df.loc[day_mask, 'low'].min())
+        except Exception:
+            day_high, day_low = recent_high, recent_low
+
+        # Breakout evidence thresholds
+        breakout_buf = 0.0005  # 0.05%
+        last_close = float(df['close'].iloc[-1])
+        last_high = float(df['high'].iloc[-1])
+        breakout_evidence = (
+            (last_close > recent_high * (1 + breakout_buf) or last_high > recent_high * (1 + breakout_buf))
+            and slope_long > 0 and rsi14 >= 55
+        )
+
+        logger.debug(
+            f"SR ctx → cur={current:.2f}, H20={recent_high:.2f}, L20={recent_low:.2f}, "
+            f"dayH={day_high:.2f}, dayL={day_low:.2f}, near_res={near_resistance}, near_sup={near_support}, "
+            f"slope_short={slope_short:.5f}, slope_long={slope_long:.5f}, RSI14={rsi14:.1f}, "
+            f"breakout_ev={breakout_evidence}"
+        )
+
+        if near_resistance:
+            if bullish_mom and breakout_evidence and abs(day_high - recent_high) / max(1.0, recent_high) < 0.002:
+                logger.info("SR: Resistance + bullish momentum + breakout evidence at day high → breakout_potential (LONG)")
+                return {
+                    'detected': True, 'name': 'breakout_potential', 'signal': 'LONG',
+                    'confidence': 80, 'level': recent_high, 'slope_long': slope_long, 'rsi14': rsi14
+                }
+            else:
+                logger.info("SR: Resistance without breakout evidence → resistance_test (SHORT)")
+                return {
+                    'detected': True, 'name': 'resistance_test', 'signal': 'SHORT',
+                    'confidence': 75, 'level': recent_high, 'slope_long': slope_long, 'rsi14': rsi14
+                }
+
+        if near_support:
+            breakdown_evidence = (
+                (last_close < recent_low * (1 - breakout_buf) or float(df['low'].iloc[-1]) < recent_low * (1 - breakout_buf))
+                and slope_long < 0 and rsi14 <= 45
+            )
+            if bearish_mom and breakdown_evidence and abs(day_low - recent_low) / max(1.0, recent_low) < 0.002:
+                logger.info("SR: Support + bearish momentum + breakdown evidence at day low → breakdown_potential (SHORT)")
+                return {
+                    'detected': True, 'name': 'breakdown_potential', 'signal': 'SHORT',
+                    'confidence': 80, 'level': recent_low, 'slope_long': slope_long, 'rsi14': rsi14
+                }
+            else:
+                logger.info("SR: Support without breakdown evidence → support_test (LONG)")
+                return {
+                    'detected': True, 'name': 'support_test', 'signal': 'LONG',
+                    'confidence': 75, 'level': recent_low, 'slope_long': slope_long, 'rsi14': rsi14
+                }
+
         return {'detected': False}
+
+
     
     def _detect_exhaustion(self, df: pd.DataFrame) -> dict:
         """Detect exhaustion after strong move."""

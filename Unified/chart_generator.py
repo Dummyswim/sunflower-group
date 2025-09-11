@@ -10,7 +10,7 @@ from matplotlib.patches import Rectangle
 import pandas as pd
 import numpy as np
 import logging
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional
 from datetime import datetime
 from pathlib import Path
 import warnings
@@ -134,13 +134,23 @@ class UnifiedChartGenerator:
             logger.debug("Adding performance metrics...")
             self._add_performance_metrics(ax_perf, signal_result)
             
+    
             
-            try: 
-                last_ts = df.index[-1] 
-                title_time = last_ts.strftime('%Y-%m-%d %H:%M:%S') 
-            except Exception: 
+            try:
+            
+                sig_bar_close = signal_result.get('bar_close_time') 
+                if sig_bar_close: 
+                    last_ts = pd.to_datetime(sig_bar_close) 
+                    title_time = last_ts.strftime('%Y-%m-%d %H:%M:%S') 
+                    logger.debug(f"Chart title anchored to bar_close_time={last_ts}") 
+                else: 
+                    last_ts = df.index[-1] 
+                    title_time = last_ts.strftime('%Y-%m-%d %H:%M:%S') 
+            except Exception as e: 
+                logger.debug(f"Fallback chart title time due to error: {e}") 
                 title_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
+                
+                
             
             title = (
                 f"Unified Trading Analysis - {title_time} IST\n"

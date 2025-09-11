@@ -20,7 +20,15 @@ logger = logging.getLogger(__name__)
 class DataPersistenceManager:
     """Manages persistent rolling window data storage and retrieval."""
     
+        
     def __init__(self, config):
+        """Initialize DataPersistenceManager with robust error handling and logging."""
+        logger.info("=" * 60)
+        logger.info("INITIALIZING DATA PERSISTENCE")
+        logger.info("=" * 60)
+
+         
+        
         self.config = config
         self.data_dir = Path("data")
         self.data_dir.mkdir(exist_ok=True)
@@ -30,22 +38,119 @@ class DataPersistenceManager:
         self.rolling_file_15m = self.data_dir / "nifty50_rolling_15m.pkl"
         self.metadata_file = self.data_dir / "metadata.json"
         
-        # Data storage
-        self.data_5m = pd.DataFrame()
-        self.data_15m = pd.DataFrame()
+        # Initialize with proper timezone-aware empty DataFrames
+        import pytz
+        self.ist = pytz.timezone('Asia/Kolkata')
+        
+        # Create properly initialized DataFrames - NEVER None
+        self.data_5m = self._create_empty_dataframe()
+        self.data_15m = self._create_empty_dataframe()
         self.metadata = {}
         
         # Rolling window parameters
-        self.max_days_5m = 30  # Keep 30 days of 5-min data
+        self.max_days_5m = 30 # Keep 30 days of 5-min data
         self.max_days_15m = 60  # Keep 60 days of 15-min data
-        self.min_required_candles = 200  # Minimum candles needed for indicators
+        self.min_required_candles = 200 # Minimum candles needed for indicators
         
-        # API configuration for historical data
+        # API configuration
         self.api_base_url = "https://api.dhan.co/v2"
         
         logger.info("DataPersistenceManager initialized")
-        logger.info(f"Data directory: {self.data_dir}")
+        logger.info(f"✅ Data directory: {self.data_dir}")
+        logger.info(f"✅ 5m file: {self.rolling_file_5m}")
+        logger.info(f"✅ 15m file: {self.rolling_file_15m}")
+        logger.info(f"✅ DataFrames initialized (5m: {type(self.data_5m)}, 15m: {type(self.data_15m)})")
+
+
+    def _create_empty_dataframe(self) -> pd.DataFrame:
+        """Create a properly initialized empty DataFrame with timezone-aware index."""
+        logger.debug("Creating empty DataFrame with IST timezone")
         
+        df = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+        df.index = pd.DatetimeIndex([], tz=self.ist, name='timestamp')
+        
+        logger.debug(f"Created DataFrame: columns={df.columns.tolist()}, index_tz={df.index.tz}")
+        return df
+
+
+    def _ensure_dataframes_valid(self) -> None:
+        """Ensure all DataFrames are valid and never None."""
+        logger.debug("Validating DataFrames...")
+        
+        # Check and fix data_5m
+        if self.data_5m is None:
+            logger.warning("⚠️ data_5m was None, creating new DataFrame")
+            self.data_5m = self._create_empty_dataframe()
+        elif not isinstance(self.data_5m, pd.DataFrame):
+            logger.warning(f"⚠️ data_5m was {type(self.data_5m)}, creating new DataFrame")
+            self.data_5m = self._create_empty_dataframe()
+        
+        # Check and fix data_15m
+        if self.data_15m is None:
+            logger.warning("⚠️ data_15m was None, creating new DataFrame")
+            self.data_15m = self._create_empty_dataframe()
+        elif not isinstance(self.data_15m, pd.DataFrame):
+            logger.warning(f"⚠️ data_15m was {type(self.data_15m)}, creating new DataFrame")
+            self.data_15m = self._create_empty_dataframe()
+        
+        logger.debug(f"✅ DataFrames valid - 5m: {len(self.data_5m)} rows, 15m: {len(self.data_15m)} rows")
+
+
+
+    def _normalize_index_tz(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure DateTimeIndex is tz-aware Asia/Kolkata and sorted. Always returns a DataFrame."""
+        logger.debug(f"Normalizing index timezone - Input type: {type(df)}")
+        
+        try:
+            # Handle None input - return empty DataFrame
+            if df is None:
+                logger.warning("Input is None, returning empty DataFrame")
+                return self._create_empty_dataframe()
+            
+            # Handle non-DataFrame input
+            if not isinstance(df, pd.DataFrame):
+                logger.warning(f"Input is {type(df)}, returning empty DataFrame")
+                return self._create_empty_dataframe()
+            
+            # Handle empty DataFrame
+            if df.empty:
+                logger.debug("Input DataFrame is empty, returning as-is")
+                return df
+            
+            # Make a copy to avoid modifying original
+            out = df.copy()
+            
+            # Log current index state
+            logger.debug(f"Current index: type={type(out.index)}, tz={getattr(out.index, 'tz', 'None')}, len={len(out)}")
+            
+            # Ensure we have a DatetimeIndex
+            if not isinstance(out.index, pd.DatetimeIndex):
+                logger.info("Converting index to DatetimeIndex")
+                out.index = pd.to_datetime(out.index, errors='coerce')
+            
+            # Handle timezone
+            if out.index.tz is None:
+                logger.info("Localizing naive index to Asia/Kolkata")
+                out.index = out.index.tz_localize(self.ist)
+            elif out.index.tz != self.ist:
+                logger.info(f"Converting index from {out.index.tz} to Asia/Kolkata")
+                out.index = out.index.tz_convert(self.ist)
+            else:
+                logger.debug("Index already in Asia/Kolkata timezone")
+            
+            # Sort by index and standardize index name 
+            out = out.sort_index()
+            
+            logger.debug(f"✅ Normalized: tz={out.index.tz}, len={len(out)}")
+            return out
+            
+        except Exception as e:
+            logger.error(f"❌ Error normalizing index: {e}", exc_info=True)
+            logger.info("Returning empty DataFrame due to error")
+            return self._create_empty_dataframe()
+
+
+
     def initialize(self) -> bool:
         """Initialize data storage - load from persistent file or fetch from API."""
         try:
@@ -53,13 +158,25 @@ class DataPersistenceManager:
             logger.info("INITIALIZING DATA PERSISTENCE")
             logger.info("=" * 60)
             
+            # Ensure DataFrames are valid before starting
+            self._ensure_dataframes_valid()
+            logger.info("✅ DataFrames validated")
+            
             # Try to load from persistent storage
+            logger.info("Loading from persistent storage...")
             loaded_5m = self._load_from_file("5m")
             loaded_15m = self._load_from_file("15m")
+            
+            logger.info(f"Load results: 5m={loaded_5m}, 15m={loaded_15m}")
+            
+            # Ensure DataFrames are still valid after loading
+            self._ensure_dataframes_valid()
             
             # Check if data is fresh and sufficient
             needs_update_5m = self._check_data_freshness("5m", self.data_5m)
             needs_update_15m = self._check_data_freshness("15m", self.data_15m)
+            
+            logger.info(f"Freshness check: 5m needs update={needs_update_5m}, 15m needs update={needs_update_15m}")
             
             # Fetch from API if needed
             if not loaded_5m or needs_update_5m:
@@ -82,46 +199,81 @@ class DataPersistenceManager:
             if not self.data_15m.empty:
                 logger.info(f"   15-min range: {self.data_15m.index[0]} to {self.data_15m.index[-1]}")
                 
+            try: 
+                if not self.data_5m.empty: 
+                    logger.debug(f"5m tz={self.data_5m.index.tz}, last={self.data_5m.index[-1]}")
+                    
+                    if not self.data_15m.empty: 
+                        logger.debug(f"15m tz={self.data_15m.index.tz}, last={self.data_15m.index[-1]}") 
+            except Exception: 
+                pass
+            
             return True
             
         except Exception as e:
             logger.error(f"Data initialization failed: {e}")
             return False
     
+        
     def _load_from_file(self, timeframe: str) -> bool:
-        """Load data from persistent file."""
+        """Load data from persistent file with enhanced error handling."""
         try:
             if timeframe == "5m":
                 file_path = self.rolling_file_5m
             else:
                 file_path = self.rolling_file_15m
             
+            logger.info(f"Attempting to load {timeframe} data from {file_path}")
+            
             if not file_path.exists():
-                logger.info(f"No existing {timeframe} data file found")
+                logger.info(f"No existing {timeframe} data file found at {file_path}")
                 return False
             
             # Load data
+            logger.debug(f"Opening file: {file_path}")
             with open(file_path, 'rb') as f:
                 data = pickle.load(f)
             
-            # Validate data
-            if not isinstance(data, pd.DataFrame) or data.empty:
-                logger.warning(f"Invalid or empty {timeframe} data in file")
+            logger.info(f"Loaded object type: {type(data)}")
+            
+            # Validate loaded data
+            if data is None:
+                logger.warning(f"Loaded data is None for {timeframe}")
                 return False
             
-            # Verify data integrity
+            if not isinstance(data, pd.DataFrame):
+                logger.warning(f"Loaded data is not a DataFrame: {type(data)}")
+                return False
+            
+            if data.empty:
+                logger.warning(f"Loaded DataFrame is empty for {timeframe}")
+                return False
+            
+            # Verify required columns
             required_columns = ['open', 'high', 'low', 'close', 'volume']
-            if not all(col in data.columns for col in required_columns):
-                logger.warning(f"Missing required columns in {timeframe} data")
+            missing_columns = [col for col in required_columns if col not in data.columns]
+            if missing_columns:
+                logger.warning(f"Missing columns in {timeframe} data: {missing_columns}")
                 return False
             
-            # Store data
+            logger.info(f"Data validation passed: {len(data)} rows, columns={data.columns.tolist()}")
+            
+            # Normalize index timezone
+            data = self._normalize_index_tz(data)
+            
+            # Ensure normalization didn't return None
+            if data is None or not isinstance(data, pd.DataFrame):
+                logger.error(f"Normalization failed for {timeframe} data")
+                return False
+            
+            # Store the data
             if timeframe == "5m":
                 self.data_5m = data
             else:
                 self.data_15m = data
             
-            logger.info(f"✅ Loaded {len(data)} {timeframe} candles from persistent storage")
+            logger.info(f"✅ Successfully loaded {len(data)} {timeframe} candles from storage")
+            logger.debug(f"Date range: {data.index[0]} to {data.index[-1]}")
             
             # Load metadata
             self._load_metadata()
@@ -129,8 +281,9 @@ class DataPersistenceManager:
             return True
             
         except Exception as e:
-            logger.error(f"Error loading {timeframe} data: {e}")
+            logger.error(f"❌ Error loading {timeframe} data: {e}", exc_info=True)
             return False
+        
     
     def _save_to_file(self, timeframe: str, data: pd.DataFrame) -> bool:
         """Save data to persistent file."""
@@ -146,11 +299,18 @@ class DataPersistenceManager:
                 file_path = self.rolling_file_15m
                 max_candles = int(self.max_days_15m * 4 * 6.5)
 
-            
-            # Trim to rolling window size
-            if len(data) > max_candles:
+
+            # Trim to rolling window size 
+            if len(data) > max_candles: 
                 data = data.tail(int(max_candles))
             
+            # Normalize and standardize index (defensive)
+            data = self._normalize_index_tz(data)
+            try:
+                data.index.name = 'timestamp'
+            except Exception:
+                pass
+
             # Save data
             with open(file_path, 'wb') as f:
                 pickle.dump(data, f)
@@ -160,47 +320,66 @@ class DataPersistenceManager:
             
             logger.debug(f"Saved {len(data)} {timeframe} candles to {file_path}")
             return True
+
+
             
         except Exception as e:
             logger.error(f"Error saving {timeframe} data: {e}")
             return False
     
+        
     def _check_data_freshness(self, timeframe: str, data: pd.DataFrame) -> bool:
-        """Check if data needs updating."""
+        """Check if data needs updating with robust None handling."""
         try:
+            logger.debug(f"Checking freshness for {timeframe} data")
+            
+            # Handle None or invalid data
+            if data is None:
+                logger.info(f"Data is None for {timeframe}, need to fetch")
+                return True
+            
+            if not isinstance(data, pd.DataFrame):
+                logger.info(f"Data is not DataFrame ({type(data)}) for {timeframe}, need to fetch")
+                return True
+            
             if data.empty:
-                logger.info(f"No {timeframe} data available, need to fetch")
+                logger.info(f"No {timeframe} data available (empty DataFrame), need to fetch")
                 return True
             
             # Check if we have enough data
             min_candles = self.min_required_candles
-            if len(data) < min_candles:
-                logger.info(f"Insufficient {timeframe} data: {len(data)} < {min_candles}")
+            current_candles = len(data)
+            
+            if current_candles < min_candles:
+                logger.info(f"Insufficient {timeframe} data: {current_candles} < {min_candles}")
                 return True
             
-            import pytz # at top if not present ... 
-            tz = pytz.timezone('Asia/Kolkata') 
-            current_time = datetime.now(tz) 
-            last_ts = data.index[-1] 
-            if getattr(last_ts, 'tzinfo', None) is None: 
-                last_ts = tz.localize(last_ts) 
-            else: 
-                last_ts = last_ts.astimezone(tz) 
-            time_diff = (current_time - last_ts).total_seconds() / 60
+            # Check data age
+            try:
+                import pytz
+                tz = pytz.timezone('Asia/Kolkata')
+                current_time = datetime.now(tz)
+                
+                last_ts = data.index[-1]
+                if getattr(last_ts, 'tzinfo', None) is None:
+                    last_ts = tz.localize(last_ts)
+                else:
+                    last_ts = last_ts.astimezone(tz)
+                
+                time_diff = (current_time - last_ts).total_seconds() / 60
+                
+                logger.info(f"{timeframe} data age: {time_diff:.0f} minutes old (last: {last_ts})")
+                
+            except Exception as e:
+                logger.warning(f"Could not check data age: {e}")
             
-
-       
-            
-            # if time_diff > max_age_minutes:
-            #     logger.info(f"{timeframe} data is stale: {time_diff:.0f} minutes old")
-            #     return True
-            
-            # logger.info(f"{timeframe} data is fresh: {time_diff:.0f} minutes old")
+            logger.info(f"{timeframe} data is sufficient: {current_candles} candles available")
             return False
             
         except Exception as e:
-            logger.error(f"Error checking data freshness: {e}")
+            logger.error(f"❌ Error checking data freshness: {e}", exc_info=True)
             return True
+
         
     def _fetch_historical_data(self, interval: str) -> pd.DataFrame:
         """Fetch historical data from Dhan API."""
@@ -294,6 +473,8 @@ class DataPersistenceManager:
                                 timestamp = base_time + timedelta(minutes=5*i)
                             else:  # 15 min
                                 timestamp = base_time + timedelta(minutes=15*i)
+                            
+                        # logger.debug(f"Old-format candle ts normalized to IST: {timestamp} (tz={getattr(timestamp, 'tzinfo', None)})")
                         
                         # Skip non-market hours
                         if timestamp.hour < 9 or (timestamp.hour == 9 and timestamp.minute < 15):
@@ -415,13 +596,21 @@ class DataPersistenceManager:
                     for candle in api_data.get('candles', []):
                         if len(candle) >= 6:
                             timestamp_str, open_val, high, low, close, volume = candle[:6]
-                            timestamp = pd.to_datetime(timestamp_str)
+                            
+                            # Localize to IST (API old format may be naive) 
+                            timestamp = pd.to_datetime(timestamp_str) 
+                            if getattr(timestamp, 'tzinfo', None) is None: 
+                                timestamp = timestamp.tz_localize('Asia/Kolkata') 
+                            else: 
+                                timestamp = timestamp.tz_convert('Asia/Kolkata')
+                            
                             
                             if volume == 0 or volume is None:
                                 price_range = high - low
                                 volatility = (price_range / close) * 100 if close > 0 else 0
                                 volume = int(10000 + volatility * 5000)
                             
+                                
                             candles.append({
                                 'timestamp': timestamp,
                                 'open': float(open_val),
@@ -458,36 +647,75 @@ class DataPersistenceManager:
             logger.error(f"Error fetching historical data: {e}", exc_info=True)
             return pd.DataFrame()
 
-    
-    def update_candle(self, candle: pd.DataFrame, timeframe: str):
-        """Update data with new candle and save incrementally."""
-        try:
-            if candle.empty:
-                logger.warning(f"Empty candle provided for update- {candle.empty}")
-                return
 
+
+    def update_candle(self, candle: pd.DataFrame, timeframe: str):
+        """Update data with new candle and save incrementally with enhanced logging."""
+        try:
+            logger.debug(f"update_candle called for {timeframe}")
+            
+            # Validate input
+            if candle is None:
+                logger.warning(f"Candle is None for {timeframe}, skipping update")
+                return
+            
+            if not isinstance(candle, pd.DataFrame):
+                logger.warning(f"Candle is not DataFrame ({type(candle)}), skipping update")
+                return
+            
+            if candle.empty:
+                logger.warning(f"Empty candle provided for {timeframe}, skipping update")
+                return
+            
+            logger.debug(f"Candle info: shape={candle.shape}, index={candle.index[0] if not candle.empty else 'empty'}")
+            
+            # Ensure DataFrames are valid
+            self._ensure_dataframes_valid()
+            
+            # Get current data and parameters
             if timeframe == "5m":
                 current_data = self.data_5m
                 max_candles = int(self.max_days_5m * 12 * 6.5)
             else:
                 current_data = self.data_15m
                 max_candles = int(self.max_days_15m * 4 * 6.5)
-
+            
+            logger.debug(f"Current {timeframe} data: {len(current_data)} rows, max={max_candles}")
+            
+            # Normalize the incoming candle
+            candle = self._normalize_index_tz(candle)
+            
+            # Ensure current data is normalized
+            if not current_data.empty:
+                current_data = self._normalize_index_tz(current_data)
+            
             # Append or update candle
-            if current_data is None or current_data.empty:
+            candle_time = candle.index[0]
+            logger.debug(f"Processing candle at {candle_time}")
+            
+            if current_data.empty:
+                logger.info(f"First candle for {timeframe}: {candle_time}")
                 updated_data = candle.copy()
             else:
-                candle_time = candle.index[0]
                 if candle_time in current_data.index:
+                    logger.debug(f"Updating existing candle at {candle_time}")
                     current_data.loc[candle_time] = candle.iloc[0]
                     updated_data = current_data
                 else:
-                    updated_data = pd.concat([current_data, candle])
-
+                    logger.debug(f"Appending new candle at {candle_time}")
+                    updated_data = pd.concat([current_data, candle], axis=0)
+            
+            # Remove duplicates if any
+            updated_data = updated_data[~updated_data.index.duplicated(keep='last')]
             
             # Trim to rolling window
             if len(updated_data) > max_candles:
+                old_len = len(updated_data)
                 updated_data = updated_data.tail(max_candles)
+                logger.debug(f"Trimmed {timeframe} data from {old_len} to {len(updated_data)} rows")
+            
+            # Final sort
+            updated_data = updated_data.sort_index()
             
             # Update in memory
             if timeframe == "5m":
@@ -495,37 +723,68 @@ class DataPersistenceManager:
             else:
                 self.data_15m = updated_data
             
-            # Save to file (incremental save)
+            # Save to file
             self._save_to_file(timeframe, updated_data)
             
-            logger.debug(f"Updated {timeframe} data with new candle at {candle.index[0]}")
+            logger.info(f"✅ Updated {timeframe} data: {len(updated_data)} total candles, last={candle_time}")
             
         except Exception as e:
-            logger.error(f"Error updating {timeframe} candle: {e}")
+            logger.error(f"❌ Error updating {timeframe} candle: {e}", exc_info=True)
+
     
+
     def get_data(self, timeframe: str, num_candles: Optional[int] = None) -> pd.DataFrame:
-        """Get data for analysis."""
+        """Get data for analysis with comprehensive error handling and logging."""
         try:
+            logger.debug(f"get_data called: timeframe={timeframe}, num_candles={num_candles}")
+            
+            # Ensure DataFrames are valid
+            self._ensure_dataframes_valid()
+            
+            # Get the appropriate data
             if timeframe == "5m":
                 data = self.data_5m
             elif timeframe == "15m":
                 data = self.data_15m
             else:
                 logger.error(f"Invalid timeframe: {timeframe}")
-                return pd.DataFrame()
+                return self._create_empty_dataframe()
+            
+            # Validate data
+            if data is None:
+                logger.warning(f"Data is None for {timeframe}, returning empty DataFrame")
+                return self._create_empty_dataframe()
+            
+            if not isinstance(data, pd.DataFrame):
+                logger.warning(f"Data is not DataFrame ({type(data)}) for {timeframe}")
+                return self._create_empty_dataframe()
             
             if data.empty:
-                logger.warning(f"No {timeframe} data available")
-                return pd.DataFrame()
-            
-            if num_candles:
-                return data.tail(num_candles).copy()
-            else:
+                logger.debug(f"No {timeframe} data available (empty DataFrame)")
                 return data.copy()
-                
+            
+            # Normalize timezone
+            data = self._normalize_index_tz(data)
+            
+            # Return requested number of candles
+            if num_candles and num_candles > 0:
+                if len(data) > num_candles:
+                    result = data.tail(num_candles).copy()
+                    logger.debug(f"Returning last {num_candles} candles of {len(data)} total")
+                else:
+                    result = data.copy()
+                    logger.debug(f"Requested {num_candles} but only {len(data)} available")
+            else:
+                result = data.copy()
+                logger.debug(f"Returning all {len(data)} candles")
+            
+            return result
+            
         except Exception as e:
-            logger.error(f"Error getting {timeframe} data: {e}")
-            return pd.DataFrame()
+            logger.error(f"❌ Error getting {timeframe} data: {e}", exc_info=True)
+            return self._create_empty_dataframe()
+
+
     
     def _load_metadata(self):
         """Load metadata about stored data."""
