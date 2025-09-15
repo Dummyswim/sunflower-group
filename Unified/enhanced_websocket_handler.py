@@ -146,46 +146,58 @@ class EnhancedWebSocketHandler:
             return pd.DataFrame()
 
 
+
     async def _maybe_fire_preclose(self, now_ts: datetime): 
-        """Trigger a pre-close preview once per bucket near its end.""" 
+        """Trigger a pre-close preview once per bucket near its end."""
         try: 
             if not self.on_preclose or not self.current_candle['start_time']: 
                 return 
             start = self.current_candle['start_time'] 
             interval_min = max(1, self.config.candle_interval_seconds // 60) 
             close_time = start + timedelta(minutes=interval_min) 
-            # lead = max(5, min(self.config.candle_interval_seconds - 1, getattr(self.config, 'preclose_lead_seconds', 10))) 
             lead = getattr(self.config, 'preclose_lead_seconds', 10)  # Use config value directly
             preclose_time = close_time - timedelta(seconds=lead)
             
-            logger.debug(f"Pre-close check → now={now_ts.strftime('%H:%M:%S')}, "
-                        f"start={start.strftime('%H:%M:%S')}, close={close_time.strftime('%H:%M:%S')}, "
-                        f"lead={lead}s")
+            # logger.debug(
+            #     f"Pre-close check → now={now_ts.strftime('%H:%M:%S')}, "
+            #     f"start={start.strftime('%H:%M:%S')}, close={close_time.strftime('%H:%M:%S')}, "
+            #     f"lead={lead}s"
+            # )
 
-
-
-            # High-visibility logging for pre-close decisions
-            preclose_time_ist = preclose_time.astimezone(IST) if getattr(preclose_time, 'tzinfo', None) else preclose_time
-            delta_to_pre = (preclose_time_ist - now_ts).total_seconds()
-            delta_to_close = (close_time - now_ts).total_seconds()
             has_ticks = bool(self.current_candle.get('ticks'))
-            fired = self._preclose_fired_for_bucket == start
-            
-            # logger.info(f"[PreClose DBG] delta_pre={delta_to_pre:.0f}s, delta_close={delta_to_close:.0f}s, has_ticks={has_ticks}, fired={fired}")
-            if delta_to_pre <= 0 and has_ticks and not fired:
-                logger.warning("[PreClose MISS] Should fire but not: reviewing bucket")
-            else:
-                logger.debug("[PreClose] Waiting: not yet time or no ticks")
+            fired = (self._preclose_fired_for_bucket == start)
 
+            # Decision logic: Only fire once, and only after preclose_time, if not already fired and there are ticks
+            if now_ts < preclose_time:
+                # logger.debug(
+                #     f"[Pre-Close] Skip: lead window not reached (now={now_ts.strftime('%H:%M:%S')}, "
+                #     f"pre={preclose_time.strftime('%H:%M:%S')})"
+                # )
+                return
+            if fired:
+                logger.debug(
+                    f"[Pre-Close] Skip: already fired for bucket start={start.strftime('%H:%M:%S')}"
+                )
+                return
+            if not has_ticks:
+                logger.info(
+                    f"[Pre-Close] Skip: no ticks in current bucket (start={start.strftime('%H:%M:%S')})"
+                )
+                return
 
-            
-            if now_ts >= preclose_time and self._preclose_fired_for_bucket != start and self.current_candle['ticks']:
-                preview = self._assemble_candle(start, self.current_candle['ticks'])
-                if not preview.empty:
-                    logger.info(f"⏳ Pre-close checkpoint: start={start.strftime('%H:%M:%S')} "
-                                f"close={close_time.strftime('%H:%M:%S')} fired at {now_ts.strftime('%H:%M:%S')}")
-                    await self.on_preclose(preview, self.candle_data.copy() if not self.candle_data.empty else preview.copy())
-                    self._preclose_fired_for_bucket = start
+            # All conditions met: fire pre-close preview
+            preview = self._assemble_candle(start, self.current_candle['ticks'])
+            if not preview.empty:
+                logger.info(
+                    f"⏳ Pre-close checkpoint: start={start.strftime('%H:%M:%S')} "
+                    f"close={close_time.strftime('%H:%M:%S')} fired at {now_ts.strftime('%H:%M:%S')}"
+                )
+                await self.on_preclose(
+                    preview,
+                    self.candle_data.copy() if not self.candle_data.empty else preview.copy()
+                )
+                self._preclose_fired_for_bucket = start
+
         except Exception as e:
             logger.debug(f"Pre-close skipped: {e}")
 
@@ -366,15 +378,16 @@ class EnhancedWebSocketHandler:
                     "ExchangeSegment": self.config.nifty_exchange_segment,
                     "SecurityId": str(self.config.nifty_security_id)  # int, not str str(self.config.nifty_security_id)
                 }]
-            }
-
-            logger.info(f"[Subscribe] Sending subscription at {datetime.now(IST).strftime('%H:%M:%S')} with params: {subscription}")
+            }  
 
             # Send subscription and wait for response
             try:
+                logger.info(f"[Subscribe] Sending subscription at {datetime.now(IST).strftime('%H:%M:%S')} with params: {subscription}")
+                
                 await self.websocket.send(json.dumps(subscription))
                 self._last_subscribe_time = datetime.now(IST)
                 logger.info(f"[Subscribe] _last_subscribe_time set to {self._last_subscribe_time.strftime('%H:%M:%S')}")
+                logger.info("[Subscribe] Waiting for market data...")
                 
                 # Wait for subscription confirmation
                 await asyncio.sleep(2)
@@ -390,8 +403,6 @@ class EnhancedWebSocketHandler:
             except Exception as e:
                 logger.error(f"[Subscribe] Error during subscription: {e}")
                 raise
-
-            logger.info("[Subscribe] Waiting for market data...")
 
 
 
@@ -980,12 +991,12 @@ class EnhancedWebSocketHandler:
             try:
                 await asyncio.sleep(1)
                 now = datetime.now(IST)
-                logger.debug(
-                    f"[Watchdog] now={now.strftime('%H:%M:%S')}, "
-                    f"_last_subscribe_time={self._last_subscribe_time.strftime('%H:%M:%S') if self._last_subscribe_time else 'None'}, "
-                    f"last_packet_time={self.last_packet_time.strftime('%H:%M:%S') if self.last_packet_time else 'None'}, "
-                    f"did_resubscribe={did_resubscribe}"
-                )
+                # logger.debug(
+                #     f"[Watchdog] now={now.strftime('%H:%M:%S')}, "
+                #     f"_last_subscribe_time={self._last_subscribe_time.strftime('%H:%M:%S') if self._last_subscribe_time else 'None'}, "
+                #     f"last_packet_time={self.last_packet_time.strftime('%H:%M:%S') if self.last_packet_time else 'None'}, "
+                #     f"did_resubscribe={did_resubscribe}"
+                # )
                 
 
                 # If we never got any packets since connect
@@ -1020,7 +1031,7 @@ class EnhancedWebSocketHandler:
                     # Got data — reset watchdog state
                     did_resubscribe = False
                     since_last_packet = (now - self.last_packet_time).total_seconds()
-                    logger.debug(f"[Watchdog] Last packet received {since_last_packet:.1f}s ago.")
+                    # logger.debug(f"[Watchdog] Last packet received {since_last_packet:.1f}s ago.")
             except asyncio.CancelledError:
                 logger.debug("Data-stall watchdog cancelled")
                 break
@@ -1432,7 +1443,11 @@ class EnhancedWebSocketHandler:
 
         if self.websocket:
             try:
-                logger.info(f"[Subscribe] WebSocket state: open={self.websocket.open}, closed={self.websocket.closed}")
+                # Safely log state without assuming attributes exist
+                if hasattr(self.websocket, 'open') and hasattr(self.websocket, 'closed'):
+                    logger.info(f"[Subscribe] WebSocket state: open={self.websocket.open}, closed={self.websocket.closed}")
+                else:
+                    logger.info("[Subscribe] WebSocket state: unknown (attributes missing)")
                 
                 logger.info(f"Final packet statistics: {self.packet_stats}")
                 logger.info(f"Total ticks processed: {self.tick_count}")
@@ -1443,3 +1458,6 @@ class EnhancedWebSocketHandler:
                 logger.error(f"Error during disconnect: {e}")
 
         self.authenticated = False
+
+
+        

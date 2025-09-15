@@ -80,7 +80,7 @@ class UnifiedTradingConfig:
     sl_volatility_cap_multiple: float = 1.0  # SL cannot be farther than 1.0× recent 5m volatility range
 
     # Stricter gate for pre-close predictions (forming bar is noisier)
-    preclose_min_mtf_score: float = 0.6
+    preclose_min_mtf_score: float = 0.50 # Reduced from 0.6
 
     # Require more breadth for directional alerts; candidates can use the lower global value
     min_active_indicators_for_alert: int = 4
@@ -187,12 +187,12 @@ class UnifiedTradingConfig:
 
     indicator_weights: Dict[str, float] = field(default_factory=lambda: {
         # Leading indicators (predict)
-        "rsi": 0.15,
-        "macd": 0.22,       # +0.02 (momentum)
+        "rsi": 0.17,
+        "macd": 0.26,       # +0.02 (momentum)
         "bollinger": 0.10,  # −0.05 (reduce over-penalizing continuation)
         
         # Lagging/confirm
-        "ema": 0.25,        # +0.05 (trend structure)
+        "ema": 0.19,        # +0.05 (trend structure)
         "supertrend": 0.18, # −0.02 (less lag weight)
         "keltner": 0.10
     })
@@ -262,6 +262,48 @@ class UnifiedTradingConfig:
     enable_signal_validation: bool = True
     enable_risk_management: bool = True
     
+
+    # Risk tapering for burst momentum setups
+    enable_rr_taper: bool = True
+    rr_taper_floor: float = 0.80           # min R:R for high-confidence bursts
+    rr_taper_confidence_min: float = 0.75  # only taper when conf >= 75%
+    rr_taper_burst_strength: float = 0.30  # |weighted_score| >= 0.30 defines 'burst'
+
+    # ATR settings for volatility-scaled SL/TP
+    atr_period: int = 14
+    atr_multiplier_sl: float = 0.6         # stop = 0.6*ATR for bursts
+    atr_multiplier_tp: float = 1.2         # target = 1.2*ATR for bursts
+
+    # Conditional breadth policy
+    enable_conditional_breadth: bool = True
+    conditional_breadth_mtf_min: float = 0.65
+
+    # MTF adaptive thresholds
+    mtf_threshold_available: float = 0.50
+    mtf_threshold_limited: float = 0.60
+    mtf_consistency_window: int = 5
+    mtf_consistency_adjust: float = 0.05   # slide threshold ±0.05
+
+    # Feature flags
+    enable_symmetric_mtf_conflict: bool = True
+    enable_rsi50_confirmation: bool = True
+    enable_momentum_slope_guard: bool = True
+
+
+    # ============== Dynamic MTF threshold tuning ============== 
+    mtf_dynamic_enable: bool = True
+    mtf_dynamic_min: float = 0.40
+    mtf_dynamic_max: float = 0.70
+    mtf_adj_trend_agree: float = -0.05
+    mtf_adj_ranging_no_room: float = +0.05
+    mtf_adj_squeeze: float = -0.05
+    mtf_adj_extreme_rsi: float = +0.05
+    mtf_adj_open_close: float = +0.03
+    mtf_squeeze_bandwidth: float = 8.0
+    mtf_rsi_extreme_buy: float = 75.0
+    mtf_rsi_extreme_sell: float = 25.0
+
+
     
     # Pre-close alerts (analyze about-to-close bar before boundary) 
     preclose_lead_seconds: int = 10 # analyze N seconds before close (min 5s)

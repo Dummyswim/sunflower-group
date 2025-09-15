@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import traceback
 
+
 # Define IST timezone
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -77,12 +78,12 @@ class SafePerformanceFilter(logging.Filter):
                 self.log_counts[record.levelname] += 1
             
             # Add module context
-            record.module_context = f"{record.module}:{record.funcName}"
+            record.module_context = f"{record.funcName}:{record.lineno}"
             
         except Exception as e:
             # If anything fails, ensure runtime exists with default value
             record.runtime = 0.0
-            record.module_context = f"{record.module}:{record.funcName}"
+            record.module_context = f"{record.funcName}:{record.lineno}"
             
         return True
 
@@ -92,7 +93,7 @@ class StandardFilter(logging.Filter):
     def filter(self, record):
         # Add module_context if not present
         if not hasattr(record, 'module_context'):
-            record.module_context = f"{record.module}:{record.funcName}"
+            record.module_context = f"{record.funcName}:{record.lineno}"
         return True
 
 class ErrorTracker:
@@ -120,7 +121,7 @@ class ErrorTracker:
                 self.errors.pop(0)
             
             # Count by module
-            module_key = f"{record.module}:{record.funcName}"
+            module_key = f"{record.funcName}:{record.lineno}"
             self.error_counts[module_key] = self.error_counts.get(module_key, 0) + 1
     
     def get_summary(self) -> Dict[str, Any]:
@@ -179,16 +180,21 @@ def setup_logging(
         
         # ========== CONSOLE HANDLER ==========
         # Create formatters for console (without runtime field)
-        if enable_colors:
-            console_formatter = ColoredFormatter(
-                '%(asctime)s - %(levelname)-8s - [%(module_context)s] - %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S'
-            )
-        else:
-            console_formatter = ISTFormatter(
-                '%(asctime)s - %(levelname)-8s - [%(module_context)s] - %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S'
-            )
+        
+        console_formatter = ISTFormatter(
+            '%(asctime)s - %(levelname)-8s - [%(module_context)s] - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        # if enable_colors:
+        #     console_formatter = ColoredFormatter(
+        #         '%(asctime)s - %(levelname)-8s - [%(module_context)s] - %(message)s',
+        #         datefmt='%Y-%m-%d %H:%M:%S'
+        #     )
+        # else:
+        #     console_formatter = ISTFormatter(
+        #         '%(asctime)s - %(levelname)-8s - [%(module_context)s] - %(message)s',
+        #         datefmt='%Y-%m-%d %H:%M:%S'
+        #     )
         
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(console_level)
@@ -320,4 +326,6 @@ def log_performance(logger: logging.Logger, operation: str, duration: float,
     except Exception as e:
         # Fallback to simple logging if performance logging fails
         logger.info(f"PERF: {operation} took {duration:.3f}s")
+        logger.info(f"x" * 60)
+        logger.info(f"x" * 60)
 

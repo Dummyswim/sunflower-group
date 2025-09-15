@@ -429,15 +429,19 @@ class UnifiedChartGenerator:
     def _plot_signal_strength(self, ax, signal_result: Dict):
         """Plot signal strength breakdown by indicator."""
         try:
-            contributions = signal_result.get('contributions', {})
-            if not contributions:
-                ax.text(0.5, 0.5, 'No Signal Data', 
-                       ha='center', va='center', transform=ax.transAxes)
-                return
             
-            # Prepare data
-            indicators = list(contributions.keys())
-            values = [contributions[ind]['contribution'] for ind in indicators]
+            
+            contributions = signal_result.get('contributions', {}) or {} 
+            # Keep only items that have a numeric 'contribution' 
+            items = [(k, v.get('contribution')) for k, v in contributions.items() if isinstance(v, dict) and 'contribution' in v] 
+            if not items: 
+                ax.text(0.5, 0.5, 'No Signal Data', ha='center', va='center', transform=ax.transAxes) 
+                return
+
+
+            indicators = [k for k, _ in items]
+            values = [float(v) for _, v in items]
+
             
             # Create horizontal bars
             y_pos = np.arange(len(indicators))
