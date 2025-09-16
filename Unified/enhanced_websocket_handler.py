@@ -1409,6 +1409,55 @@ class EnhancedWebSocketHandler:
     
 
 
+    # async def disconnect(self, stop_running: bool = True):
+    #     """Gracefully disconnect from WebSocket.
+    #     stop_running=True → full shutdown
+    #     stop_running=False → internal reconnect (keep run_forever alive)
+    #     """
+    #     logger.info("Disconnecting from DhanHQ WebSocket")
+    #     if stop_running:
+    #         self.running = False
+    #         logger.debug("Disconnect mode: full shutdown (running=False)")
+    #     else:
+    #         logger.debug("Disconnect mode: internal reconnect (running=True)")
+
+    #     # Cancel boundary loop if running (enhanced with safer exception handling)
+    #     try:
+    #         if getattr(self, 'boundary_task', None) and not self.boundary_task.done():
+    #             self.boundary_task.cancel()
+    #             await self.boundary_task  # Await to ensure clean cancellation [[3]]
+    #     except asyncio.CancelledError:
+    #         logger.debug("Boundary loop task cancelled")
+    #     except Exception as e:
+    #         logger.debug(f"Boundary task cancel failed (ignored): {e}")
+
+    #     # Cancel data-stall watchdog if running (enhanced similarly)
+    #     try:
+    #         if getattr(self, 'data_watchdog_task', None) and not self.data_watchdog_task.done():
+    #             self.data_watchdog_task.cancel()
+    #             await self.data_watchdog_task  # Await for proper cleanup [[6]]
+    #     except asyncio.CancelledError:
+    #         logger.debug("Data-stall watchdog cancelled")
+    #     except Exception as e:
+    #         logger.debug(f"Data watchdog cancel failed (ignored): {e}")
+
+    #     if self.websocket:
+    #         try:
+    #             logger.info(f"[Subscribe] WebSocket state: open={self.websocket.open}, closed={self.websocket.closed}")
+                
+    #             logger.info(f"Final packet statistics: {self.packet_stats}")
+    #             logger.info(f"Total ticks processed: {self.tick_count}")
+    #             logger.info(f"Final synthetic volume: {self.current_period_volume:,}")
+    #             await self.websocket.close()  # Ensure async close to avoid abnormal errors [[7]]
+    #             logger.info("WebSocket disconnected successfully")
+    #         except Exception as e:
+    #             logger.error(f"Error during disconnect: {e}")
+
+    #     self.authenticated = False
+        
+        
+            
+
     async def disconnect(self, stop_running: bool = True):
         """Gracefully disconnect from WebSocket.
         stop_running=True → full shutdown

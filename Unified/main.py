@@ -346,8 +346,14 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
 
                     rej = signal.get('rejection_reason')
                 else:
-                    # Compute a lightweight raw scorer for calibration (no validations)   
-                    raw = self.signal_analyzer._calculate_weighted_signal(indicators_5m) 
+                    # Compute a lightweight raw scorer for calibration (no validations)
+                    try:
+                        self.signal_analyzer.current_df = df_5m
+                    except Exception:
+                        pass
+                    raw = self.signal_analyzer._calculate_weighted_signal(indicators_5m)
+
+                    
                     contrib = raw.get('contributions', {}) 
                     w_score = float(raw.get('weighted_score', 0.0)) 
                     direction = str(raw.get('composite_signal', 'NEUTRAL')) 

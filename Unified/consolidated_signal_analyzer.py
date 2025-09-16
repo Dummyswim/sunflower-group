@@ -12,7 +12,6 @@ from typing import Dict, Optional, List, Tuple, Any
 from datetime import datetime, timedelta
 from collections import deque
 from pattern_detector import CandlestickPatternDetector, ResistanceDetector
-from datetime import datetime, timedelta
 
 try:
     import talib
@@ -467,26 +466,37 @@ class MultiTimeframeAnalyzer:
                     session = session_info.get('session', 'normal') if isinstance(session_info, dict) else 'normal'
                     trend_dir = trend_15m.get('direction', 0)
                     trend_strength = float(trend_15m.get('strength', 0.0))
+                                                
+                                                
                     rsi_15 = float(indicators_15m.get('rsi', {}).get('value', 50.0))
                     bb_bw = float(indicators_15m.get('bollinger', {}).get('bandwidth', 0.0))
                     last_t = df_15m.index[-1].time() if (df_15m is not None and not df_15m.empty) else None
 
-                    # 1) Trend agree + strong + room AVAILABLE → relax a bit
-                    if trend_dir != 0 and trend_dir == signal_direction and trend_strength >= 0.60 and sr_aligned_trade:
+                    # Gate relax nudges during open/close windows
+                    from datetime import datetime as _dt
+                    open_close = False
+                    if last_t is not None:
+                        open_close = (
+                            (_dt.strptime('09:15','%H:%M').time() <= last_t < _dt.strptime('09:45','%H:%M').time()) or
+                            (_dt.strptime('14:45','%H:%M').time() <= last_t <= _dt.strptime('15:15','%H:%M').time())
+                        )
+
+                    # 1) Trend agree + strong + room AVAILABLE → relax a bit (skip relax at open/close)
+                    if (not open_close) and trend_dir != 0 and trend_dir == signal_direction and trend_strength >= 0.60 and sr_aligned_trade:
                         dyn_adj += float(getattr(self.config, 'mtf_adj_trend_agree', -0.05))
                         logger.info(f"[MTF-DYN] Trend agree + strong → {dyn_adj:+.2f}")
 
-                    # 2) Ranging + LIMITED room → tighten
+                    # 2) Ranging + LIMITED room → tighten (always)
                     if session == 'ranging' and not sr_aligned_trade:
                         dyn_adj += float(getattr(self.config, 'mtf_adj_ranging_no_room', +0.05))
                         logger.info(f"[MTF-DYN] Ranging + LIMITED room → {dyn_adj:+.2f}")
 
-                    # 3) 15m squeeze + room AVAILABLE → relax
-                    if sr_aligned_trade and bb_bw > 0 and bb_bw <= float(getattr(self.config, 'mtf_squeeze_bandwidth', 8.0)):
+                    # 3) 15m squeeze + room AVAILABLE → relax (skip relax at open/close)
+                    if (not open_close) and sr_aligned_trade and bb_bw > 0 and bb_bw <= float(getattr(self.config, 'mtf_squeeze_bandwidth', 8.0)):
                         dyn_adj += float(getattr(self.config, 'mtf_adj_squeeze', -0.05))
                         logger.info(f"[MTF-DYN] 15m squeeze → {dyn_adj:+.2f}")
 
-                    # 4) RSI extremes at range edge → tighten
+                    # 4) RSI extremes at range edge → tighten (always)
                     if signal_direction == 1 and rsi_15 >= float(getattr(self.config, 'mtf_rsi_extreme_buy', 75.0)) and price_position >= self.config.extreme_price_pos_hi:
                         dyn_adj += float(getattr(self.config, 'mtf_adj_extreme_rsi', +0.05))
                         logger.info(f"[MTF-DYN] BUY at top + RSI15 extreme → {dyn_adj:+.2f}")
@@ -494,15 +504,16 @@ class MultiTimeframeAnalyzer:
                         dyn_adj += float(getattr(self.config, 'mtf_adj_extreme_rsi', +0.05))
                         logger.info(f"[MTF-DYN] SELL at bottom + RSI15 extreme → {dyn_adj:+.2f}")
 
-                    # 5) Tighten near open/close windows
-                    from datetime import datetime as _dt
-                    if last_t is not None:
-                        if (_dt.strptime('09:15','%H:%M').time() <= last_t < _dt.strptime('09:45','%H:%M').time()) or \
-                        (_dt.strptime('14:45','%H:%M').time() <= last_t <= _dt.strptime('15:15','%H:%M').time()):
-                            dyn_adj += float(getattr(self.config, 'mtf_adj_open_close', +0.03))
-                            logger.info(f"[MTF-DYN] Open/Close tighten → {dyn_adj:+.2f}")
+                    # 5) Tighten near open/close windows (always)
+                    if open_close:
+                        dyn_adj += float(getattr(self.config, 'mtf_adj_open_close', +0.03))
+                        logger.info(f"[MTF-DYN] Open/Close tighten → {dyn_adj:+.2f}")
+
+
+                            
                 except Exception as e:
                     logger.debug(f"[MTF-DYN] Adjust skipped: {e}")
+
 
             thr_min = float(getattr(self.config, 'mtf_dynamic_min', 0.40))
             thr_max = float(getattr(self.config, 'mtf_dynamic_max', 0.70))
@@ -1129,7 +1140,6 @@ class ConsolidatedSignalAnalyzer:
                     signal_result['rejection_reason'] = "mtf_not_aligned"
                     self._last_reject = {'stage': 'MTF', 'reason': mtf_description}
                     return None
-                logger.info("continue logging")
 
 
                 # Require higher breadth for actionable; allow 3/6 conditionally
@@ -1144,6 +1154,63 @@ class ConsolidatedSignalAnalyzer:
                 comp_up = str(signal_result.get('composite_signal','')).upper()
                 direction = 'BUY' if 'BUY' in comp_up else ('SELL' if 'SELL' in comp_up else 'NEUTRAL')
                 macd_slope = float(contributions.get('macd', {}).get('hist_slope', 0.0))
+
+
+
+                # Opposing-slope adjustment in weak MTF (nudge toward neutral before gates)
+                try:
+                    ws = float(signal_result.get('weighted_score', 0.0))
+                    mr = str(signal_result.get('market_regime', 'NORMAL'))
+                    penalty = 0.06
+                    if int(signal_result.get('active_indicators', 0)) < 4:
+                        penalty += 0.02  # slightly stronger with low breadth
+
+                    changed = False
+                    if mtf_val < 0.65 and ws > 0 and macd_slope <= 0:
+                        ws_old = ws; ws = ws - penalty; changed = True
+                        logger.info(f"[ADJ] Weak MTF BUY vs slope<=0 → score {ws_old:+.3f} → {ws:+.3f}")
+                    elif mtf_val < 0.65 and ws < 0 and macd_slope >= 0:
+                        ws_old = ws; ws = ws + penalty; changed = True
+                        logger.info(f"[ADJ] Weak MTF SELL vs slope>=0 → score {ws_old:+.3f} → {ws:+.3f}")
+
+                    if changed:
+                        signal_result['weighted_score'] = ws
+                        # Reclassify using the same thresholds as scorer
+                        if mr == "STRONG_UPTREND":
+                            buy_th, sell_th = 0.05, -0.25
+                        elif mr == "STRONG_DOWNTREND":
+                            buy_th, sell_th = 0.25, -0.05
+                        else:
+                            buy_th, sell_th = 0.10, -0.10
+
+                        prev_sig = str(signal_result.get('composite_signal','NEUTRAL'))
+                        if ws < (sell_th - 0.1):
+                            signal_result['composite_signal'] = 'STRONG_SELL'
+                        elif ws < sell_th:
+                            signal_result['composite_signal'] = 'SELL'
+                        elif ws > (buy_th + 0.1):
+                            signal_result['composite_signal'] = 'STRONG_BUY'
+                        elif ws > buy_th:
+                            signal_result['composite_signal'] = 'BUY'
+                        else:
+                            signal_result['composite_signal'] = 'NEUTRAL'
+                        if signal_result['composite_signal'] != prev_sig:
+                            logger.info(f"[ADJ] Reclassified: {prev_sig} → {signal_result['composite_signal']} (mtf={mtf_val:.2f})")
+
+                        # Rebuild dynamic prediction text
+                        text, meta = self._build_dynamic_prediction(
+                            composite_signal=signal_result['composite_signal'],
+                            weighted_score=ws,
+                            active_count=int(signal_result.get('active_indicators', 0)),
+                            contributions=contributions,
+                            market_regime=mr
+                        )
+                        signal_result['next_candle_prediction'] = text
+                        signal_result['prediction_meta'] = meta
+                except Exception as e:
+                    logger.debug(f"Weak-MTF opposing-slope adjustment skipped: {e}")
+
+
 
 
                 # Breadth gate
@@ -1162,7 +1229,6 @@ class ConsolidatedSignalAnalyzer:
                         signal_result['rejection_reason'] = "breadth_3_lt_4"
                         logger.info(f"[BREADTH] ❌ Reject: active_indicators {active_inds}/6 < {min_alert}")
                         return None  # reject
-                logger.info("continue logging")
 
 
                 # Momentum-slope guard for borderline MTF
@@ -1175,25 +1241,6 @@ class ConsolidatedSignalAnalyzer:
                         signal_result['rejection_reason'] = "slope_guard"
                         logger.info(f"[SLOPE] ❌ SELL rejected: slope={macd_slope:+.6f}, mtf={mtf_val:.2f}")
                         return None
-                logger.info("continue logging")
-
-
-
-
-
-
-
-
-                # Momentum-slope guard for borderline MTF
-                if getattr(self.config, 'enable_momentum_slope_guard', True) and mtf_val < 0.65:
-                    if direction == 'BUY' and macd_slope <= 0:
-                        signal_result['rejection_reason'] = "slope_guard"
-                        logger.info(f"[SLOPE] ❌ BUY rejected: slope={macd_slope:+.6f}, mtf={mtf_val:.2f}")
-                        return None # Return None to reject the signal
-                    if direction == 'SELL' and macd_slope >= 0:
-                        signal_result['rejection_reason'] = "slope_guard"
-                        logger.info(f"[SLOPE] ❌ SELL rejected: slope={macd_slope:+.6f}, mtf={mtf_val:.2f}")
-                        return None # Return None to reject the signal
 
 
 
@@ -2141,6 +2188,25 @@ class ConsolidatedSignalAnalyzer:
                 pass
 
 
+            try:
+                # Extra SR+RSI nuance to avoid buying top/selling bottom in ranges
+                rsi_val = float(contributions.get('rsi', {}).get('rsi_value', 50.0))
+                bb_pos = float(contributions.get('bollinger', {}).get('position', 0.5))
+                if weighted_score > 0 and bb_pos >= 0.90 and rsi_val >= 70:
+                    old = weighted_score
+                    weighted_score -= 0.025
+                    scalping_signals.append("SR+RSI nuance: BUY near upper with RSI≥70 → haircut")
+                    logger.info(f"SR+RSI BUY haircut: bb_pos={bb_pos:.2f}, rsi={rsi_val:.1f} → score {old:+.3f}→{weighted_score:+.3f}")
+                elif weighted_score < 0 and bb_pos <= 0.10 and rsi_val <= 30:
+                    old = weighted_score
+                    weighted_score += 0.025
+                    scalping_signals.append("SR+RSI nuance: SELL near lower with RSI≤30 → haircut")
+                    logger.info(f"SR+RSI SELL haircut: bb_pos={bb_pos:.2f}, rsi={rsi_val:.1f} → score {old:+.3f}→{weighted_score:+.3f}")
+            except Exception:
+                pass
+
+
+
             # HTF top/bottom haircut to align prelim with range room (before pattern boost)
             try:
                 if weighted_score > 0 and getattr(self, '_extreme_top', False):
@@ -2458,11 +2524,15 @@ class ConsolidatedSignalAnalyzer:
             else:
                 # Neutral — snap back to 0.5 with tiny band
                 prob_up = 0.5 + 0.05 * np.tanh(ws / 0.10)
+                
 
-            # Clamp to [0,1], then softly to [0.20, 0.80] for text until calibration is done
-            prob_up = max(0.0, min(1.0, float(prob_up)))
-            prob_up = float(max(0.20, min(0.80, prob_up)))
-            prob_red = float(1.0 - prob_up)
+            # Raw probability for meta; soft clamp only for text
+            prob_up_raw = max(0.0, min(1.0, float(prob_up)))
+            prob_up_text = float(max(0.20, min(0.80, prob_up_raw)))
+            prob_red_text = float(1.0 - prob_up_text)
+            prob_up = prob_up_text  # used only for text below (percent)
+            prob_red = prob_red_text
+
 
             # 2) Expected move (pts) from live volatility
             try:
@@ -2491,8 +2561,8 @@ class ConsolidatedSignalAnalyzer:
                 text = f"Next 5m: Range likely | ±{lo} to ±{hi} pts"
 
             meta = {
-                'prob_up': round(prob_up, 4),
-                'prob_red': round(prob_red, 4),
+                'prob_up': round(prob_up_raw, 4),
+                'prob_red': round(1.0 - prob_up_raw, 4),
                 'exp_move_pts': {'lo': lo, 'hi': hi},
                 'score_mag': round(score_mag, 3),
                 'active_indicators': int(active_count),

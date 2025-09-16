@@ -433,7 +433,8 @@ class UnifiedChartGenerator:
             
             contributions = signal_result.get('contributions', {}) or {} 
             # Keep only items that have a numeric 'contribution' 
-            items = [(k, v.get('contribution')) for k, v in contributions.items() if isinstance(v, dict) and 'contribution' in v] 
+            
+            items = [ (k, v.get('contribution')) for k, v in contributions.items() if isinstance(v, dict) and isinstance(v.get('contribution'), (int, float)) ]
             if not items: 
                 ax.text(0.5, 0.5, 'No Signal Data', ha='center', va='center', transform=ax.transAxes) 
                 return
