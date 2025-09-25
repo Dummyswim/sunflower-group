@@ -185,6 +185,9 @@ class UnifiedChartGenerator:
         try:
             # Limit to last N candles for clarity
             plot_df = df.tail(self.config.chart_candles_to_show)
+            plot_df = plot_df.replace([np.nan, np.inf, -np.inf], 0) 
+
+
             x = np.arange(len(plot_df))
             
             # Plot candlesticks
@@ -298,6 +301,8 @@ class UnifiedChartGenerator:
         """Plot volume bars with color coding."""
         try:
             plot_df = df.tail(self.config.chart_candles_to_show)
+            plot_df = plot_df.replace([np.nan, np.inf, -np.inf], 0) 
+
             x = np.arange(len(plot_df))
             
             # Color based on price movement
@@ -440,12 +445,12 @@ class UnifiedChartGenerator:
                 return
 
 
-            indicators = [k for k, _ in items]
-            values = [float(v) for _, v in items]
 
-            
+            labels = [k for k, _ in items]
             # Create horizontal bars
-            y_pos = np.arange(len(indicators))
+            values = [float(v) for _, v in items]
+            y_pos = np.arange(len(labels))
+                        
             colors = [self.colors['bullish'] if v > 0 else self.colors['bearish'] 
                      for v in values]
             
@@ -459,12 +464,15 @@ class UnifiedChartGenerator:
             
             # Formatting
             ax.set_yticks(y_pos)
-            ax.set_yticklabels(indicators)
+            ax.set_yticklabels(labels)
+
+            
             ax.axvline(x=0, color='gray', linestyle='-', linewidth=1)
             ax.set_xlabel('Signal Contribution', fontsize=10, fontweight='bold')
             ax.set_title("Signal Strength Breakdown", fontsize=11, fontweight='bold')
             ax.grid(True, alpha=0.3, axis='x', color=self.colors['grid'])
             
+
         except Exception as e:
             logger.error(f"Signal strength error: {e}")
     

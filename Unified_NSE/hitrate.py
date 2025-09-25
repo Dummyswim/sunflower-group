@@ -4,6 +4,7 @@ from typing import Dict, Optional, Tuple
 from datetime import datetime, time
 import json
 import os
+import math
 
 @dataclass
 class Candidate:
@@ -22,7 +23,7 @@ class Candidate:
     sr_room: str = "UNKNOWN"       # 'AVAILABLE' | 'LIMITED' | 'UNKNOWN'
     regime: str = "UNKNOWN"
     confidence: float = 0.0
-    saved_at: datetime = None
+    saved_at: Optional[datetime] = None
 
 def _bucket_mtf(x: float) -> str:
     if x < 0.20: return "MTF<0.20"
@@ -71,6 +72,7 @@ class HitRateTracker:
 
 
     def resolve_bar(self, next_bar_time: datetime, open_price: float, close_price: float, logger=None):
+        
         c = self.pending.pop(next_bar_time, None)
         if not c:
             return
@@ -82,7 +84,36 @@ class HitRateTracker:
             self._dump_jsonl(c, correct=None, open_price=open_price, close_price=close_price)
             return
 
-        up = (close_price - open_price) > 0
+        # sanitize open/close
+        try:
+            open_price = float(open_price)
+        except Exception:
+            open_price = 0.0
+        try:
+            close_price = float(close_price)
+        except Exception:
+            close_price = 0.0
+        if not math.isfinite(open_price):
+            open_price = 0.0
+        if not math.isfinite(close_price):
+            close_price = 0.0
+
+        move = close_price - open_price
+        # Treat tiny bars as noise and skip stats (persist JSONL with correct=None)
+        try:
+            pts_min = 1.0
+            pct_min = 0.0003  # 0.03%
+            tiny = abs(move) < max(pts_min, pct_min * max(1.0, open_price))
+        except Exception:
+            tiny = False
+
+        if tiny:
+            self._dump_jsonl(c, correct=None, open_price=open_price, close_price=close_price)
+            if logger:
+                logger.info(f"[HR] Skipped micro-move scoring (Δ={move:+.2f}) for {base_dir}")
+            return
+
+        up = (move > 0)
         correct = (base_dir == "BUY" and up) or (base_dir == "SELL" and not up)
 
 
@@ -139,6 +170,7 @@ class HitRateTracker:
             f.write(json.dumps(rec) + "\n")
 
     def report(self, logger, min_samples: int = 5):
+        logger.info("=" * 60)
         logger.info("===== HIT-RATE BUCKETS =====")
         # 1) MTF × Breadth
         agg = defaultdict(lambda: [0, 0])
@@ -175,3 +207,4 @@ class HitRateTracker:
                 logger.info(f"[Slope={sl}] total={tot} acc={acc:.1f}%")
 
         logger.info("===== END OF HIT-RATE BUCKETS =====")
+        logger.info("=" * 60)

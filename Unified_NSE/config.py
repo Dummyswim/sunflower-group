@@ -6,6 +6,8 @@ import logging
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, field
 from pathlib import Path
+import math
+
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +77,16 @@ class UnifiedTradingConfig:
     min_signal_duration_minutes: int = 5
     
     
+    # Weak‑MTF band extra penalty (0.50–0.65); 0.0 keeps current behavior
+    weak_mtf_band_extra_penalty: float = 0.01
+
+
     # Volatility caps for intraday scalps (constrain TP/SL by local vol)
     tp_volatility_cap_multiple: float = 1.8  # TP cannot be farther than 1.8× recent 5m volatility range
     sl_volatility_cap_multiple: float = 1.0  # SL cannot be farther than 1.0× recent 5m volatility range
 
     # Stricter gate for pre-close predictions (forming bar is noisier)
-    preclose_min_mtf_score: float = 0.50 # Reduced from 0.6
+    preclose_min_mtf_score: float = 0.60 # Reduced from 0.6
 
     # Require more breadth for directional alerts; candidates can use the lower global value
     min_active_indicators_for_alert: int = 4
@@ -290,6 +296,11 @@ class UnifiedTradingConfig:
     enable_momentum_slope_guard: bool = True
 
 
+    # Logging and release-gate feature flags (high-verbosity until stable)
+    verbose_logging: bool = True
+    require_expansion_for_promotion: bool = True
+
+
     # ============== Dynamic MTF threshold tuning ============== 
     mtf_dynamic_enable: bool = True
     mtf_dynamic_min: float = 0.40
@@ -306,8 +317,63 @@ class UnifiedTradingConfig:
 
     
     # Pre-close alerts (analyze about-to-close bar before boundary) 
-    preclose_lead_seconds: int = 10 # analyze N seconds before close (min 5s)
+    preclose_lead_seconds: int = 15 # analyze N seconds before close (min 5s)
     
+        
+    # Candlestick pattern layer (TA-Lib-backed)
+    enable_talib_patterns: bool = True
+    candlestick_patterns: list = field(default_factory=lambda: [
+        "CDLINVERTEDHAMMER",    # Inverted Hammer (bullish reversal)
+        "CDLPIERCING",          # Piercing Line (bullish reversal)
+        "CDLHARAMI",            # Harami (±100)
+        "CDL3WHITESOLDIERS",    # Three White Soldiers (bullish momentum)
+        "CDL3BLACKCROWS",       # Three Black Crows (bearish momentum)
+        "CDLDARKCLOUDCOVER",    # Dark Cloud Cover (bearish reversal)
+        "CDLABANDONEDBABY",     # Abandoned Baby (±100)
+        "CDLSPINNINGTOP",       # Spinning Top (indecision)
+        "CDLTRISTAR",           # Tri-Star (±100)
+        "CDLSTICKSANDWICH",     # Stick Sandwich (±100)
+        # Common/previous
+        "CDLENGULFING",
+        "CDLHAMMER",
+        "CDLSHOOTINGSTAR"
+    ])
+
+    # Custom patterns not in TA-Lib
+    enable_custom_tweezer: bool = True  # Tweezer Top/Bottom
+    tweezer_tolerance_bps: float = 5.0  # highs/lows within tolerance (bps of price)
+    enable_rounding_patterns: bool = False  # off by default for 5m
+    rounding_window: int = 20
+
+    # Pattern usage policy
+    pattern_min_strength: int = 50  # TA-Lib outputs ±100; |score| ≥ 50 required
+    pattern_as_confirmation_only: bool = True  # do not bypass context gates
+    require_pattern_confirmation: bool = False  # if True, block promotion without aligned pattern
+
+        
+    # Borderline MTF soft‑allow controls
+    enable_mtf_borderline_soft_allow: bool = True
+    mtf_borderline_min: float = 0.55
+    mtf_borderline_max: float = 0.60
+    mtf_borderline_conf_penalty: float = 12.0
+
+
+    # BUY guard when HTF is hostile and MTF is below strong threshold
+    buy_guard_htf_enabled: bool = True
+    buy_guard_mtf_threshold: float = 0.70  # apply the guard when mtf_score < 0.70
+
+    # SELL guard when HTF is hostile and MTF is below strong threshold (symmetry with BUY guard)
+    sell_guard_htf_enabled: bool = True
+    sell_guard_mtf_threshold: float = 0.70
+
+
+    # Borderline soft-allow: require minimum MACD slope magnitude
+    slope_soft_allow_min_mag: float = 0.15  # ignore soft-allow when |slope| < this
+
+    # Session-aware min strength (only for safe, aligned contexts)
+    session_ranging_strength_delta: float = 0.02
+
+
     
     def get_rsi_params(self, timeframe: str) -> Dict:
         """Get RSI parameters for timeframe."""
@@ -356,12 +422,41 @@ class UnifiedTradingConfig:
                 logger.error(f"Invalid min_confidence: {self.min_confidence}")
                 return False
             
-            # Create required directories
-            for path in [self.log_file, self.chart_save_path, "data"]:
-                Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+            # Finite checks for critical floats
+            crit_pairs = [
+                ('min_signal_strength', self.min_signal_strength),
+                ('min_confidence', self.min_confidence),
+                ('preclose_min_mtf_score', self.preclose_min_mtf_score),
+                ('weak_mtf_band_extra_penalty', self.weak_mtf_band_extra_penalty),
+            ]
+            for name, val in crit_pairs:
+                try:
+                    v = float(val)
+                except Exception:
+                    logger.error(f"{name} is not numeric: {val}")
+                    return False
+                if not math.isfinite(v):
+                    logger.error(f"{name} is NaN/Inf: {val}")
+                    return False
+                        
+                        
+            
+            # Create required directories (file vs directory safe)
+            Path(self.log_file).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.chart_save_path).mkdir(parents=True, exist_ok=True)
+            Path("data").mkdir(parents=True, exist_ok=True)
 
 
             logger.info("Configuration validated successfully") 
+            
+            logger.info("[LOG] Verbose logging mode: %s", getattr(self, 'verbose_logging', True))
+            logger.info("[GATE] require_expansion_for_promotion=%s", getattr(self, 'require_expansion_for_promotion', True))
+            logger.info("[CFG] preclose_min_mtf_score=%.2f | weak_mtf_band_extra_penalty=%.3f | preclose_lead_seconds=%ds",
+                        self.preclose_min_mtf_score, self.weak_mtf_band_extra_penalty, self.preclose_lead_seconds)
+            logger.info("continue logging")
+
+            
             logger.info(f"✓ Min Confidence: {self.min_confidence}%") 
             logger.info(f"✓ Min Active Indicators: {self.min_active_indicators}") 
             logger.info(f"✓ Price Action Validation: {self.price_action_validation}") 
@@ -374,7 +469,30 @@ class UnifiedTradingConfig:
             logger.info(f"✓ MTF Threshold (at-close): {self.trend_alignment_threshold:.2f}")
 
 
-            
+            logger.info("[MTF] borderline soft-allow: %s (%.2f–%.2f, penalty=%.1f)",
+                        self.enable_mtf_borderline_soft_allow,
+                        self.mtf_borderline_min,
+                        self.mtf_borderline_max,
+                        self.mtf_borderline_conf_penalty)
+
+
+            logger.info("[GUARD] buy_guard_htf_enabled=%s | buy_guard_mtf_threshold=%.2f",
+                        self.buy_guard_htf_enabled, self.buy_guard_mtf_threshold)
+            logger.info("[GUARD] sell_guard_htf_enabled=%s | sell_guard_mtf_threshold=%.2f",
+                        self.sell_guard_htf_enabled, self.sell_guard_mtf_threshold)
+
+            logger.info("[SOFT-ALLOW] slope_soft_allow_min_mag=%.3f", self.slope_soft_allow_min_mag)
+            logger.info("[SESSION] ranging_strength_delta=%.3f", self.session_ranging_strength_delta)
+
+
+
+            logger.info("[PATTERN] talib=%s | enabled=%s | min_strength=%d | confirm_only=%s | require=%s",
+                        True, self.enable_talib_patterns, self.pattern_min_strength,
+                        self.pattern_as_confirmation_only, self.require_pattern_confirmation)
+            logger.info("[PATTERN] list=%s", self.candlestick_patterns)
+            logger.info("continue logging")
+
+                        
             return True
             
         except Exception as e:

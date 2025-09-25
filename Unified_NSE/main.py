@@ -7,6 +7,7 @@ Enhanced Main Entry Point with Persistent Storage and Multi-Timeframe Support
 """
 import asyncio
 import sys
+import inspect
 import signal
 import logging
 from pathlib import Path
@@ -28,6 +29,7 @@ from telegram_bot import TelegramBot
 from chart_generator import UnifiedChartGenerator
 from pattern_detector import CandlestickPatternDetector, ResistanceDetector
 from hitrate import HitRateTracker, Candidate # Hit-rate buckets and calibration
+from logging_setup import log_span
 
 
 # Setup logging
@@ -38,6 +40,7 @@ setup_logging(
 )
 
 logger = get_logger(__name__)
+
 
 class EnhancedUnifiedTradingSystem:
     """Enhanced trading system with persistent storage and MTF support."""
@@ -225,6 +228,14 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 logger.info("Neutral prediction - not sending alert")
                 return
             
+
+            size_mult = 0.0
+            try:
+                size_mult = float(signal.get('entry_exit', {}).get('size_multiplier', signal.get('size_multiplier', 0.0)))
+            except Exception:
+                size_mult = 0.0
+
+            
             message = f"""
     {emoji} <b>NEXT CANDLE PREDICTION</b> {emoji}
 
@@ -248,6 +259,8 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
     • Target: {signal.get('take_profit', 0):.2f}
     • Risk/Reward: {signal.get('risk_reward', 0):.2f} 
     • Duration: ~{signal.get('duration_prediction', {}).get('estimated_minutes', 10)} min (e.g., {next_candle_start.strftime('%H:%M')}-{(next_candle_start + timedelta(minutes=signal.get('duration_prediction', {}).get('estimated_minutes', 10))).strftime('%H:%M')})
+    • Size Multiplier: {size_mult:.2f}x
+
 
     <b>📈 INDICATORS:</b>
     • Active: {signal.get('active_indicators', 0)}/6
@@ -261,6 +274,8 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             success = self.telegram_bot.send_message(message)
 
             if success:
+                logger.info(f"[ALERT] size_multiplier (pre-close): {size_mult:.2f}")
+
                 logger.info(f"✅ Predictive alert sent → NEXT: {next_candle_start.strftime('%H:%M')}-{next_candle_end.strftime('%H:%M')} IST (entry at open) | {signal_type} @ {confidence:.1f}%")
 
             else:
@@ -312,6 +327,15 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             indicators_5m = await self.technical_analysis.calculate_all_indicators(df_5m)
             indicators_15m = await self.calculate_15m_indicators(df_15m) if not df_15m.empty else None
 
+            try:
+                if not df_15m.empty:
+                    last_htf = df_15m.index[-1]
+                    logger.info("Sentinel: Using last CLOSED 15m bar only → %s", last_htf.strftime('%H:%M:%S'))
+
+            except Exception:
+                pass
+
+
 
             signal = await self.signal_analyzer.analyze_and_generate_signal(
                 indicators_5m, df_5m, indicators_15m, df_15m
@@ -352,15 +376,15 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
 
                     rej = signal.get('rejection_reason')
                     
-                    if isinstance(rej, str) and rej.upper() in {'PA','MTF','VALIDATION','CONFIDENCE','RR'}: 
-                        mapper = {'PA': 'pa_veto', 'MTF': 'mtf_not_aligned', 'VALIDATION': 'validation', 'CONFIDENCE': 'confidence_floor', 'RR': 'rr_floor'} 
-                        rej = mapper[rej.upper()] 
-
-                                        
+                    if isinstance(rej, str) and rej.upper() in {'PA','MTF','VALIDATION','CONFIDENCE','RR'}:
+                        mapper = {'PA': 'pa_veto', 'MTF': 'mtf_not_aligned', 'VALIDATION': 'validation', 'CONFIDENCE': 'confidence_floor', 'RR': 'rr_floor'}
+                        rej = mapper[rej.upper()]
                     if not rej and getattr(self.signal_analyzer, "_last_reject", None):
                         stage = str(self.signal_analyzer._last_reject.get('stage', '')).upper()
                         mapper = {'PA': 'pa_veto', 'MTF': 'mtf_not_aligned', 'VALIDATION': 'validation', 'CONFIDENCE': 'confidence_floor', 'RR': 'rr_floor'}
                         rej = mapper.get(stage, stage.lower() or None)
+
+
 
                                         
                 else:
@@ -406,6 +430,15 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             except Exception:
                 pass
 
+
+            try:
+                rsi_fallback = bool(contrib.get('rsi', {}).get('fallback', False))
+                logger.info(f"[CAL] rsi_fallback={rsi_fallback}")
+            except Exception:
+                pass
+
+
+
             cand = Candidate(
                 next_bar_time=preview_close,
                 direction=direction,
@@ -430,6 +463,27 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                         f"score={w_score:+.3f} | slope={macd_slope:+.6f} | rsi={rsi_val:.1f} "
                         f"{'(upX)' if rsi_up else '(dnX)' if rsi_dn else ''} | sr={sr_room} | rej={rej or '-'}")
 
+
+            # ai_dir = '-'  # observe-only phase placeholder
+            # ai_prob = '-'
+            # logger.info(f"[CAL] Saved pre-close candidate | "
+            #             f"t={preview_close.strftime('%H:%M:%S')} | dir={direction:<12} | mtf={mtf_score:>4.2f} | "
+            #             f"act={breadth}/6 | score={w_score:+.3f} | macd_slope={macd_slope:+.6f} | "
+            #             f"rsi={rsi_val:>5.1f}{'(upX)' if rsi_up else '(dnX)' if rsi_dn else ''} | sr={sr_room:<8} | "
+            #             f"rej={str(rej or '-'):>14} | AI={ai_dir}/{ai_prob}")
+
+
+            # Optional release gate for pre-close prepared signals
+            try:
+                if signal and getattr(self.config, 'require_expansion_for_promotion', True):
+                    if not self._release_ok(signal):
+                        logger.info("[Pre-Close] Blocked: release not confirmed (expansion=False)")
+                        logger.info("continue logging")
+                        return
+            except Exception:
+                pass
+
+
             # If no actionable signal, keep going (calibration already captured)
             if not signal:
                 logger.info("Pre-close: no actionable signal (calibration captured)")
@@ -448,13 +502,19 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                             ('SELL' in comp and 'bullish' in htf_macd_sig))
                 
 
+
                 if mtf_score < mtf_needed or htf_contra:
-                    logger.info(f"⛔ Pre-close suppressed: MTF {mtf_score:.2f} < {mtf_needed:.2f} or HTF MACD opposes ({htf_macd_sig})")
+                    log_span("[Pre-Close] Strict Gate Suppressed")
+                    mtf_below = bool(mtf_score < mtf_needed)
+                    reasons = []
+                    if mtf_below:
+                        reasons.append(f"mtf_below ({mtf_score:.2f} < {mtf_needed:.2f})")
+                    if htf_contra:
+                        reasons.append(f"opposing_15m_macd ({htf_macd_sig})")
+                    logger.info("Reason: %s", " & ".join(reasons) if reasons else "unknown")
                     logger.info(f"Pre-close: gating → needed_mtf={mtf_needed:.2f}, got={mtf_score:.2f}, htf_macd={htf_macd_sig}")
                     return
-
-
-                
+                                
             except Exception as e:
                 logger.debug(f"Pre-close strict gate skipped: {e}")
                 
@@ -850,12 +910,63 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
 
     async def _should_send_alert(self, signal: Dict) -> bool:
         """Determine if alert should be sent."""
+        log_span("[ALERT] Eligibility Check")    
+            
         try:
             signal_type = signal.get('composite_signal', 'NEUTRAL')
             confidence = signal.get('confidence', 0)
             
+
+            # Golden-lane promotion of NEUTRAL heads-up (strict)
             if signal_type in ['NEUTRAL', 'NO_SIGNAL']:
+                buy_ok = False
+                sell_ok = False
+                try:
+                    
+
+                    cand = str(signal.get('candidate_signal','') or '')
+                    mtf = float(signal.get('mtf_score', 0.0))
+                    if pd.isna(mtf) or np.isinf(mtf):
+                        mtf = 0.0
+                    contrib = signal.get('contributions', {}) or {}
+                    slope = float(contrib.get('macd', {}).get('hist_slope', 0.0))
+                    if pd.isna(slope) or np.isinf(slope):
+                        slope = 0.0
+                    rsi_up = bool(contrib.get('rsi', {}).get('rsi_cross_up', False))
+                    rsi_dn = bool(contrib.get('rsi', {}).get('rsi_cross_down', False))
+                    rr_val = float(signal.get('risk_reward', 0.0))
+                    if pd.isna(rr_val) or np.isinf(rr_val):
+                        rr_val = 0.0
+                    rr_ok = rr_val >= max(
+                        self.config.min_risk_reward_floor,
+                        self.config.rr_taper_floor if self.config.enable_rr_taper else self.config.min_risk_reward_floor
+                    )
+
+                    
+                    buy_ok = (cand == 'BUY_CANDIDATE' and mtf >= 0.65 and slope > 0 and rsi_up and rr_ok)
+                    sell_ok = (cand == 'SELL_CANDIDATE' and mtf >= 0.65 and slope < 0 and rsi_dn and rr_ok)
+                except Exception:
+                    buy_ok = sell_ok = False
+
+                # Apply expansion release gate before returning
+                try:
+                    if (buy_ok or sell_ok) and getattr(self.config, 'require_expansion_for_promotion', True):
+                        exp_ok = self._release_ok(signal)
+                        if not exp_ok:
+                            logger.info("[PROMOTE] Blocked: expansion release not confirmed")
+                            logger.info("continue logging")
+                            return False
+                except Exception:
+                    pass
+
+                if buy_ok or sell_ok:
+                    logger.info(f"[PROMOTE] Golden-lane neutral → actionable ({cand}, mtf={mtf:.2f}, slope={slope:+.6f}, rr_ok={rr_ok})")
+                    logger.info("continue logging")
+                    return True
+
+                logger.info("continue logging")
                 return False
+
             
             if confidence < self.config.min_confidence:
                 return False
@@ -872,6 +983,17 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             logger.error(f"Alert check error: {e}")
             return False
     
+    def _release_ok(self, signal: Dict) -> bool:
+        try:
+            contrib = signal.get('contributions', {}) or {}
+            exp = bool(contrib.get('_ctx_expansion', False))
+            logger.info("[RELEASE] expansion=%s (from contributions)", exp)
+            return exp
+        except Exception as e:
+            logger.debug("Release check error: %s", e)
+            return False
+
+
     async def send_alert(self, signal: Dict, indicators: Dict, df: pd.DataFrame) -> None:
         """Send scalping-specific trading alert via Telegram."""
         
@@ -912,24 +1034,6 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 logger.debug(f"Withdraw watch not started: {e}")
                 
 
-            # message = f"""
-            # {emoji} <b>[{urgency}]</b> {emoji}
-
-            # <b>PREDICTION FOR NEXT CANDLE:</b>
-            # • Next Candle: {next_candle_start.strftime('%H:%M')}-{next_candle_end.strftime('%H:%M')} IST
-            # • Analysis Based On: {current_candle_start.strftime('%H:%M')}-{current_candle_end.strftime('%H:%M')} IST
-            # • Alert Sent: {datetime.now(ist).strftime('%H:%M:%S')} IST
-
-
-            # <b>FORECAST WINDOW:</b> 
-            # • 5m: {forecast_5m_start.strftime('%H:%M')}–{forecast_5m_end.strftime('%H:%M')} IST 
-            # • 15m: {forecast_5m_start.strftime('%H:%M')}–{forecast_15m_end.strftime('%H:%M')} IST
-            # ...
-            # """
-
-            
-            # ist = pytz.timezone("Asia/Kolkata") 
-            # timestamp_ist = datetime.now(ist)
             current_price = float(df['close'].iloc[-1]) if not df.empty else 0
             
             # Get scalping prediction
@@ -941,6 +1045,19 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             signal_type = signal.get('composite_signal', 'UNKNOWN')
             confidence = signal.get('confidence', 0)
             active_indicators = signal.get('active_indicators', 0)
+            
+            
+            # Pattern visibility in alert logs (if analyzer attached it)
+            try:
+                pat = signal.get('contributions', {}).get('pattern_top', {}) or {}
+                logger.info("[ALERT] Pattern=%s (%s, %s%%)", 
+                            pat.get('name','NONE'), 
+                            pat.get('signal','NEUTRAL'), 
+                            str(pat.get('confidence','0')))
+                logger.info("continue logging")
+            except Exception:
+                pass
+
             
             weighted_score = signal.get('weighted_score', 0)
             next_candle = signal.get('next_candle_prediction', '')
@@ -965,6 +1082,14 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 urgency = "WAIT"
  
 
+            size_mult = 0.0
+            try:
+                size_mult = float(signal.get('entry_exit', {}).get('size_multiplier', signal.get('size_multiplier', 0.0)))
+            except Exception:
+                size_mult = 0.0
+            logger.info(f"[ALERT] size_multiplier (at-close): {size_mult:.2f}")
+
+
             # Now build the message with defined variables
         
             message = f"""
@@ -986,6 +1111,7 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
     • Confidence: {confidence:.1f}% 
     • Candle close: {base_ts_ist.strftime('%H:%M IST')} | Sent: {now_ist.strftime('%H:%M:%S IST')} 
     • Duration: ~{signal.get('duration_prediction', {}).get('estimated_minutes', 10)} min (e.g., {forecast_5m_start.strftime('%H:%M')}-{(forecast_5m_start + timedelta(minutes=signal.get('duration_prediction', {}).get('estimated_minutes', 10))).strftime('%H:%M')})
+    • Size Multiplier: {size_mult:.2f}x
 
 
     <b>ACTION:</b>

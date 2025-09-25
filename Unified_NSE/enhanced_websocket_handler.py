@@ -199,10 +199,13 @@ class EnhancedWebSocketHandler:
                 if not preview.empty:
                     # Mark as fired BEFORE awaiting the long call
                     self._preclose_fired_for_bucket = start
-                    logger.info(
-                        f"⏳ Pre-close checkpoint: start={start.strftime('%H:%M:%S')} "
-                        f"close={close_time.strftime('%H:%M:%S')} fired at {now_ts.strftime('%H:%M:%S')}"
-                    )
+
+                    logger.info("=" * 60)
+                    logger.info("⏳ Pre-close checkpoint: start=%s close=%s fired_at=%s",
+                                start.strftime('%H:%M:%S'), close_time.strftime('%H:%M:%S'), now_ts.strftime('%H:%M:%S'))
+                    logger.info("=" * 60)
+
+                                        
                     await self.on_preclose(
                         preview,
                         self.candle_data.copy() if not self.candle_data.empty else preview.copy()
@@ -233,7 +236,13 @@ class EnhancedWebSocketHandler:
                 if start and self.current_candle.get('ticks'):
                     close_time = start + timedelta(seconds=self.config.candle_interval_seconds)
                     if now_ts >= close_time and not self._bucket_closed:
-                        logger.info(f"⏱️ Boundary close {start.strftime('%H:%M:%S')}→{close_time.strftime('%H:%M:%S')} — creating candle and dispatching callbacks")
+
+                        logger.info("=" * 60)
+                        logger.info("⏱️ Boundary close %s→%s — creating candle & dispatching callbacks",
+                                    start.strftime('%H:%M:%S'), close_time.strftime('%H:%M:%S'))
+                        logger.info("=" * 60)
+
+                        
                         await self._create_candle(start, self.current_candle['ticks'])
                         self._bucket_closed = True
 
@@ -442,6 +451,10 @@ class EnhancedWebSocketHandler:
             
             # Parse ticker data (bytes 8-15)
             ltp = struct.unpack('<f', data[8:12])[0]
+
+            if not np.isfinite(ltp):
+                return None
+                            
             ltt = struct.unpack('<I', data[12:16])[0]
             
             # Sanity check
@@ -504,6 +517,9 @@ class EnhancedWebSocketHandler:
             
             # Parse Quote Data (bytes 8-49)
             ltp = struct.unpack('<f', data[8:12])[0]
+            if not np.isfinite(ltp):
+                return None
+                                        
             ltq = struct.unpack('<h', data[12:14])[0]
             ltt = struct.unpack('<I', data[14:18])[0]
             atp = struct.unpack('<f', data[18:22])[0]
@@ -597,6 +613,9 @@ class EnhancedWebSocketHandler:
             
             # Parse main data (bytes 8-61)
             ltp = struct.unpack('<f', data[8:12])[0]
+            if not np.isfinite(ltp):
+                return None
+                        
             ltq = struct.unpack('<h', data[12:14])[0]
             ltt = struct.unpack('<I', data[14:18])[0]
             atp = struct.unpack('<f', data[18:22])[0]
@@ -845,21 +864,7 @@ class EnhancedWebSocketHandler:
                 logger.info(f"Skipping candle outside market hours: {timestamp.strftime('%H:%M:%S')}")
                 return
             
-            # # Create candle
-            # candle = pd.DataFrame([{
-            #     'timestamp': timestamp,
-            #     'open': open_price,
-            #     'high': high,
-            #     'low': low,
-            #     'close': close,
-            #     'volume': candle_volume,  # Always has value for indicators
-            #     'tick_count': len(ticks)
-            # }]).set_index('timestamp')
-            
-            # logger.info(f"Candle Created: {timestamp.strftime('%H:%M:%S')} | "
-            #            f"O:{open_price:.2f} H:{high:.2f} L:{low:.2f} C:{close:.2f} | "
-            #            f"Volume:{candle_volume:,} (synthetic) | Ticks:{len(ticks)}")
-            
+
              
 
             # Label candle by START time for real-time context
@@ -1208,6 +1213,9 @@ class EnhancedWebSocketHandler:
             packet_type = struct.unpack('<I', data[0:4])[0]
             security_id = struct.unpack('<I', data[4:8])[0]
             ltp = struct.unpack('<f', data[8:12])[0]
+            if not np.isfinite(ltp):
+                return None
+                        
             close = struct.unpack('<f', data[12:16])[0]
             
             if security_id != self.config.nifty_security_id:
@@ -1247,6 +1255,9 @@ class EnhancedWebSocketHandler:
                 return None
             
             ltp = struct.unpack('<f', data[8:12])[0]
+            if not np.isfinite(ltp):
+                return None   
+                   
             open_price = struct.unpack('<f', data[12:16])[0]
             high = struct.unpack('<f', data[16:20])[0]
             low = struct.unpack('<f', data[20:24])[0]
@@ -1294,6 +1305,8 @@ class EnhancedWebSocketHandler:
                 return None
             
             ltp = struct.unpack('<f', data[8:12])[0]
+            if not np.isfinite(ltp):
+                return None
             open_price = struct.unpack('<f', data[12:16])[0]
             high = struct.unpack('<f', data[16:20])[0]
             low = struct.unpack('<f', data[20:24])[0]
@@ -1356,7 +1369,9 @@ class EnhancedWebSocketHandler:
                 return None
             
             ltp = struct.unpack('<f', data[8:12])[0]
-            
+            if not np.isfinite(ltp):
+                return None
+                                        
             # Calculate synthetic volume
             synthetic_volume = self._calculate_synthetic_volume(ltp)
             self.current_period_volume += synthetic_volume
@@ -1420,53 +1435,6 @@ class EnhancedWebSocketHandler:
     
 
 
-    # async def disconnect(self, stop_running: bool = True):
-    #     """Gracefully disconnect from WebSocket.
-    #     stop_running=True → full shutdown
-    #     stop_running=False → internal reconnect (keep run_forever alive)
-    #     """
-    #     logger.info("Disconnecting from DhanHQ WebSocket")
-    #     if stop_running:
-    #         self.running = False
-    #         logger.debug("Disconnect mode: full shutdown (running=False)")
-    #     else:
-    #         logger.debug("Disconnect mode: internal reconnect (running=True)")
-
-    #     # Cancel boundary loop if running (enhanced with safer exception handling)
-    #     try:
-    #         if getattr(self, 'boundary_task', None) and not self.boundary_task.done():
-    #             self.boundary_task.cancel()
-    #             await self.boundary_task  # Await to ensure clean cancellation [[3]]
-    #     except asyncio.CancelledError:
-    #         logger.debug("Boundary loop task cancelled")
-    #     except Exception as e:
-    #         logger.debug(f"Boundary task cancel failed (ignored): {e}")
-
-    #     # Cancel data-stall watchdog if running (enhanced similarly)
-    #     try:
-    #         if getattr(self, 'data_watchdog_task', None) and not self.data_watchdog_task.done():
-    #             self.data_watchdog_task.cancel()
-    #             await self.data_watchdog_task  # Await for proper cleanup [[6]]
-    #     except asyncio.CancelledError:
-    #         logger.debug("Data-stall watchdog cancelled")
-    #     except Exception as e:
-    #         logger.debug(f"Data watchdog cancel failed (ignored): {e}")
-
-    #     if self.websocket:
-    #         try:
-    #             logger.info(f"[Subscribe] WebSocket state: open={self.websocket.open}, closed={self.websocket.closed}")
-                
-    #             logger.info(f"Final packet statistics: {self.packet_stats}")
-    #             logger.info(f"Total ticks processed: {self.tick_count}")
-    #             logger.info(f"Final synthetic volume: {self.current_period_volume:,}")
-    #             await self.websocket.close()  # Ensure async close to avoid abnormal errors [[7]]
-    #             logger.info("WebSocket disconnected successfully")
-    #         except Exception as e:
-    #             logger.error(f"Error during disconnect: {e}")
-
-    #     self.authenticated = False
-        
-        
             
 
     async def disconnect(self, stop_running: bool = True):

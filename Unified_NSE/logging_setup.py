@@ -327,5 +327,10 @@ def log_performance(logger: logging.Logger, operation: str, duration: float,
         # Fallback to simple logging if performance logging fails
         logger.info(f"PERF: {operation} took {duration:.3f}s")
         logger.info(f"x" * 60)
-        logger.info(f"x" * 60)
 
+
+def log_span(title: str):
+    logger = logging.getLogger()  # Use root logger for span logs
+    logger.info("=" * 60)
+    logger.info(title)
+    logger.info("=" * 60)

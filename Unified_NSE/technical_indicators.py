@@ -23,6 +23,7 @@ class ConsolidatedTechnicalAnalysis:
         self.config = config
         self.signal_history = []
         logger.info("Technical Analysis initialized (volume-free)")
+        self._last_valid_rsi = {'5m': None, '15m': None}
     
     async def calculate_all_indicators(self, df: pd.DataFrame, timeframe: str = "5m") -> Dict:
         """Calculate technical indicators without volume dependencies."""
@@ -105,6 +106,15 @@ class ConsolidatedTechnicalAnalysis:
         
 
         logger.info(f"Calculated {len(indicators)} indicators successfully [{timeframe}]")
+
+        logger.info("[IND] RSI=%s | MACD_hist=%.4f | EMA_sig=%s | BB_bw=%s",
+            f"{indicators['rsi'].get('value', 50):.1f}" if 'rsi' in indicators else 'NA',
+            float(indicators['macd'].get('histogram', 0.0)) if 'macd' in indicators else 0.0,
+            indicators['ema'].get('signal', 'NA') if 'ema' in indicators else 'NA',
+            f"{indicators['bollinger'].get('bandwidth', 0.0):.2f}" if 'bollinger' in indicators else 'NA')
+        logger.info("continue logging")
+
+
 
         return indicators
     
@@ -192,6 +202,7 @@ class ConsolidatedTechnicalAnalysis:
     
     def _calculate_rsi(self, df: pd.DataFrame, timeframe: str = "5m") -> Dict:
         """Calculate RSI indicator."""
+        
         try:
             rsi_params = self.config.get_rsi_params(timeframe)
             period = rsi_params['period']
@@ -199,32 +210,72 @@ class ConsolidatedTechnicalAnalysis:
             if talib:
                 rsi_series = talib.RSI(df['close'].values, timeperiod=period)
             else:
-                # Fallback RSI calculation
                 delta = df['close'].diff()
                 gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
                 loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-                
-                # Safe division with proper zero handling
                 loss_safe = loss.replace(0, 1e-10)
                 loss_safe = loss_safe.where(loss_safe != 0, 1e-10)
-                rs = gain / loss_safe
-                rs = rs.fillna(100)  # If still NaN, use high RS value
+                
 
+                rs = gain / loss_safe.replace(0, 1e-10)
+                rs = rs.fillna(100)
+                rs = rs.replace([np.inf, -np.inf], 100)
                 rsi_series = 100 - (100 / (1 + rs))
-                rsi_series = rsi_series.values
 
-            # Enhanced NaN protection
+                rsi_series = rsi_series.values
+            
+            fallback_used = False
             if len(rsi_series) > 0:
                 last_val = rsi_series[-1]
                 if pd.notna(last_val) and not np.isinf(last_val) and 0 <= last_val <= 100:
                     current_rsi = float(last_val)
                 else:
-                    current_rsi = 50.0
-                    logger.debug(f"Invalid RSI value {last_val}, using default 50")
+                    # Context‑preserving fallback: use last valid RSI with slight decay, else shorter window, else 50
+                    prev_vals = pd.Series(rsi_series).replace([np.inf, -np.inf], np.nan).dropna()
+                    if len(prev_vals) >= 1:
+                        last_valid = float(prev_vals.iloc[-1])
+                        self._last_valid_rsi[timeframe] = last_valid
+                        current_rsi = last_valid * 0.95 + 50.0 * 0.05
+                    elif self._last_valid_rsi.get(timeframe) is not None:
+                        current_rsi = float(self._last_valid_rsi[timeframe]) * 0.95 + 50.0 * 0.05
+                    else:
+                        # fallback to short window proxy
+                        short = max(5, period // 2)
+                        try:
+                            delta2 = df['close'].diff()
+                            gain2 = (delta2.where(delta2 > 0, 0)).rolling(window=short).mean()
+                            loss2 = (-delta2.where(delta2 < 0, 0)).rolling(window=short).mean().replace(0, 1e-10)
+                            rs2 = (gain2 / loss2).fillna(1.0)
+                            alt = float((100 - (100 / (1 + rs2))).iloc[-1])
+                            current_rsi = alt if np.isfinite(alt) and 0 <= alt <= 100 else 50.0
+                        except Exception:
+                            current_rsi = 50.0
+                    fallback_used = True
+                    logger.info(f"[RSI] Fallback used → {current_rsi:.1f} (period={period}, tf={timeframe})")
             else:
+                # empty series: last valid if exists, else 50
+                if self._last_valid_rsi.get(timeframe) is not None:
+                    current_rsi = float(self._last_valid_rsi[timeframe]) * 0.95 + 50.0 * 0.05
+                else:
+                    current_rsi = 50.0
+                fallback_used = True
+                logger.info(f"[RSI] Fallback used → {current_rsi:.1f} (empty series, tf={timeframe})")
+
+
+            # Persist last valid RSI when not a fallback
+            if not fallback_used:
+                self._last_valid_rsi[timeframe] = current_rsi
+
+            # Sanitize final RSI value
+            try:
+                current_rsi = float(current_rsi)
+                if not np.isfinite(current_rsi):
+                    current_rsi = 50.0
+                else:
+                    current_rsi = float(np.clip(current_rsi, 0.0, 100.0))
+            except Exception:
                 current_rsi = 50.0
 
-            
             # Determine signal
             if current_rsi > rsi_params['overbought']:
                 signal = 'overbought'
@@ -232,20 +283,24 @@ class ConsolidatedTechnicalAnalysis:
                 signal = 'oversold'
             else:
                 signal = 'neutral'
+
+
             
-            # Check for divergence
             divergence = self._check_rsi_divergence(df, rsi_series)
             
             return {
                 'value': current_rsi,
                 'signal': signal,
                 'divergence': divergence,
-                'rsi_series': pd.Series(rsi_series, index=df.index)
+                'rsi_series': pd.Series(rsi_series, index=df.index),
+                'fallback': fallback_used
             }
         except Exception as e:
             logger.error(f"RSI calculation error: {e}")
             return self._get_default_rsi()
-    
+
+
+
     def _check_rsi_divergence(self, df: pd.DataFrame, rsi_series: np.ndarray) -> str:
         """Check for RSI divergence patterns."""
         try:
@@ -300,7 +355,11 @@ class ConsolidatedTechnicalAnalysis:
                 hist = hist.values
             
             current_hist = float(hist[-1]) if len(hist) > 0 and not np.isnan(hist[-1]) else 0
-            
+
+            if np.isnan(current_hist) or np.isinf(current_hist):
+                current_hist = 0.0
+                        
+                        
             # Determine signal
             signal_type = 'neutral'
             if current_hist > 0:
@@ -321,10 +380,20 @@ class ConsolidatedTechnicalAnalysis:
                     crossover = 'bullish_crossover'
                 elif hist[-2] >= 0 and hist[-1] < 0:
                     crossover = 'bearish_crossover'
+
+
+            # ensure finite values
+            macd_val = float(macd[-1]) if len(macd) > 0 else 0.0
+            sig_val = float(signal[-1]) if len(signal) > 0 else 0.0
+            if np.isnan(macd_val) or np.isinf(macd_val):
+                macd_val = 0.0
+            if np.isnan(sig_val) or np.isinf(sig_val):
+                sig_val = 0.0
+
             
             return {
-                'macd': float(macd[-1]) if len(macd) > 0 and not np.isnan(macd[-1]) else 0,
-                'signal': float(signal[-1]) if len(signal) > 0 and not np.isnan(signal[-1]) else 0,
+                'macd': macd_val,
+                'signal': sig_val,
                 'histogram': current_hist,
                 'signal_type': signal_type,
                 'crossover': crossover,

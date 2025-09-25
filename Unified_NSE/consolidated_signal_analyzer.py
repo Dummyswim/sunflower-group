@@ -10,8 +10,10 @@ import numpy as np
 import logging
 from typing import Dict, Optional, List, Tuple, Any
 from datetime import datetime, timedelta
-from collections import deque
+from collections import deque as _deque
+
 from pattern_detector import CandlestickPatternDetector, ResistanceDetector
+from logging_setup import log_span
 
 try:
     import talib
@@ -19,6 +21,7 @@ except ImportError:
     talib = None
 
 logger = logging.getLogger(__name__)
+
 
 # ==========================================================================================
 # PRICE ACTION VALIDATOR
@@ -47,7 +50,9 @@ class PriceActionValidator:
             """
             try:
                 logger.info("=" * 50)
-                logger.info("PRICE ACTION VALIDATION START")
+
+                log_span("PRICE ACTION VALIDATION START")
+
                 logger.debug(f"signal_type={signal_type}, df_len={len(df)}, lookback={lookback}")
 
                 if df.empty or len(df) < lookback:
@@ -91,11 +96,14 @@ class PriceActionValidator:
                 except Exception as e:
                     logger.debug(f"Var resolution error (ignored): {e}")
 
+
                 if session_ranging and ignored_pattern:
-                    pattern_signal = ignored_pattern.get('signal', 'neutral').lower()
-                    if (signal_type == 'SELL' and pattern_signal == 'long') or (signal_type == 'BUY' and pattern_signal == 'short'):
+                    pattern_signal = str(ignored_pattern.get('signal', 'neutral')).lower()
+                    # Supportive means the ignored pattern agrees with our side in ranging (SELL+short, BUY+long)
+                    if (signal_type == 'SELL' and pattern_signal in ('short', 'sell')) or (signal_type == 'BUY' and pattern_signal in ('long', 'buy')):
                         logger.debug(f"Ignored pattern nuance: {ignored_pattern.get('name', 'unknown')} supportive in ranging — overriding veto")
-                        return True, "Ignored pattern nuance override in ranging"
+                        return True, "Ignored pattern nuance override in ranging (supportive)"
+
                 logger.debug(f"PA nuance check: ignored_pattern={ignored_pattern}, session_ranging={session_ranging}")
 
                 # Check for contradictions
@@ -129,6 +137,35 @@ class PriceActionValidator:
                         return False, "Higher lows forming — avoid shorting rising structure"
                     
                 # Additional validation for current candle — context-aware
+
+                # Narrow allowance for trend‑pullback BUYs (strict; uses local structure + momentum) 
+
+                try: 
+                    contrib = signal_result.get('contributions', {}) if isinstance(signal_result, dict) else {} 
+                    rsi_up = bool(contrib.get('rsi', {}).get('rsi_cross_up', False)) 
+                    macd_slope = float(contrib.get('macd', {}).get('hist_slope', 0.0)) 
+                    if ("BUY" in signal_type and candle_analysis.get('higher_lows', False) and rsi_up and macd_slope > 0 and session_info.get('session','normal') in ('trending','normal')): 
+                        logger.info("PA allowance: trend‑pullback BUY → higher‑lows + RSI‑50 cross up + MACD slope>0") 
+                        return True, "Trend‑pullback BUY allowance" 
+                except Exception: 
+                    pass 
+                logger.info("continue logging")
+
+
+                # Symmetric allowance for trend‑pullback SELLs (strict; local structure + momentum)
+                try:
+                    contrib = signal_result.get('contributions', {}) if isinstance(signal_result, dict) else {}
+                    rsi_dn = bool(contrib.get('rsi', {}).get('rsi_cross_down', False))
+                    macd_slope = float(contrib.get('macd', {}).get('hist_slope', 0.0))
+                    if ("SELL" in signal_type and candle_analysis.get('lower_highs', False) and rsi_dn and macd_slope < 0 
+                        and session_info.get('session','normal') in ('trending','normal')):
+                        logger.info("PA allowance: trend‑pullback SELL → lower‑highs + RSI‑50 cross down + MACD slope<0")
+                        return True, "Trend‑pullback SELL allowance"
+                except Exception:
+                    pass
+
+
+                                
                 current_candle = recent_candles.iloc[-1]
                 current_direction = "bullish" if current_candle['close'] > current_candle['open'] else "bearish"
                 body_ratio = self._calculate_body_ratio(current_candle)
@@ -169,6 +206,7 @@ class PriceActionValidator:
                 logger.debug(f"PA Validation: signal_type={signal_type}, "
                             f"last_candle={'green' if df['close'].iloc[-1] > df['open'].iloc[-1] else 'red'}, "
                             f"last_close={df['close'].iloc[-1]:.2f}")
+
                 
 
                 logger.debug(f"Price action validation passed for {signal_type}")
@@ -295,7 +333,9 @@ class MultiTimeframeAnalyzer:
         """
         try:
             logger.info("=" * 50)
-            logger.info("MTF ALIGNMENT CHECK STARTING")
+
+            log_span("MTF ALIGNMENT CHECK STARTING")
+
             logger.debug(
                 f"MTF inputs: 5m={signal_5m.get('composite_signal','NEUTRAL')}, "
                 f"15m_len={len(df_15m) if df_15m is not None else 0}, "
@@ -472,7 +512,8 @@ class MultiTimeframeAnalyzer:
                     bb_bw = float(indicators_15m.get('bollinger', {}).get('bandwidth', 0.0))
                     last_t = df_15m.index[-1].time() if (df_15m is not None and not df_15m.empty) else None
 
-                    # Gate relax nudges during open/close windows
+
+                    # Gate relax nudges during open/close AND optional early‑expansion window
                     from datetime import datetime as _dt
                     open_close = False
                     if last_t is not None:
@@ -480,21 +521,49 @@ class MultiTimeframeAnalyzer:
                             (_dt.strptime('09:15','%H:%M').time() <= last_t < _dt.strptime('09:45','%H:%M').time()) or
                             (_dt.strptime('14:45','%H:%M').time() <= last_t <= _dt.strptime('15:15','%H:%M').time())
                         )
+                    skip_relax = open_close
+                    try:
+                        # If an expansion flip window is active, skip relaxes until it expires
+                        now_ist = df_15m.index[-1].to_pydatetime() if (df_15m is not None and not df_15m.empty) else datetime.now()
+                        if getattr(self, "_skip_relax_until", None) and now_ist <= self._skip_relax_until:
+                            skip_relax = True
+                            logger.info(f"[MTF-DYN] Relax skipped (early expansion window until {self._skip_relax_until.strftime('%H:%M:%S')})")
+                        elif getattr(self, "_skip_relax_until", None) and now_ist > self._skip_relax_until:
+                            self._skip_relax_until = None
+                    except Exception:
+                        pass
 
-                    # 1) Trend agree + strong + room AVAILABLE → relax a bit (skip relax at open/close)
-                    if (not open_close) and trend_dir != 0 and trend_dir == signal_direction and trend_strength >= 0.60 and sr_aligned_trade:
+
+
+                    # 1) Trend agree + strong + room AVAILABLE → relax a bit (skip relax at open/close or early-expansion window)
+                    if (not skip_relax) and trend_dir != 0 and trend_dir == signal_direction and trend_strength >= 0.60 and sr_aligned_trade:
                         dyn_adj += float(getattr(self.config, 'mtf_adj_trend_agree', -0.05))
                         logger.info(f"[MTF-DYN] Trend agree + strong → {dyn_adj:+.2f}")
+                    elif sr_aligned_trade and trend_dir != 0 and trend_dir == signal_direction and trend_strength >= 0.60:
+                        logger.info("[MTF-DYN] Trend-agree relax skipped (open/close or early expansion window)")
+
+
 
                     # 2) Ranging + LIMITED room → tighten (always)
                     if session == 'ranging' and not sr_aligned_trade:
                         dyn_adj += float(getattr(self.config, 'mtf_adj_ranging_no_room', +0.05))
                         logger.info(f"[MTF-DYN] Ranging + LIMITED room → {dyn_adj:+.2f}")
 
-                    # 3) 15m squeeze + room AVAILABLE → relax (skip relax at open/close)
-                    if (not open_close) and sr_aligned_trade and bb_bw > 0 and bb_bw <= float(getattr(self.config, 'mtf_squeeze_bandwidth', 8.0)):
+
+                    # 3) 15m squeeze + room AVAILABLE → relax (skip relax at open/close AND require momentum aligned)
+                    
+                    if (not skip_relax) and sr_aligned_trade and momentum_aligned_trade and bb_bw > 0 and bb_bw <= float(getattr(self.config, 'mtf_squeeze_bandwidth', 8.0)):
+
+
                         dyn_adj += float(getattr(self.config, 'mtf_adj_squeeze', -0.05))
-                        logger.info(f"[MTF-DYN] 15m squeeze → {dyn_adj:+.2f}")
+                        logger.info(f"[MTF-DYN] 15m squeeze (momentum-aligned) → {dyn_adj:+.2f}")
+                    else:
+
+                        if (not skip_relax) and sr_aligned_trade and bb_bw > 0 and bb_bw <= float(getattr(self.config, 'mtf_squeeze_bandwidth', 8.0)) and not momentum_aligned_trade:
+
+                            logger.info(f"[MTF-DYN] Squeeze relax skipped (15m momentum not aligned)")
+
+
 
                     # 4) RSI extremes at range edge → tighten (always)
                     if signal_direction == 1 and rsi_15 >= float(getattr(self.config, 'mtf_rsi_extreme_buy', 75.0)) and price_position >= self.config.extreme_price_pos_hi:
@@ -918,7 +987,36 @@ class TrendAlignmentAnalyzer:
             logger.error(f"Trend analysis error: {e}")
             return {'trend': 'neutral', 'aligned': False}
         
-        
+    
+
+class AdaptiveThresholdManager:
+    def __init__(self):
+        self.recent_accuracy = _deque(maxlen=50)
+        self.threshold_adjustments = {}
+        logger.info("[LEARN] AdaptiveThresholdManager initialized")
+    
+    def learn_from_session(self, hitrate_data: list[dict]):
+        try:
+            for s in (hitrate_data or []):
+                if s.get('correct') and s.get('rejection_reason'):
+                    rr = str(s.get('rejection_reason'))
+                    self.threshold_adjustments[rr] = self.threshold_adjustments.get(rr, 0) - 0.01
+                elif (s.get('correct') is False) and (not s.get('rejection_reason')):
+                    self.threshold_adjustments['passed_wrong'] = self.threshold_adjustments.get('passed_wrong', 0) + 0.01
+            logger.info(f"[LEARN] Suggested adjustments: {self.threshold_adjustments}")
+        except Exception as e:
+            logger.debug(f"[LEARN] learn_from_session skipped: {e}")
+
+def apply_learned_adjustments(base_conf: float, ctx_key: str, manager: Optional[AdaptiveThresholdManager]) -> float:
+    try:
+        if not manager:
+            return base_conf
+        adj = float(manager.threshold_adjustments.get(ctx_key, 0.0))
+        new_conf = max(0.0, min(100.0, base_conf + adj * 100))
+        logger.info(f"[LEARN] Confidence adjusted by {adj:+.3f} for {ctx_key}: {base_conf:.1f}→{new_conf:.1f}")
+        return new_conf
+    except Exception:
+        return base_conf
         
         
 # ==========================================================================================
@@ -931,8 +1029,13 @@ class ConsolidatedSignalAnalyzer:
     def __init__(self, config, technical_analysis=None):
         self.config = config
         self.technical = technical_analysis
-        self.pattern_detector = CandlestickPatternDetector()
-        self.resistance_detector = ResistanceDetector()
+        
+        self.pattern_detector = CandlestickPatternDetector(self.config) if 'CandlestickPatternDetector' in globals() else None
+        self.resistance_detector = ResistanceDetector() if 'ResistanceDetector' in globals() else None
+        logger.info("[PATTERN] Detector initialized (TA‑Lib layer=%s)", "ON" if self.pattern_detector else "OFF")
+        logger.info("continue logging")
+
+                
         
         # Initialize validators and analyzers
         self.price_action_validator = PriceActionValidator(config)
@@ -945,7 +1048,8 @@ class ConsolidatedSignalAnalyzer:
         self.trend_analyzer = TrendAlignmentAnalyzer(config)
         
         # History tracking
-        self.signal_history = deque(maxlen=100)
+        # self.signal_history = deque(maxlen=100)
+        self.signal_history = _deque(maxlen=100)
         self.last_alert_time = None
         self._last_reject = None  # Add this line
         self.current_df = None 
@@ -976,8 +1080,9 @@ class ConsolidatedSignalAnalyzer:
                 return None
             
             logger.info("=" * 50)
-            logger.info("Starting enhanced signal analysis...")
-            
+            log_span("Starting enhanced signal analysis...")
+
+
             # Reset last rejection for this bar
             self._last_reject = None 
             # Store dataframe for market regime detection
@@ -987,6 +1092,33 @@ class ConsolidatedSignalAnalyzer:
             session_info = self.detect_session_characteristics(df_5m)
 
             logger.info(f"Session: {session_info.get('session','unknown')} | Strategy: {session_info.get('strategy','standard')}")
+
+
+
+            # Expansion flip handling → skip relax nudges briefly
+            try:
+
+                exp_flag, exp_flip = self._detect_expansion_lite(df_5m, indicators_5m)
+                # Cache expansion flag to reuse in scorer (avoids a second call and "unused" warning)
+                try:
+                    self._last_expansion_flag = exp_flag
+                except Exception:
+                    pass
+                if exp_flip:
+                    bars = 3
+                    # Use df_5m index to preserve timezone and avoid naive/aware compare issues downstream
+                    ts_ref = df_5m.index[-1] if (df_5m is not None and not df_5m.empty) else datetime.now()
+                    until = ts_ref + timedelta(minutes=5 * bars)
+                    setattr(self.mtf_analyzer, "_skip_relax_until", until)
+                    logger.info(f"[EXP] Flip detected → skip relax nudges for next {bars} bars (until {until.strftime('%H:%M:%S')})")
+
+
+                                    
+            except Exception:
+                pass
+
+
+
 
             # Make HTF MACD signal available to the scorer (for ST softening gate)
             try:
@@ -1120,6 +1252,7 @@ class ConsolidatedSignalAnalyzer:
                     indicators_15m,
                     df_15m, 
                     session_info )
+                mtf_val = float(mtf_score)
                 
                 
                 
@@ -1127,34 +1260,151 @@ class ConsolidatedSignalAnalyzer:
                 
                 
                 
-                
-                
-
-                # Enforce MTF only for directional calls; skip veto for NEUTRAL (non-actionable)
+                                
                 if (
                     self.config.mtf_alignment_required
                     and str(signal_result.get('composite_signal', 'NEUTRAL')).upper() != 'NEUTRAL'
                     and not mtf_aligned
                 ):
-                    logger.info(f"❌ Signal rejected: {mtf_description}")
-                    signal_result['rejection_reason'] = "mtf_not_aligned"
-                    self._last_reject = {'stage': 'MTF', 'reason': mtf_description}
-                    return None
+                    mtf_val = float(mtf_score)
+                    comp = str(signal_result.get('composite_signal','')).upper()
+                    dir_up = ('BUY' in comp)
+                    slope = float(signal_result.get('contributions', {}).get('macd', {}).get('hist_slope', 0.0))
+                    breadth = int(signal_result.get('active_indicators', 0))
+                    slope_ok = (slope > 0 and dir_up) or (slope < 0 and not dir_up)
+                    
+                    lb = float(getattr(self.config, 'mtf_borderline_min', 0.55))
+                    ub = float(getattr(self.config, 'mtf_borderline_max', 0.60))
+                    penalty = float(getattr(self.config, 'mtf_borderline_conf_penalty', 12.0))
+                    enable_soft = bool(getattr(self.config, 'enable_mtf_borderline_soft_allow', True))
+                    
+        
+                    mag_ok = abs(slope) >= float(getattr(self.config, 'slope_soft_allow_min_mag', 0.15))
+                    price_above_short = bool(signal_result.get('contributions', {}).get('ema', {}).get('price_above_short', False))
+                    ema_ok = (price_above_short if dir_up else (not price_above_short))
+                    if enable_soft and (lb <= mtf_val < ub) and slope_ok and mag_ok and ema_ok and breadth >= 4:
+
+                        
+                        old_conf = float(signal_result.get('confidence', 0.0))
+                        signal_result['confidence'] = max(0.0, old_conf - penalty)
+                        signal_result.setdefault('scalping_signals', []).append("Borderline MTF soft‑allow (confidence demoted)")
+                        logger.info("[MTF] Soft-allowed borderline band: mtf=%.2f slope=%+.6f |mag_ok=%s| ema_ok=%s breadth=%d → conf %.1f→%.1f",
+                                    mtf_val, slope, mag_ok, ema_ok, breadth, old_conf, float(signal_result['confidence']))
+
+                        logger.info("continue logging")
+
+                    else:
+                        logger.info(f"❌ Signal rejected: {mtf_description}")
+                        signal_result['rejection_reason'] = "mtf_not_aligned"
+                        self._last_reject = {'stage': 'MTF', 'reason': mtf_description}
+                        return None
+
+                
+
+
+
+
+                # BUY guard in bearish HTF when MTF is below strong threshold
+                try:
+                    actionable = str(signal_result.get('composite_signal', 'NEUTRAL')).upper() in ('BUY','STRONG_BUY','SELL','STRONG_SELL')
+                    comp = str(signal_result.get('composite_signal','')).upper()
+                    dir_up = ('BUY' in comp)
+                    guard_on = bool(getattr(self.config, 'buy_guard_htf_enabled', True))
+                    guard_thr = float(getattr(self.config, 'buy_guard_mtf_threshold', 0.70))
+                    if guard_on and actionable and dir_up and (mtf_val < guard_thr):
+                        # Use 15m MACD signal and 15m short EMA reclaim check
+                        macd_15_sig = None
+                        try:
+                            macd_15_sig = str(indicators_15m.get('macd', {}).get('signal_type', 
+                                            indicators_15m.get('macd', {}).get('signal','neutral'))).lower() if indicators_15m else 'neutral'
+                        except Exception:
+                            macd_15_sig = 'neutral'
+                        price_above_15m_short = False
+                        try:
+                            if indicators_15m and df_15m is not None and not df_15m.empty:
+                                last_15_close = float(df_15m['close'].iloc[-1])
+                                ema_short_15 = float(indicators_15m.get('ema', {}).get('short', 0.0))
+                                price_above_15m_short = last_15_close > ema_short_15 > 0
+                        except Exception:
+                            price_above_15m_short = False
+                        
+                        hostile_macd = ('bearish_strengthening' in (macd_15_sig or ''))
+                        if hostile_macd and not price_above_15m_short:
+                            logger.info("[GUARD] ❌ BUY blocked by HTF: mtf=%.2f<%.2f, 15m MACD=%s, price_above_15m_short=%s",
+                                        mtf_val, guard_thr, macd_15_sig, price_above_15m_short)
+                            signal_result['rejection_reason'] = "buy_guard_htf"
+                            self._last_reject = {'stage': 'MTF', 'reason': 'BUY guard (HTF bearish_strengthening & below 15m short EMA)'}
+                            return None
+                except Exception as _e:
+                    logger.debug(f"BUY guard skipped: {_e}")
+
+                # SELL guard in bullish HTF when MTF is below strong threshold (symmetry with BUY guard)
+                try:
+                    actionable = str(signal_result.get('composite_signal','NEUTRAL')).upper() in ('BUY','STRONG_BUY','SELL','STRONG_SELL')
+                    comp = str(signal_result.get('composite_signal','')).upper()
+                    dir_down = ('SELL' in comp)
+                    guard_on = bool(getattr(self.config, 'sell_guard_htf_enabled', True))
+                    guard_thr = float(getattr(self.config, 'sell_guard_mtf_threshold', 0.70))
+                    
+                    if guard_on and actionable and dir_down and (mtf_val < guard_thr):
+                        macd_15_sig = None
+                        try:
+                            macd_15_sig = str(indicators_15m.get('macd', {}).get('signal_type',
+                                            indicators_15m.get('macd', {}).get('signal','neutral'))).lower() if indicators_15m else 'neutral'
+                        except Exception:
+                            macd_15_sig = 'neutral'
+                        
+                        price_below_15m_short = False
+                        try:
+                            if indicators_15m and df_15m is not None and not df_15m.empty:
+                                last_15_close = float(df_15m['close'].iloc[-1])
+                                ema_short_15 = float(indicators_15m.get('ema', {}).get('short', 0.0))
+                                price_below_15m_short = (last_15_close < ema_short_15) if ema_short_15 > 0 else False
+                        except Exception:
+                            price_below_15m_short = False
+                        
+                        hostile_macd = ('bullish_strengthening' in (macd_15_sig or ''))
+                        if hostile_macd and not price_below_15m_short:
+                            logger.info("[GUARD] ❌ SELL blocked by HTF: mtf=%.2f<%.2f, 15m MACD=%s, price_below_15m_short=%s",
+                                        mtf_val, guard_thr, macd_15_sig, price_below_15m_short)
+                            signal_result['rejection_reason'] = "sell_guard_htf"
+                            self._last_reject = {'stage': 'MTF', 'reason': 'SELL guard (HTF bullish_strengthening & above 15m short EMA)'}
+                            return None
+                except Exception as _e:
+                    logger.debug(f"SELL guard skipped: {_e}")
+
+
+
 
 
                 # Require higher breadth for actionable; allow 3/6 conditionally
-                actionable = str(signal_result.get('composite_signal', 'NEUTRAL')).upper() in ('BUY','SELL','STRONG_BUY','STRONG_SELL')
+                # actionable = str(signal_result.get('composite_signal', 'NEUTRAL')).upper() in ('BUY','SELL','STRONG_BUY','STRONG_SELL')
                 contributions = signal_result.get('contributions', {})
 
-                # Persist the freshly computed MTF score before downstream checks
-                signal_result['mtf_score'] = float(mtf_score)
-                mtf_val = float(mtf_score)
 
-                # Direction + MACD slope for guards
+                # Direction + MACD slope for guards (define BEFORE using it in hard-neutral)
                 comp_up = str(signal_result.get('composite_signal','')).upper()
                 direction = 'BUY' if 'BUY' in comp_up else ('SELL' if 'SELL' in comp_up else 'NEUTRAL')
-                macd_slope = float(contributions.get('macd', {}).get('hist_slope', 0.0))
 
+
+                macd_slope = float(contributions.get('macd', {}).get('hist_slope', 0.0))
+                if pd.isna(macd_slope) or np.isinf(macd_slope):
+                    macd_slope = 0.0
+
+
+                # [HARD-NEUTRAL] LIMITED S/R + weak MTF + opposing slope → reject early
+                try:
+                    sr_room = getattr(self.mtf_analyzer, '_last_sr_room', 'UNKNOWN')
+                    if (direction in ('BUY','SELL') and sr_room == 'LIMITED' and mtf_val < 0.65 and
+                        ((direction == 'BUY' and macd_slope <= 0) or (direction == 'SELL' and macd_slope >= 0))):
+                        log_span("[HARD-NEUTRAL] Worst cluster blocked")
+                        logger.info("sr_room=%s | mtf=%.2f | dir=%s | slope=%.6f", sr_room, mtf_val, direction, macd_slope)
+                        signal_result['rejection_reason'] = "hard_neutral_worst_cluster"
+                        self._last_reject = {'stage': 'MTF', 'reason': 'LIMITED+weakMTF+opposingSlope'}
+                        logger.info("continue logging")
+                        return None
+                except Exception as e:
+                    logger.debug("Hard-neutral check skipped: %s", e)
 
 
                 # Opposing-slope adjustment in weak MTF (nudge toward neutral before gates)
@@ -1164,6 +1414,30 @@ class ConsolidatedSignalAnalyzer:
                     penalty = 0.06
                     if int(signal_result.get('active_indicators', 0)) < 4:
                         penalty += 0.02  # slightly stronger with low breadth
+
+                    # NEW: add banded boost for 0.50–0.65 MTF
+                    try:
+                        if 0.50 <= mtf_val < 0.65:
+                            penalty += 0.01  # gentle extra bite in the borderline band
+                    except Exception:
+                        pass
+
+                    # Optional extra penalty controlled by config
+                    try:
+                        extra = float(getattr(self.config, 'weak_mtf_band_extra_penalty', 0.0))
+                        if 0.50 <= mtf_val < 0.65 and extra > 0:
+                            penalty += min(0.03, extra)
+                            logger.info(f"[ADJ] Weak‑MTF band extra penalty applied: +{extra:.3f}")
+                            
+                            logger.info("[ADJ] Weak-MTF opposing-slope adjustment in effect (mtf=%.2f, slope=%.6f, score_before=%+.3f)",
+                                        mtf_val, macd_slope, float(signal_result.get('weighted_score', 0.0)))
+                            logger.info("continue logging")
+
+
+                            
+                    except Exception:
+                        pass
+
 
                     changed = False
                     if mtf_val < 0.65 and ws > 0 and macd_slope <= 0:
@@ -1196,6 +1470,16 @@ class ConsolidatedSignalAnalyzer:
                             signal_result['composite_signal'] = 'NEUTRAL'
                         if signal_result['composite_signal'] != prev_sig:
                             logger.info(f"[ADJ] Reclassified: {prev_sig} → {signal_result['composite_signal']} (mtf={mtf_val:.2f})")
+
+
+                        # Pass optional context to text builder for display-only damping
+                        try:
+                            contributions['_ctx_mtf_score'] = mtf_val
+                            contributions['_ctx_sr_room'] = getattr(self.mtf_analyzer, '_last_sr_room', None)
+                        except Exception:
+                            pass
+
+
 
                         # Rebuild dynamic prediction text
                         text, meta = self._build_dynamic_prediction(
@@ -1345,6 +1629,40 @@ class ConsolidatedSignalAnalyzer:
             # 6. Analyze trend alignment
             trend_analysis = self.trend_analyzer.analyze_trend(df_5m, indicators_5m)
             
+
+            # Session‑aware min_strength override for safe, aligned contexts
+            try:
+                session = session_info.get('session', 'normal')
+                exp_flag = bool(getattr(self, "_last_expansion_flag", False))
+                contributions = signal_result.get('contributions', {})
+                slope = float(contributions.get('macd', {}).get('hist_slope', 0.0))
+                comp_up = str(signal_result.get('composite_signal','')).upper()
+                dir_up = ('BUY' in comp_up)
+                slope_ok = (slope > 0 and dir_up) or (slope < 0 and not dir_up)
+                mtf_safe = float(signal_result.get('mtf_score', 0.0)) 
+
+                rsi_up = bool(contributions.get('rsi', {}).get('rsi_cross_up', False))
+                rsi_dn = bool(contributions.get('rsi', {}).get('rsi_cross_down', False))
+                cross_ok = (rsi_up and dir_up) or (rsi_dn and not dir_up)
+
+                if (session == 'ranging') and exp_flag and slope_ok and (mtf_safe >= 0.65 or (mtf_safe >= 0.50 and cross_ok)):
+                    base_min = float(getattr(self.config, 'min_signal_strength', 0.10))
+                    delta = float(getattr(self.config, 'session_ranging_strength_delta', 0.02))
+                    # Stronger relief when we rely on the soft MTF path (>=0.50 with RSI cross)
+                    if mtf_safe < 0.65:
+                        delta = max(delta, 0.04)
+                    override = max(0.0, base_min - delta)
+                    signal_result['min_strength_override'] = override
+                    logger.info("[SESSION] min_strength override (ranging+expansion): %.3f → %.3f (mtf=%.2f, slope=%+.6f, cross_ok=%s, dir=%s)", base_min, override, mtf_safe, slope, cross_ok, 'BUY' if dir_up else 'SELL')
+                    logger.info("continue logging")
+
+                
+            except Exception as _e:
+                logger.debug(f"Session min_strength override skipped: {_e}")
+
+            
+            
+            
             # 7. Enhanced validation
             is_valid = self._enhanced_validation(
                 signal_result, 
@@ -1403,6 +1721,8 @@ class ConsolidatedSignalAnalyzer:
                 # If entry_exit already rejected on rr_floor, honor it
                 if entry_exit.get('rejection_reason') == 'rr_floor':
                     signal_result['rejection_reason'] = "rr_floor"
+                    log_span("[RISK] R:R Enforcement")
+
                     logger.info("x" * 60)
                     logger.info(f"❌ Rejected by R:R (from entry/exit): {rr_val:.2f}")
                     logger.info("x" * 60)
@@ -1729,6 +2049,63 @@ class ConsolidatedSignalAnalyzer:
             return {'session': 'unknown', 'strategy': 'standard', 'confidence_adjustment': 1.0}
 
 
+
+    def _detect_expansion_lite(self, df: pd.DataFrame, indicators_5m: Dict) -> tuple[bool, bool]:
+        """
+        Lite expansion detector (no volume): expansion=True when at least 2/3 hold over 2 of last 3 bars:
+        - Bollinger bandwidth rising,
+        - ATR proxy acceleration positive (HL mean),
+        - |Δ MACD histogram| rising.
+        Returns (expansion, flip_from_compression).
+        """
+        try:
+            import numpy as _np
+            if df is None or df.empty or len(df) < 20:
+                return False, False
+
+            # 1) BB bandwidth rising (recompute from series when available)
+            bw_up = False
+            try:
+                bb = indicators_5m.get('bollinger', {}) if isinstance(indicators_5m, dict) else {}
+                up = bb.get('upper_series'); mid = bb.get('middle_series'); lo = bb.get('lower_series')
+                if all(s is not None for s in [up, mid, lo]) and len(up) >= 3:
+                    bws = ((up - lo) / mid.replace(0, _np.nan) * 100.0).tail(3).astype(float)
+                    bw_up = bool((bws.diff() > 0).tail(2).sum() >= 1)
+            except Exception:
+                bw_up = False
+
+            # 2) ATR proxy acceleration: mean(high-low) rolling rising
+            atr_up = False
+            try:
+                hl_mean = (pd.to_numeric(df['high'], errors='coerce') - pd.to_numeric(df['low'], errors='coerce')).rolling(14).mean()
+                if len(hl_mean.dropna()) >= 3:
+                    a = hl_mean.dropna().tail(3).astype(float)
+                    atr_up = bool((a.diff() > 0).tail(2).sum() >= 1)
+            except Exception:
+                atr_up = False
+
+            # 3) |Δ MACD histogram| rising
+            macd_abs_up = False
+            try:
+                hist = indicators_5m.get('macd', {}).get('histogram_series')
+                if hist is not None and len(hist) >= 3:
+                    d = hist.diff().abs().tail(3).astype(float)
+                    macd_abs_up = bool((d.diff() > 0).tail(2).sum() >= 1)
+            except Exception:
+                macd_abs_up = False
+
+            expansion = (int(bw_up) + int(atr_up) + int(macd_abs_up)) >= 2
+            prev = getattr(self, "_last_expansion_flag", False)
+            flip = (not prev) and bool(expansion)
+            self._last_expansion_flag = expansion
+
+            logger.info(f"[EXP] bb_up={bw_up} atr_up={atr_up} |Δmacd|_up={macd_abs_up} → expansion={expansion}, flip={flip}")
+            return expansion, flip
+        except Exception:
+            return False, False
+
+
+
     def _calculate_final_confidence_with_mtf(
         self, 
         signal_result: Dict, 
@@ -1890,23 +2267,41 @@ class ConsolidatedSignalAnalyzer:
             # Fallback to base confidence if something went wrong
             return float(signal_result.get('confidence', 0.0))
 
-
-
     def _calculate_weighted_signal(self, indicators: Dict) -> Dict:
         """Calculate weighted signal for INDEX SCALPING with market regime awareness."""
+
+        # IMPORTANT: initialize locals used throughout (prevents UnboundLocalError)
+        weighted_score: float = 0.0
+        composite_signal: str = 'NEUTRAL'
+
+        # Optional visibility for initialization (consistent with high-verbosity style)
+        logger.debug("[SCORER] initialized locals: weighted_score=%.3f, composite_signal=%s",
+                    weighted_score, composite_signal)
+        logger.info("continue logging")
+
+        
         try:
-            weighted_score = 0.0
-            contributions = {}
+            # Always build a local result dict; never reference 'signal_result' in this scope
+            result: Dict[str, Any] = {
+                'weighted_score': 0.0,
+                'contributions': {},
+                'active_indicators': 0,
+                'composite_signal': 'NEUTRAL',
+                'confidence': 0.0,
+                'market_regime': 'NORMAL',
+            }
+            contributions = result['contributions']
             active_count = 0
-            scalping_signals = []
+            scalping_signals: List[str] = []
             
+
             # CRITICAL: Detect market regime first
-            if hasattr(self, 'current_df'):
-                market_regime = self.detect_market_regime(self.current_df)
-            else:
-                market_regime = "NORMAL"
-            
-            
+            market_regime = self.detect_market_regime(self.current_df) if hasattr(self, 'current_df') else "NORMAL"
+            result['market_regime'] = market_regime
+            logger.debug("[SCORER] market_regime=%s", market_regime)
+            logger.info("continue logging")
+
+
 
 
             for ind_name, weight in self.config.indicator_weights.items():
@@ -1920,60 +2315,66 @@ class ConsolidatedSignalAnalyzer:
                 prediction = ""
                 extras = {}
 
+       
+                                        
 
-                
                 # ADJUST SIGNALS BASED ON MARKET REGIME
                 if ind_name == 'rsi':
-                    if market_regime == "STRONG_UPTREND":
-                        # In strong uptrends, RSI can stay overbought
-                        if value > 85:  # Only extreme overbought is bearish
-                            contribution = -weight * 0.5  # Reduced weight
-                            active_count += 1
-                        elif value > 70:  # Normal overbought is still bullish in trend
-                            contribution = weight * 0.3
-                            active_count += 1
-                        elif value < 30:  # Oversold in uptrend = strong buy
-                            contribution = weight * 1.5
-                            active_count += 1
-                        elif value > 50:
-                            contribution = weight * 0.2
-                            active_count += 1
-                    else:
-                        # Normal market conditions
-                        if signal == 'overbought' or value > 75:
-                            contribution = -weight
-                            active_count += 1
-                            if value > 80:
-                                prediction = "RSI overbought → Pullback likely"
-                                scalping_signals.append(prediction)
-                        elif signal == 'oversold' or value < 25:
-                            contribution = weight
-                            active_count += 1
-                            if value < 20:
-                                prediction = "RSI oversold → Bounce likely"
-                                scalping_signals.append(prediction)
-                        elif signal != 'neutral':
-                            active_count += 1
-                            
-                            
-                        # Store RSI micro-feature for later quality checks
+                    # Always capture micro features and neutralize on fallback before regime logic
+                    extras['rsi_value'] = indicator.get('value', 50)
+                    try:
+                        fallback_flag = bool(indicator.get('fallback', False))
+                        extras['fallback'] = fallback_flag
+                        if fallback_flag:
+                            logger.info("[RSI] Fallback detected → contribution neutralized (all regimes)")
+                            contribution = 0.0  # continue to record micro-features but avoid directional contribution
+                        
+                        rsi_series = indicator.get('rsi_series')
+                        prev_rsi = float(rsi_series.iloc[-2]) if rsi_series is not None and len(rsi_series) >= 2 else None
+                        curr_rsi = float(indicator.get('value', 50))
+                        rsi_cross_up = bool(prev_rsi is not None and prev_rsi <= 50.0 and curr_rsi > 50.0)
+                        rsi_cross_down = bool(prev_rsi is not None and prev_rsi >= 50.0 and curr_rsi < 50.0)
+                        extras['rsi_value'] = curr_rsi
+                        extras['rsi_cross_up'] = rsi_cross_up
+                        extras['rsi_cross_down'] = rsi_cross_down
+                        logger.debug(f"[RSI] value={curr_rsi:.1f} prev={prev_rsi} upX={rsi_cross_up} dnX={rsi_cross_down}")
+                    except Exception:
                         extras['rsi_value'] = indicator.get('value', 50)
-
-                        # Store RSI micro-features (50-cross flags)
-                        try:
-                            rsi_series = indicator.get('rsi_series')
-                            prev_rsi = float(rsi_series.iloc[-2]) if rsi_series is not None and len(rsi_series) >= 2 else None
-                            curr_rsi = float(indicator.get('value', 50))
-                            rsi_cross_up = bool(prev_rsi is not None and prev_rsi <= 50.0 and curr_rsi > 50.0)
-                            rsi_cross_down = bool(prev_rsi is not None and prev_rsi >= 50.0 and curr_rsi < 50.0)
-                            extras['rsi_value'] = curr_rsi
-                            extras['rsi_cross_up'] = rsi_cross_up
-                            extras['rsi_cross_down'] = rsi_cross_down
-                            logger.debug(f"[RSI] value={curr_rsi:.1f} prev={prev_rsi} upX={rsi_cross_up} dnX={rsi_cross_down}")
-                        except Exception:
-                            extras['rsi_value'] = indicator.get('value', 50)
-
-
+                    
+                    # Now apply regime adjustments ONLY if not fallback
+                    if not extras.get('fallback', False):
+                        if market_regime == "STRONG_UPTREND":
+                            # In strong uptrends, RSI can stay overbought
+                            if value > 85:
+                                contribution = -weight * 0.5
+                                active_count += 1
+                            elif value > 70:
+                                contribution = weight * 0.3
+                                active_count += 1
+                            elif value < 30:
+                                contribution = weight * 1.5
+                                active_count += 1
+                            elif value > 50:
+                                contribution = weight * 0.2
+                                active_count += 1
+                        else:
+                            # Normal market conditions (your existing logic)
+                            if signal == 'overbought' or value > 75:
+                                contribution = -weight
+                                active_count += 1
+                                if value > 80:
+                                    prediction = "RSI overbought → Pullback likely"
+                                    scalping_signals.append(prediction)
+                            elif signal == 'oversold' or value < 25:
+                                contribution = weight
+                                active_count += 1
+                                if value < 20:
+                                    prediction = "RSI oversold → Bounce likely"
+                                    scalping_signals.append(prediction)
+                            elif signal != 'neutral':
+                                active_count += 1
+                            # Micro-features already captured above for RSI; no duplication here
+       
                             
                 elif ind_name == 'bollinger':
                     position = indicator.get('position', 0.5)
@@ -2188,22 +2589,43 @@ class ConsolidatedSignalAnalyzer:
                 pass
 
 
+            # Extra SR+RSI nuance to avoid buying top/selling bottom in ranges (context-aware)
             try:
-                # Extra SR+RSI nuance to avoid buying top/selling bottom in ranges
                 rsi_val = float(contributions.get('rsi', {}).get('rsi_value', 50.0))
                 bb_pos = float(contributions.get('bollinger', {}).get('position', 0.5))
-                if weighted_score > 0 and bb_pos >= 0.90 and rsi_val >= 70:
+                sr_room = str(contributions.get('_ctx_sr_room', getattr(self.mtf_analyzer, '_last_sr_room', 'UNKNOWN')) or 'UNKNOWN').upper()
+                macd_slope = float(contributions.get('macd', {}).get('hist_slope', 0.0))
+                if pd.isna(macd_slope) or np.isinf(macd_slope):
+                    macd_slope = 0.0
+
+                # BUY near top: stronger haircut when LIMITED room or momentum not supportive
+                if weighted_score > 0 and (bb_pos >= 0.90 or rsi_val >= 70):
                     old = weighted_score
-                    weighted_score -= 0.025
-                    scalping_signals.append("SR+RSI nuance: BUY near upper with RSI≥70 → haircut")
-                    logger.info(f"SR+RSI BUY haircut: bb_pos={bb_pos:.2f}, rsi={rsi_val:.1f} → score {old:+.3f}→{weighted_score:+.3f}")
-                elif weighted_score < 0 and bb_pos <= 0.10 and rsi_val <= 30:
+                    penalty = 0.025
+                    if sr_room == 'LIMITED':
+                        penalty += 0.035
+                    if macd_slope <= 0:
+                        penalty += 0.020
+                    weighted_score -= penalty
+                    scalping_signals.append("SR+RSI nuance: BUY near upper → haircut (ctx-aware)")
+                    logger.info(f"SR+RSI BUY haircut: bb_pos={bb_pos:.2f}, rsi={rsi_val:.1f}, sr={sr_room}, slope={macd_slope:+.6f} → {old:+.3f}→{weighted_score:+.3f}")
+
+                # SELL near bottom: stronger haircut when LIMITED room or slope ≥ 0 (bounce risk)
+                elif weighted_score < 0 and (bb_pos <= 0.10 or rsi_val <= 30):
                     old = weighted_score
-                    weighted_score += 0.025
-                    scalping_signals.append("SR+RSI nuance: SELL near lower with RSI≤30 → haircut")
-                    logger.info(f"SR+RSI SELL haircut: bb_pos={bb_pos:.2f}, rsi={rsi_val:.1f} → score {old:+.3f}→{weighted_score:+.3f}")
+                    boost = 0.025
+                    if sr_room == 'LIMITED':
+                        boost += 0.035
+                    if macd_slope >= 0:
+                        boost += 0.020
+                    if rsi_val <= 35 and sr_room == 'LIMITED':
+                        boost += 0.020
+                    weighted_score += boost
+                    scalping_signals.append("SR+RSI nuance: SELL near lower → haircut (ctx-aware)")
+                    logger.info(f"SR+RSI SELL haircut: bb_pos={bb_pos:.2f}, rsi={rsi_val:.1f}, sr={sr_room}, slope={macd_slope:+.6f} → {old:+.3f}→{weighted_score:+.3f}")
             except Exception:
                 pass
+
 
 
 
@@ -2231,7 +2653,11 @@ class ConsolidatedSignalAnalyzer:
             # Low-breadth quality gate and attenuation
             if active_count < 3:
                 bull_bias = weighted_score > 0
+
                 macd_slope = float(contributions.get('macd', {}).get('hist_slope', 0.0))
+                if pd.isna(macd_slope) or np.isinf(macd_slope):
+                    macd_slope = 0.0
+                                
                 price_above_short = bool(contributions.get('ema', {}).get('price_above_short', False))
                 rsi_val = float(contributions.get('rsi', {}).get('rsi_value', 50.0))
                 bb_pos = float(contributions.get('bollinger', {}).get('position', 0.5))
@@ -2266,6 +2692,67 @@ class ConsolidatedSignalAnalyzer:
 
                 # Stronger attenuation when only 1–2 indicators contribute
                 weighted_score *= 0.7
+
+
+            # Micro‑range neutralizer: low score, tight bands, and weak/contrary momentum → force NEUTRAL
+            try:
+                bb_bw = float(indicators.get('bollinger', {}).get('bandwidth', 0.0)) if isinstance(indicators, dict) else 0.0
+                macd_hist = float(indicators.get('macd', {}).get('histogram', 0.0)) if isinstance(indicators, dict) else 0.0
+
+                macd_slope = float(contributions.get('macd', {}).get('hist_slope', 0.0))
+                if pd.isna(macd_slope) or np.isinf(macd_slope):
+                    macd_slope = 0.0                
+
+                # Expansion-aware neutralizer: detect once and annotate contributions
+
+                try:
+                    # Prefer the cached flag set earlier in analyze_and_generate_signal
+                    exp_flag = getattr(self, "_last_expansion_flag", None)
+                    if exp_flag is None:
+                        exp_flag, _ = self._detect_expansion_lite(self.current_df, indicators)
+                except Exception:
+                    exp_flag = False
+                if isinstance(contributions, dict):
+                    contributions['_ctx_expansion'] = exp_flag
+
+
+
+                                        
+                # Expansion-aware micro-range handling: allow momentum+RSI-confirmed rebounds to avoid over-neutralizing
+                rsi_val = float(contributions.get('rsi', {}).get('rsi_value', 50.0))
+                rsi_up = bool(contributions.get('rsi', {}).get('rsi_cross_up', False))
+                rsi_dn = bool(contributions.get('rsi', {}).get('rsi_cross_down', False))
+
+                if abs(weighted_score) < 0.12 and bb_bw <= 8.0:
+                    # BUY-side allowance: slightly negative score but momentum turns up with RSI support
+                    if (weighted_score < 0 and macd_slope > 0 and (rsi_up or rsi_val >= 50.0)):
+                        old = weighted_score
+                        bump = 0.04 if exp_flag else 0.02
+                        weighted_score = min(0.12, weighted_score + bump)
+                        scalping_signals.append("Micro-range allowance: momentum+RSI (up) confirmation")
+                        logger.info("[NEUTRALIZER] Skipped collapse (BUY-side allowance, expansion=%s) → %+.3f→%+.3f", exp_flag, old, weighted_score)
+                        logger.info("continue logging")
+                    # SELL-side allowance: slightly positive score but momentum turns down with RSI support
+                    elif (weighted_score > 0 and macd_slope < 0 and (rsi_dn or rsi_val <= 50.0)):
+                        old = weighted_score
+                        bump = 0.04 if exp_flag else 0.02
+                        weighted_score = max(-0.12, weighted_score - bump)
+                        scalping_signals.append("Micro-range allowance: momentum+RSI (down) confirmation")
+                        logger.info("[NEUTRALIZER] Skipped collapse (SELL-side allowance, expansion=%s) → %+.3f→%+.3f", exp_flag, old, weighted_score)
+                        logger.info("continue logging")
+                    # Otherwise apply the usual collapse
+                    elif (abs(macd_hist) < 0.005 or (weighted_score > 0 and macd_slope <= 0) or (weighted_score < 0 and macd_slope >= 0)):
+                        old = weighted_score
+                        collapse = 0.35 if exp_flag else 0.20
+                        weighted_score *= collapse
+                        scalping_signals.append(f"Micro-range neutralizer ({'exp' if exp_flag else 'compr'}): tight BB + tiny/contrary MACD")
+                        logger.info(f"[NEUTRALIZER] Micro-range → score {old:+.3f} → {weighted_score:+.3f} (bb_bw={bb_bw:.2f}, macd_hist={macd_hist:+.4f}, slope={macd_slope:+.6f}, expansion={exp_flag})")
+                        logger.info("continue logging")
+
+                                    
+                    
+            except Exception:
+                pass
 
 
     
@@ -2304,15 +2791,34 @@ class ConsolidatedSignalAnalyzer:
             )
 
   
-
+            # Guard against NaN/Inf before downstream usage
             if pd.isna(weighted_score) or np.isinf(weighted_score):
-                logger.error(f"Invalid weighted_score detected: {weighted_score}, resetting to 0")
+                logger.error("Invalid weighted_score detected: %.3f, resetting to 0", weighted_score)
                 weighted_score = 0.0
-           
+
+            
             # Include pattern detection in signal (HTF/SR-aware gating)
             if self.pattern_detector and hasattr(self, 'current_df') and not self.current_df.empty:
                 try:
                     pattern_result = self.pattern_detector.detect_patterns(self.current_df)
+
+
+                    # Attach and log the top pattern explicitly for audit and alerts (no re-bind)
+                    if pattern_result:
+                        contributions['pattern_top'] = {
+                            'name': str(pattern_result.get('name', '')).upper(),
+                            'signal': str(pattern_result.get('signal', 'NEUTRAL')).upper(),
+                            'confidence': int(pattern_result.get('confidence', 0))
+                        }
+                        logger.info("[PATTERN] Recognized: %s (%s, %d%%)",
+                                    contributions['pattern_top']['name'],
+                                    contributions['pattern_top']['signal'],
+                                    contributions['pattern_top']['confidence'])
+                        logger.info("continue logging")
+
+
+
+                    # Apply pattern boost or ignore based on context
                     if pattern_result and pattern_result.get('confidence', 0) > 0:
                         pattern_signal = pattern_result.get('signal', 'neutral')
                         htf_macd_sig = str(getattr(self, '_htf_macd_sig', '') or '').lower()
@@ -2323,40 +2829,42 @@ class ConsolidatedSignalAnalyzer:
                         hostile_buy_ctx = ('bearish' in htf_macd_sig) or (bb_pos >= 0.90) or top_guard
                         hostile_sell_ctx = ('bullish' in htf_macd_sig) or (bb_pos <= 0.10) or bottom_guard
 
-                        breakout_evidence = bool(pattern_result.get('name') == 'breakout_potential' and pattern_signal == 'LONG')
-                        breakdown_evidence = bool(pattern_result.get('name') == 'breakdown_potential' and pattern_signal == 'SHORT')
-
-                                                
-
                         if pattern_signal == 'LONG' and weighted_score > 0:
                             if hostile_buy_ctx:
-                                logger.info(f"Pattern detected but ignored (HTF hostile or near upper band): {pattern_result['name']} | htf_macd={htf_macd_sig}, bb_pos={bb_pos:.2f}")
+                                logger.info("Pattern detected but ignored (HTF hostile or near upper band): %s | htf_macd=%s, bb_pos=%.2f",
+                                            str(pattern_result.get('name', '')).upper(), htf_macd_sig, bb_pos)
+                                logger.info("continue logging")
                             else:
                                 weighted_score += 0.05
-                                scalping_signals.append(f"Pattern applied: {pattern_result['name']}")
-                                logger.info(f"Pattern boost applied: {pattern_result['name']}")
+                                scalping_signals.append(f"Pattern applied: {str(pattern_result.get('name', '')).upper()}")
+                                logger.info("Pattern boost applied: %s", str(pattern_result.get('name', '')).upper())
+                                logger.info("continue logging")
                         elif pattern_signal == 'SHORT' and weighted_score < 0:
                             if hostile_sell_ctx:
-                                logger.info(f"Pattern detected but ignored (HTF hostile or near lower band): {pattern_result['name']} | htf_macd={htf_macd_sig}, bb_pos={bb_pos:.2f}")
+                                logger.info("Pattern detected but ignored (HTF hostile or near lower band): %s | htf_macd=%s, bb_pos=%.2f",
+                                            str(pattern_result.get('name', '')).upper(), htf_macd_sig, bb_pos)
+                                logger.info("continue logging")
                             else:
                                 weighted_score -= 0.05
-                                scalping_signals.append(f"Pattern applied: {pattern_result['name']}")
-                                logger.info(f"Pattern boost applied: {pattern_result['name']}")
-                            
+                                scalping_signals.append(f"Pattern applied: {str(pattern_result.get('name', '')).upper()}")
+                                logger.info("Pattern boost applied: %s", str(pattern_result.get('name', '')).upper())
+                                logger.info("continue logging")
+
+
+                                
+                                
                         else:
-                            logger.info(f"Pattern detected but ignored (contradicts 5m bias): {pattern_result.get('name')}")
-                            # Record ignored counter-pattern so PA/ranging nuance can apply a small haircut later
+                            logger.info("Pattern detected but ignored (contradicts 5m bias): %s", str(pattern_result.get('name', '')).upper())
+                            logger.info("continue logging")
+                            # Record ignored counter-pattern for nuanced adjustments
                             contributions['pattern_ignored'] = {
                                 'name': pattern_result.get('name'),
                                 'signal': pattern_signal,
                                 'confidence': pattern_result.get('confidence', 0)
                             }
 
-
-                            
                 except Exception as e:
                     logger.debug(f"Pattern detection skipped: {e}")
-
 
 
             # Re-classify after pattern/quality adjustments to keep mapping consistent
@@ -2372,10 +2880,22 @@ class ConsolidatedSignalAnalyzer:
             else:
                 composite_signal = 'NEUTRAL'
 
+
+
             if composite_signal != prev_signal:
-                logger.debug(f"Reclassified after adjustments: {prev_signal} → {composite_signal} (score={weighted_score:.3f})")
+                logger.debug("Reclassified after adjustments: %s → %s (score=%.3f)", prev_signal, composite_signal, weighted_score)
+                logger.info("continue logging")
+
 
             # Rebuild dynamic prediction after reclassification
+            try:
+                contributions['_ctx_mtf_score'] = contributions.get('_ctx_mtf_score', None)  # leave if already set
+                if contributions['_ctx_mtf_score'] is None:  # if MTF was not computed earlier, leave None
+                    pass
+                contributions['_ctx_sr_room'] = contributions.get('_ctx_sr_room', getattr(self.mtf_analyzer, '_last_sr_room', None))
+            except Exception:
+                pass
+
             next_candle_prediction, prediction_meta = self._build_dynamic_prediction(
                 composite_signal=composite_signal,
                 weighted_score=weighted_score,
@@ -2409,9 +2929,12 @@ class ConsolidatedSignalAnalyzer:
                 (market_regime == "STRONG_DOWNTREND" and weighted_score < 0):
                     base_confidence += 15  # Boost for trend-aligned signals
                     next_candle_prediction += f" [TREND DAY - {market_regime}]"
-            
+
             confidence = min(100, max(base_confidence, 20))
-            
+            if pd.isna(confidence) or np.isinf(confidence):
+                logger.error(f"Invalid confidence detected: {confidence}, resetting to 0")
+                confidence = 0.0
+                        
             logger.info(f"Market Regime: {market_regime}")
             logger.info(f"Weighted Score: {weighted_score:.3f}")
             logger.info(f"Active Indicators: {active_count}/{len(self.config.indicator_weights)}")
@@ -2420,7 +2943,17 @@ class ConsolidatedSignalAnalyzer:
 
 
 
-                
+
+            # Pattern already attached earlier in this scorer pass — skip duplicate work
+            logger.debug("[PATTERN] Duplicate attach skipped (already attached earlier in scorer)")
+            logger.info("continue logging")
+
+
+            # Note: result[] dict writes skipped — returning explicit dict below
+            logger.debug("[SCORER] finalize: using explicit return dict (result[] unchanged)")
+            logger.info("continue logging")
+
+                            
 
             return {
                 'weighted_score': weighted_score,
@@ -2483,6 +3016,10 @@ class ConsolidatedSignalAnalyzer:
 
             # Momentum adds a small, sign-aware tilt
             macd_slope = float(contributions.get('macd', {}).get('hist_slope', 0.0))
+
+            if pd.isna(macd_slope) or np.isinf(macd_slope):
+                macd_slope = 0.0
+                                
             rsi_val = float(contributions.get('rsi', {}).get('rsi_value', 50.0))
             rsi_up = bool(contributions.get('rsi', {}).get('rsi_cross_up', False))
             rsi_dn = bool(contributions.get('rsi', {}).get('rsi_cross_down', False))
@@ -2529,6 +3066,21 @@ class ConsolidatedSignalAnalyzer:
             # Raw probability for meta; soft clamp only for text
             prob_up_raw = max(0.0, min(1.0, float(prob_up)))
             prob_up_text = float(max(0.20, min(0.80, prob_up_raw)))
+            
+            # Display-only damping in weak contexts (optional ctx fields)
+            try:
+                ctx_mtf = contributions.get('_ctx_mtf_score', None)
+                ctx_sr = str(contributions.get('_ctx_sr_room', '') or '').upper()
+                if ctx_mtf is not None:
+                    # Cap text at 60% when mtf<0.50 or SR room LIMITED
+                    if float(ctx_mtf) < 0.50 or ctx_sr == 'LIMITED':
+                        if prob_up_text > 0.60:
+                            logger.info(f"[PRED-TEXT] Damped display prob due to weak ctx (mtf={ctx_mtf}, sr={ctx_sr}): {prob_up_text*100:.0f}% → 60%")
+                        prob_up_text = min(prob_up_text, 0.60)
+            except Exception:
+                pass
+
+
             prob_red_text = float(1.0 - prob_up_text)
             prob_up = prob_up_text  # used only for text below (percent)
             prob_red = prob_red_text
@@ -2647,11 +3199,15 @@ class ConsolidatedSignalAnalyzer:
                 return False
 
 
-            if abs(signal_result['weighted_score']) < self.config.min_signal_strength: 
+            min_strength_req = float(signal_result.get('min_strength_override', self.config.min_signal_strength))
+            if abs(signal_result['weighted_score']) < min_strength_req:
+
                 signal_result['rejection_reason'] = "min_strength" 
                 logger.debug(f"Weak signal strength: {signal_result['weighted_score']}")
                 logger.info(f"Weak signal strength: {signal_result['weighted_score']}")                
-                logger.info(f"[VALIDATION] ❌ Reject: weak strength {signal_result['weighted_score']:.3f} < min {self.config.min_signal_strength:.3f}")
+                
+                logger.info(f"[VALIDATION] ❌ Reject: weak strength {signal_result['weighted_score']:.3f} < min {min_strength_req:.3f}")
+
                 
                 return False 
 
@@ -2753,7 +3309,26 @@ class ConsolidatedSignalAnalyzer:
         except Exception as e:
             logger.error(f"Cooldown check error: {e}")
             return True
-        
+            
+
+    def _should_apply_rr_taper(self, confidence_pct: float, weighted_score: float, mtf_score: float, df: pd.DataFrame) -> bool:
+        try:
+            base_condition = (confidence_pct >= 0.65 and abs(weighted_score) >= 
+                            float(getattr(self.config, 'rr_taper_burst_strength', 0.30)) - 0.05)
+            late_day = False
+            try:
+                ts = df.index[-1] if (df is not None and not df.empty) else None
+                late_day = bool(ts and (ts.hour > 14 or (ts.hour == 14 and ts.minute >= 45)))
+            except Exception:
+                pass
+            late_day_condition = late_day and (mtf_score >= 0.70)
+            strong_alignment = (mtf_score >= 0.75 and abs(weighted_score) >= 0.20)
+            ok = base_condition or late_day_condition or strong_alignment
+            logger.info(f"[RISK] RR-taper eligibility: base={base_condition} late={late_day_condition} strong={strong_alignment} → {ok}")
+            return ok
+        except Exception:
+            return False
+
 
 
     def _calculate_entry_exit_levels(
@@ -2915,32 +3490,66 @@ class ConsolidatedSignalAnalyzer:
             reward = abs(take_profit - entry)
             risk_reward = (reward / risk) if risk > 0 else 0.0
 
-            min_rr = min_rr_floor
-            if use_taper and is_burst and confidence_pct >= conf_limit:
-                min_rr = float(getattr(self.config, 'rr_taper_floor', 0.80))
-                logger.info(f"[RISK] Tapered R:R floor active: {min_rr:.2f} (burst+conf)")
 
-            logger.debug(f"Entry/Exit: Entry={entry:.2f}, SL={stop_loss:.2f}, TP={take_profit:.2f}, R:R={risk_reward:.2f}")
+
+            min_rr = min_rr_floor
+            taper_ok = False
+            if use_taper and is_burst:
+                try:
+                    ws = float(signal_result.get('weighted_score', 0.0))
+                except Exception:
+                    ws = 0.0
+                try:
+                    mtf_val = float(signal_result.get('mtf_score', 0.0))
+                except Exception:
+                    mtf_val = 0.0
+                exp_flag = bool(signal_result.get('contributions', {}).get('_ctx_expansion', False))
+                logger.info("[RISK] Taper precheck: is_burst=%s, conf_pct=%.2f, ws=%+.3f, mtf=%.2f, expansion=%s",
+                            bool(is_burst), float(confidence_pct), ws, mtf_val, exp_flag)
+                
+                taper_ok = self._should_apply_rr_taper(confidence_pct, ws, mtf_val, df)
+
+                
+                if taper_ok:
+                    min_rr = float(getattr(self.config, 'rr_taper_floor', 0.80))
+                    logger.info(f"[RISK] Tapered R:R floor active: {min_rr:.2f} (eligibility met)")
+                else:
+                    logger.debug(f"[RISK] Taper not applied: min_rr={min_rr:.2f}")
+
+
+            
+            logger.info(f"Entry/Exit: Entry={entry:.2f}, SL={stop_loss:.2f}, TP={take_profit:.2f}, R:R={risk_reward:.2f}")
+
+
+            try:
+                # scale ≤ 1.0; don't exceed 1.0; floor at 0.25 to keep visibility
+                size_multiplier = max(0.25, min(1.0, (risk_reward / max(1.0, min_rr)))) * max(0.25, confidence_pct)
+                logger.info(f"[RISK] Size multiplier computed: {size_multiplier:.2f} (RR={risk_reward:.2f}, floor={min_rr:.2f}, conf={confidence_pct:.2f})")
+            except Exception:
+                size_multiplier = 1.0
+
+
 
             # R:R enforcement (keep your existing logic, but use min_rr here)
             if risk_reward < min_rr:
                 logger.info(f"❌ R:R {risk_reward:.2f} below floor {min_rr:.2f} — rejecting signal")
+
+
                 return {
                     'entry_price': round(entry, 2),
                     'stop_loss': round(stop_loss, 2),
                     'take_profit': round(take_profit, 2),
                     'risk_reward': round(risk_reward, 2),
+                    'size_multiplier': round(size_multiplier, 2),
                     'rejection_reason': 'rr_floor'
                 }
-
-
 
 
             
              # Show raw candidates for traceability (high-visibility DEBUG) 
             logger.debug(f"Entry/Exit candidates: upper={upper_candidates} lower={lower_candidates}")
 
-            logger.debug(f"Entry/Exit (directional): res_above={resistance_above:.2f}, "
+            logger.info(f"Entry/Exit (directional): res_above={resistance_above:.2f}, "
                         f"sup_below={support_below:.2f}, entry={entry:.2f}, "
                         f"SL={stop_loss:.2f}, TP={take_profit:.2f}")
             
@@ -2966,13 +3575,15 @@ class ConsolidatedSignalAnalyzer:
             
             
             logger.info(f"Entry/Exit: Entry={entry:.2f}, SL={stop_loss:.2f}, TP={take_profit:.2f}, R:R={risk_reward:.2f}")
-            
+        
             return {
                 'entry_price': round(entry, 2),
                 'stop_loss': round(stop_loss, 2),
                 'take_profit': round(take_profit, 2),
-                'risk_reward': round(risk_reward, 2)
+                'risk_reward': round(risk_reward, 2),
+                'size_multiplier': round(size_multiplier, 2)
             }
+
             
         except Exception as e:
             logger.error(f"Error calculating entry/exit levels: {e}")
@@ -2982,6 +3593,7 @@ class ConsolidatedSignalAnalyzer:
                 'take_profit': 0,
                 'risk_reward': 0
             }
+
 
 
     def _calculate_volatility_range(self, df: pd.DataFrame) -> float:

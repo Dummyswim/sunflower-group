@@ -303,7 +303,16 @@ class DataPersistenceManager:
             # Trim to rolling window size 
             if len(data) > max_candles: 
                 data = data.tail(int(max_candles))
-            
+
+            # Ensure numeric columns are finite
+            try:
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    if col in data.columns:
+                        data[col] = pd.to_numeric(data[col], errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            except Exception:
+                pass
+
+                        
             # Normalize and standardize index (defensive)
             data = self._normalize_index_tz(data)
             try:

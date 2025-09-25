@@ -1,299 +1,211 @@
 """
-Candlestick Pattern Detection for Index Scalping
+Candlestick Pattern Detection for Index Scalping (TA‑Lib–backed)
+This module detects classic TA‑Lib CDL patterns + custom Tweezer Top/Bottom and optional Rounding.
+It returns the top candidate for the last bar with {'name','signal','confidence'} and logs the decision.
 """
-import pandas as pd
-import numpy as np
+
 import logging
-from typing import Dict 
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    import talib as ta
+    _HAS_TALIB = True
+except Exception:
+    _HAS_TALIB = False
+
+
+def _np_series(x: pd.Series) -> np.ndarray:
+    return pd.to_numeric(x, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
+
+
+def _talib_func(name: str):
+    return getattr(ta, name, None) if _HAS_TALIB else None
+
+
+# Define TA‑Lib patterns
+TA_PATTERNS = {
+    # Requested new patterns
+    "CDLINVERTEDHAMMER": _talib_func("CDLINVERTEDHAMMER"),
+    "CDLPIERCING": _talib_func("CDLPIERCING"),
+    "CDLHARAMI": _talib_func("CDLHARAMI"),
+    "CDL3WHITESOLDIERS": _talib_func("CDL3WHITESOLDIERS"),
+    "CDL3BLACKCROWS": _talib_func("CDL3BLACKCROWS"),
+    "CDLDARKCLOUDCOVER": _talib_func("CDLDARKCLOUDCOVER"),
+    "CDLABANDONEDBABY": _talib_func("CDLABANDONEDBABY"),
+    "CDLSPINNINGTOP": _talib_func("CDLSPINNINGTOP"),
+    "CDLTRISTAR": _talib_func("CDLTRISTAR"),
+    "CDLSTICKSANDWICH": _talib_func("CDLSTICKSANDWICH"),
+    # Existing/common
+    "CDLENGULFING": _talib_func("CDLENGULFING"),
+    "CDLHAMMER": _talib_func("CDLHAMMER"),
+    "CDLSHOOTINGSTAR": _talib_func("CDLSHOOTINGSTAR"),
+}
+
+
 class CandlestickPatternDetector:
-    """Detects high-probability candlestick patterns for scalping."""
-    
-    def __init__(self):
-        self.patterns = []
-        
-    def detect_patterns(self, df: pd.DataFrame) -> dict:
-        """Detect actionable patterns in last 5 candles."""
-        if len(df) < 5:
-            return {'pattern': 'none', 'signal': 'neutral', 'confidence': 0}
-        
-        last_5 = df.tail(5)
-        patterns_found = []
-        
-        # Pattern 1: Three White Soldiers / Three Black Crows
-        if self._detect_three_soldiers(last_5):
-            patterns_found.append({
-                'name': 'three_white_soldiers',
-                'signal': 'LONG',
-                'confidence': 80
-            })
-        elif self._detect_three_crows(last_5):
-            patterns_found.append({
-                'name': 'three_black_crows', 
-                'signal': 'SHORT',
-                'confidence': 80
-            })
-        
-        # Pattern 2: Momentum Burst
-        momentum = self._detect_momentum_burst(last_5)
-        if momentum['detected']:
-            patterns_found.append(momentum)
-        
-        # Pattern 3: Support/Resistance Test
-        sr_test = self._detect_sr_test(df)
-        if sr_test['detected']:
-            patterns_found.append(sr_test)
-        
-        # Pattern 4: Exhaustion
-        exhaustion = self._detect_exhaustion(last_5)
-        if exhaustion['detected']:
-            patterns_found.append(exhaustion)
-        
-        if patterns_found:
-            # Return highest confidence pattern
-            best = max(patterns_found, key=lambda x: x['confidence'])
-            logger.info(f"Pattern detected: {best['name']} - {best['signal']}")
-            # logger.debug(f"Pattern detected: {best['name']} - {best['signal']}")
-            return best
-        
-        return {'pattern': 'none', 'signal': 'neutral', 'confidence': 0}
-    
-    # def _detect_three_soldiers(self, df: pd.DataFrame) -> bool:
-    #     """Three consecutive green candles with increasing closes."""
-    #     if len(df) < 3:
-    #         return False
-        
-    #     last_3 = df.tail(3)
-    #     all_green = all(last_3['close'] > last_3['open'])
-    #     increasing = all(last_3['close'].diff().dropna() > 0)
-        
-    #     return all_green and increasing
-    
-    
-    def _detect_three_soldiers(self, df: pd.DataFrame) -> bool: 
-        """Three White Soldiers: 3 green candles; opens inside prior body; strong bodies; small upper wicks.""" 
-        if len(df) < 3: 
-            return False 
-        
-        last_3 = df.tail(3).copy()
-        if not all(last_3['close'] > last_3['open']):
-            return False
-        if not all(last_3['close'].diff().dropna() > 0):
-            return False
+    """
+    Detects high-probability candlestick patterns for scalping.
+    Returns a single top pattern for the last bar with:
+    {'name': str, 'signal': 'LONG'|'SHORT'|'NEUTRAL', 'confidence': int}
+    Compatible with the rest of the pipeline (analyzer, charts, alerts).
+    """
 
-        for i in range(-2, 1):
-            prev = last_3.iloc[i-1]
-            cur = last_3.iloc[i]
-            body_prev = abs(prev['close'] - prev['open'])
-            range_prev = max(prev['high'] - prev['low'], 1e-6)
-            if body_prev / range_prev < 0.5:
-                return False
-            lo_body = min(prev['open'], prev['close'])
-            hi_body = max(prev['open'], prev['close'])
-            if not (lo_body <= cur['open'] <= hi_body):
-                return False
-            cur_body = cur['close'] - cur['open']
-            upper_wick = cur['high'] - max(cur['close'], cur['open'])
-            if cur_body <= 0 or upper_wick > 0.5 * cur_body:
-                return False
-        logger.debug("Pattern OK: Three White Soldiers")
-        return True
+    def __init__(self, config=None):
+        self.config = config
+        # Defaults if config not injected
+        self._min_strength = int(getattr(config, "pattern_min_strength", 50)) if config else 50
+        self._enable_talib = bool(getattr(config, "enable_talib_patterns", True)) if config else True
+        self._names = list(getattr(config, "candlestick_patterns", [])) if config else [
+            "CDLINVERTEDHAMMER", "CDLPIERCING", "CDLHARAMI", "CDL3WHITESOLDIERS", "CDL3BLACKCROWS",
+            "CDLDARKCLOUDCOVER", "CDLABANDONEDBABY", "CDLSPINNINGTOP", "CDLTRISTAR", "CDLSTICKSANDWICH",
+            "CDLENGULFING", "CDLHAMMER", "CDLSHOOTINGSTAR"
+        ]
+        self._enable_tw = bool(getattr(config, "enable_custom_tweezer", True)) if config else True
+        self._tw_tol_bps = float(getattr(config, "tweezer_tolerance_bps", 5.0)) if config else 5.0
+        self._enable_round = bool(getattr(config, "enable_rounding_patterns", False)) if config else False
+        self._round_win = int(getattr(config, "rounding_window", 20)) if config else 20
 
-    
-    
-    def _detect_three_crows(self, df: pd.DataFrame) -> bool: 
-        """Three Black Crows: 3 red candles; opens inside prior body; strong bodies; small lower wicks.""" 
-        if len(df) < 3: 
-            return False 
-        
-        last_3 = df.tail(3).copy()
-    
-        if not all(last_3['close'] < last_3['open']):
-            return False
-        if not all(last_3['close'].diff().dropna() < 0):
-            return False
-        for i in range(-2, 1):
-            prev = last_3.iloc[i-1]
-            cur = last_3.iloc[i]
-            body_prev = abs(prev['close'] - prev['open'])
-            range_prev = max(prev['high'] - prev['low'], 1e-6)
-            if body_prev / range_prev < 0.5:
-                return False
-            lo_body = min(prev['open'], prev['close'])
-            hi_body = max(prev['open'], prev['close'])
-            if not (lo_body <= cur['open'] <= hi_body):
-                return False
-            
-            cur_body = cur['open'] - cur['close'] 
-            lower_wick = min(cur['open'], cur['close']) - cur['low'] 
-            if cur_body <= 0 or lower_wick > 0.5 * cur_body: 
-                return False
-            
-            
-            
-        logger.debug("Pattern OK: Three Black Crows")
-        return True
-
-    
-    def _detect_momentum_burst(self, df: pd.DataFrame) -> dict:
-        """Detect sudden momentum increase."""
-        if len(df) < 5:
-            return {'detected': False}
-        
-        # Calculate rate of change
-        roc = (df['close'].iloc[-1] - df['close'].iloc[-3]) / df['close'].iloc[-3] * 100
-        
-        if abs(roc) > 0.15:  # 0.15% move in 3 candles
-            return {
-                'detected': True,
-                'name': 'momentum_burst',
-                'signal': 'LONG' if roc > 0 else 'SHORT',
-                'confidence': min(90, 60 + abs(roc) * 100),
-                'momentum': roc
-            }
-        
-        return {'detected': False}
-    
-
-
-
-    def _detect_sr_test(self, df: pd.DataFrame) -> dict:
-        """Detect support/resistance test with longer momentum and breakout evidence.
-
-        Rules:
-        - At resistance + bullish momentum + breakout evidence at day high → breakout_potential (LONG)
-        - At resistance without breakout evidence or with bearish momentum → resistance_test (SHORT)
-        - At support + bearish momentum + breakdown evidence at day low → breakdown_potential (SHORT)
-        - At support without breakdown evidence or with bullish momentum → support_test (LONG)
+    def detect_patterns(self, df: pd.DataFrame) -> Dict[str, object]:
         """
-        if len(df) < 20:
-            return {'detected': False}
+        Detect actionable TA‑Lib candlestick patterns (and custom) on the last bar.
+        Returns: {'name': str, 'signal': 'LONG'|'SHORT'|'NEUTRAL', 'confidence': int}
+        High-visibility INFO logs name the recognized pattern for users.
+        """
+        # NaN/Inf safe frame
+        if df is None or df.empty or len(df) < 2:
+            return {'name': 'NONE', 'signal': 'NEUTRAL', 'confidence': 0}
 
-        window = df.tail(20).copy()
-        recent_high = float(window['high'].max())
-        recent_low = float(window['low'].min())
-        current = float(df['close'].iloc[-1])
+        data = df.replace([np.nan, np.inf, -np.inf], 0.0)
 
-        # Proximity thresholds
-        tol_res = 0.001
-        tol_sup = 0.001
-        near_resistance = (recent_high > 0) and (abs(current - recent_high) / recent_high < tol_res)
-        near_support = (recent_low > 0) and (abs(current - recent_low) / recent_low < tol_sup)
+        # 1) TA‑Lib patterns
+        merged: Dict[str, int] = {}
+        if self._enable_talib and _HAS_TALIB and self._names:
+            raw = self._detect_talib_scores(data.tail(50), self._names)
+            merged.update(raw)
 
-        # Momentum: 20-bar slope + RSI(14)
-        closes_short = df['close'].tail(12).astype(float).values
-        closes_long = df['close'].tail(20).astype(float).values
+        # 2) Custom Tweezer Top/Bottom (TA‑Lib doesn’t provide these)
+        if self._enable_tw:
+            tw = self._detect_tweezer(data, self._tw_tol_bps)  # {'TWEEZER_TOP': -1, 'TWEEZER_BOTTOM': +1}
+            for k, v in tw.items():
+                merged[k] = int(v * 100)  # scale to ±100 so min_strength applies uniformly
+
+        # 3) Optional rounding top/bottom proxy (noisy on 5m; disabled by default)
+        if self._enable_round:
+            rnd = self._detect_rounding(data, self._round_win)  # {'ROUNDING_TOP':1} or {'ROUNDING_BOTTOM':1}
+            for k, v in rnd.items():
+                merged[k] = int(v * 100)
+
+        # Pick top pattern by |score| ≥ min_strength
+        top_name, top_val = self._select_top(merged, self._min_strength)
+        if not top_name:
+            # If nothing strong, still surface a Spinning Top if it’s pronounced (indecision/veto)
+            st = merged.get("CDLSPINNINGTOP", 0)
+            if abs(int(st)) >= self._min_strength:
+                logger.info("[PATTERN] Indecision: CDLSPINNINGTOP (%+d) — veto in compression", int(st))
+                logger.info("continue logging")
+        
+            return {'name': 'NONE', 'signal': 'NEUTRAL', 'confidence': 0}
+
+        # Map sign to LONG/SHORT, compute a confidence 60–90 band
+        direction = 'LONG' if top_val > 0 else 'SHORT' if top_val < 0 else 'NEUTRAL'
+        conf = int(min(90, 60 + min(100, abs(int(top_val))) * 0.2))
+
+        # High-visibility INFO for users
+        if top_name == "CDLSPINNINGTOP":
+            logger.info("[PATTERN] Indecision: %s (%+d) — veto in compression", top_name, int(top_val))
+            logger.info("continue logging")
+        else:
+            logger.info("[PATTERN] Recognized: %s (%+d) | dir=%s",
+                        top_name, int(top_val), "BULLISH" if direction == 'LONG' else "BEARISH")
+            logger.info("continue logging")
+
+        # Log custom tweezer specifically (user-friendly naming)
+        if top_name in ("TWEEZER_TOP", "TWEEZER_BOTTOM"):
+            logger.info("[PATTERN] Tweezer detected: %s → %s", top_name,
+                        "bearish" if top_name.endswith("TOP") else "bullish")
+            logger.info("continue logging")
+
+        return {'name': top_name, 'signal': direction, 'confidence': conf}
+
+    # ===== Internals =====
+
+    def _detect_talib_scores(self, df: pd.DataFrame, names: List[str]) -> Dict[str, int]:
+        if not _HAS_TALIB or df is None or df.empty:
+            return {}
+        o = _np_series(df["open"])
+        h = _np_series(df["high"])
+        l = _np_series(df["low"])
+        c = _np_series(df["close"])
+        out: Dict[str, int] = {}
+        for name in names:
+            func = TA_PATTERNS.get(name)
+            if func is None:
+                continue
+            try:
+                
+                v = func(o, h, l, c)
+                last = v[-1] if v is not None and len(v) else 0
+                val = int(last) if np.isfinite(last) else 0
+                out[name] = val
+
+            except Exception as e:
+                logger.debug("[PATTERN] TA‑Lib %s failed: %s", name, e)
+        return out
+
+    def _select_top(self, scores: Dict[str, int], min_strength: int) -> Tuple[Optional[str], int]:
+        top_name, top_val = None, 0
+        for k, v in (scores or {}).items():
+            vi = int(v)
+            if abs(vi) >= int(min_strength) and abs(vi) > abs(int(top_val)):
+                top_name, top_val = k, vi
+        return top_name, int(top_val)
+
+    def _detect_tweezer(self, df: pd.DataFrame, tol_bps: float) -> Dict[str, int]:
+        """
+        Tweezer Top/Bottom:
+          - Top: highs of last 2 candles within tolerance → bearish bias (-1)
+          - Bottom: lows of last 2 candles within tolerance → bullish bias (+1)
+        """
+        out = {}
+        if df is None or len(df) < 2:
+            return out
+        last2 = df.tail(2)
+        h1, h2 = float(last2["high"].iloc[-2]), float(last2["high"].iloc[-1])
+        l1, l2 = float(last2["low"].iloc[-2]), float(last2["low"].iloc[-1])
+        if not (np.isfinite(h1) and np.isfinite(h2) and np.isfinite(l1) and np.isfinite(l2)):
+            return out
+        px = float(last2["close"].iloc[-1]) or 1.0
+        tol = abs(px) * (tol_bps / 10_000.0)
+        if abs(h1 - h2) <= tol:
+            out["TWEEZER_TOP"] = -1
+        if abs(l1 - l2) <= tol:
+            out["TWEEZER_BOTTOM"] = +1
+        return out
+
+    def _detect_rounding(self, df: pd.DataFrame, window: int) -> Dict[str, int]:
+        """
+        Lightweight rounding proxy via quadratic curvature sign over `window` bars.
+        (Noisy on 5m; disabled by default in config.)
+        """
+        out = {}
+        if df is None or len(df) < window:
+            return out
+        closes = _np_series(df["close"])[-window:]
+        x = np.arange(window, dtype=float)
         try:
-            x_short = np.arange(len(closes_short))
-            x_long = np.arange(len(closes_long))
-            slope_short = float(np.polyfit(x_short, closes_short, 1)[0])
-            slope_long = float(np.polyfit(x_long, closes_long, 1)[0])
-        except Exception:
-            slope_short, slope_long = 0.0, 0.0
-
-        try:
-            delta14 = pd.Series(df['close'].tail(30).astype(float).values).diff()
-            gain14 = delta14.clip(lower=0).rolling(14).mean()
-            loss14 = (-delta14.clip(upper=0)).rolling(14).mean().replace(0, 1e-10)
-            rs14 = (gain14 / loss14).fillna(0)
-            rsi14 = float((100 - (100 / (1 + rs14))).iloc[-1])
-        except Exception:
-            rsi14 = 50.0
-
-        # Recent pressure
-        recent = df.tail(2)
-        recent_green = int((recent['close'] > recent['open']).sum())
-        recent_red = 2 - recent_green
-
-        # Momentum decision (longer horizon)
-        bullish_mom = ((slope_long > 0 and rsi14 > 50) or (recent_green >= 2))
-        bearish_mom = ((slope_long < 0 and rsi14 < 50) or (recent_red >= 2))
-
-        # Day high/low context
-        try:
-            day_mask = df.index.date == df.index[-1].date()
-            day_high = float(df.loc[day_mask, 'high'].max())
-            day_low = float(df.loc[day_mask, 'low'].min())
-        except Exception:
-            day_high, day_low = recent_high, recent_low
-
-        # Breakout evidence thresholds
-        breakout_buf = 0.0005  # 0.05%
-        last_close = float(df['close'].iloc[-1])
-        last_high = float(df['high'].iloc[-1])
-        breakout_evidence = (
-            (last_close > recent_high * (1 + breakout_buf) or last_high > recent_high * (1 + breakout_buf))
-            and slope_long > 0 and rsi14 >= 55
-        )
-
-        logger.debug(
-            f"SR ctx → cur={current:.2f}, H20={recent_high:.2f}, L20={recent_low:.2f}, "
-            f"dayH={day_high:.2f}, dayL={day_low:.2f}, near_res={near_resistance}, near_sup={near_support}, "
-            f"slope_short={slope_short:.5f}, slope_long={slope_long:.5f}, RSI14={rsi14:.1f}, "
-            f"breakout_ev={breakout_evidence}"
-        )
-
-        if near_resistance:
-            if bullish_mom and breakout_evidence and abs(day_high - recent_high) / max(1.0, recent_high) < 0.002:
-                logger.info("SR: Resistance + bullish momentum + breakout evidence at day high → breakout_potential (LONG)")
-                return {
-                    'detected': True, 'name': 'breakout_potential', 'signal': 'LONG',
-                    'confidence': 80, 'level': recent_high, 'slope_long': slope_long, 'rsi14': rsi14
-                }
-            else:
-                logger.info("SR: Resistance without breakout evidence → resistance_test (SHORT)")
-                return {
-                    'detected': True, 'name': 'resistance_test', 'signal': 'SHORT',
-                    'confidence': 75, 'level': recent_high, 'slope_long': slope_long, 'rsi14': rsi14
-                }
-
-        if near_support:
-            breakdown_evidence = (
-                (last_close < recent_low * (1 - breakout_buf) or float(df['low'].iloc[-1]) < recent_low * (1 - breakout_buf))
-                and slope_long < 0 and rsi14 <= 45
-            )
-            if bearish_mom and breakdown_evidence and abs(day_low - recent_low) / max(1.0, recent_low) < 0.002:
-                logger.info("SR: Support + bearish momentum + breakdown evidence at day low → breakdown_potential (SHORT)")
-                return {
-                    'detected': True, 'name': 'breakdown_potential', 'signal': 'SHORT',
-                    'confidence': 80, 'level': recent_low, 'slope_long': slope_long, 'rsi14': rsi14
-                }
-            else:
-                logger.info("SR: Support without breakdown evidence → support_test (LONG)")
-                return {
-                    'detected': True, 'name': 'support_test', 'signal': 'LONG',
-                    'confidence': 75, 'level': recent_low, 'slope_long': slope_long, 'rsi14': rsi14
-                }
-
-        return {'detected': False}
-
-
-    
-    def _detect_exhaustion(self, df: pd.DataFrame) -> dict:
-        """Detect exhaustion after strong move."""
-        if len(df) < 5:
-            return {'detected': False}
-        
-        # Check for extended move
-        move_5_candles = (df['close'].iloc[-1] - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100
-        
-        # Check for declining momentum
-        last_candle_range = df['high'].iloc[-1] - df['low'].iloc[-1]
-        prev_candle_range = df['high'].iloc[-2] - df['low'].iloc[-2]
-        
-        if abs(move_5_candles) > 0.3 and last_candle_range < prev_candle_range * 0.5:
-            return {
-                'detected': True,
-                'name': 'exhaustion',
-                'signal': 'SHORT' if move_5_candles > 0 else 'LONG',
-                'confidence': 75,
-                'move': move_5_candles
-            }
-        
-        return {'detected': False}
-
+            a, b, c = np.polyfit(x, closes, 2)
+            if np.isfinite(a):
+                if a < 0:
+                    out["ROUNDING_TOP"] = 1
+                elif a > 0:
+                    out["ROUNDING_BOTTOM"] = 1
+        except Exception as e:
+            logger.debug("[PATTERN] Rounding fit failed: %s", e)
+        return out
 
 class ResistanceDetector:
     """Detects dynamic support and resistance levels from live data."""
@@ -348,24 +260,28 @@ class ResistanceDetector:
             round(current_price / 25) * 25      # Nearest 25
         ]
         
-        for level in round_levels:
-            if abs(current_price - level) / current_price < 0.01:  # Within 1%
+
+        for level in round_levels: 
+            denom = max(abs(float(current_price)), 1e-9)
+            # protect against division by zero 
+            if abs(current_price - level) / denom < 0.01:  # Within 1%
+                
                 if level > current_price:
                     levels['moderate_resistance'].append(level)
                 else:
                     levels['moderate_support'].append(level)
-        
+                            
         # Clean and sort
         for key in levels:
             levels[key] = sorted(list(set(levels[key])))
         
         # Find nearest levels
-        nearest_resistance = min(levels['strong_resistance'] + levels['moderate_resistance'], 
-                               default=current_price + 100, 
-                               key=lambda x: abs(x - current_price) if x > current_price else float('inf'))
-        nearest_support = max(levels['strong_support'] + levels['moderate_support'],
-                            default=current_price - 100,
-                            key=lambda x: abs(x - current_price) if x < current_price else float('-inf'))
+
+        upside = [x for x in (levels['strong_resistance'] + levels['moderate_resistance']) if x > current_price]
+        downside = [x for x in (levels['strong_support'] + levels['moderate_support']) if x < current_price]
+        nearest_resistance = min(upside, default=current_price + 100, key=lambda x: abs(x - current_price))
+        nearest_support = max(downside, default=current_price - 100, key=lambda x: abs(x - current_price))
+
         
         return {
             'levels': levels,
