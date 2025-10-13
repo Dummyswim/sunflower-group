@@ -63,12 +63,25 @@ class EnhancedWebSocketHandler:
         self.current_period_volume = 0
         self.synthetic_volume_base = 1000  # Base synthetic volume
         
+
+        self.current_oi = None
+        self._last_candle_oi = None
+        logger.debug("OI tracking initialized: current_oi=None, _last_candle_oi=None")
+
         
         # Callbacks 
         self.on_tick = None 
         self.on_candle = None 
         self.on_error = None 
         self.on_preclose = None # NEW: pre-close analysis callback
+        
+        # Microstructure buffers (last ~60–120s)
+        from collections import deque
+        self._micro_ticks = deque(maxlen=400)
+        self._micro_last_snapshot = {}
+        logger.debug("Microstructure buffers initialized")
+
+
         
         # Statistics
         self.packet_stats = {packet_type: 0 for packet_type in self.PACKET_TYPES.values()}
@@ -81,6 +94,15 @@ class EnhancedWebSocketHandler:
         self.boundary_task = None
         self.data_watchdog_task = None
         self._last_subscribe_time = None
+
+
+        # Optional checksum validation (disabled by default)
+        self.enable_packet_checksum_validation = bool(getattr(self.config, 'enable_packet_checksum_validation', False))
+        self._checksum_warned = False
+        self._checksum_mismatch_count = 0
+        logger.debug(f"Checksum validation enabled: {self.enable_packet_checksum_validation}")
+        
+
 
 
 
@@ -117,6 +139,21 @@ class EnhancedWebSocketHandler:
 
     
     
+    def get_ticks_between(self, start_ts, end_ts) -> list:
+        """Return a list of tick dicts with timestamps in [start_ts, end_ts)."""
+        try:
+            if not self.tick_buffer:
+                return []
+            out = [t for t in self.tick_buffer if t.get('timestamp') and (start_ts <= t['timestamp'] < end_ts)]
+            logger.info("[TICKS] window %s→%s count=%d", start_ts.strftime('%H:%M:%S'), end_ts.strftime('%H:%M:%S'), len(out))
+            
+            return out
+        except Exception as e:
+            logger.debug(f"get_ticks_between error: {e}")
+            return []
+
+
+
 
     def _assemble_candle(self, start_time: datetime, ticks: List[Dict]) -> pd.DataFrame: 
         """Build an OHLCV candle from accumulated ticks for this bucket.""" 
@@ -135,6 +172,25 @@ class EnhancedWebSocketHandler:
                 volatility = (price_range / close) * 100 if close > 0 else 0
                 candle_volume = 5000 + int(volatility * 10000) + len(ticks) * 100
 
+
+            # OI integration (safe defaults)
+            try:
+                oi_val = int(self.current_oi) if isinstance(self.current_oi, (int, float)) else int(self._last_candle_oi) if self._last_candle_oi is not None else 0
+            except Exception:
+                oi_val = 0
+
+            try:
+                prev_oi = int(self.candle_data['oi'].iloc[-1]) if ('oi' in self.candle_data.columns and not self.candle_data.empty) else oi_val
+            except Exception:
+                prev_oi = oi_val
+
+            oi_change = int(oi_val - prev_oi)
+            denom = abs(prev_oi) if prev_oi != 0 else 1
+            oi_change_pct = float((oi_change / denom) * 100.0)
+
+            logger.info(f"[CANDLE-PREVIEW] OI={oi_val} ΔOI={oi_change} ({oi_change_pct:.2f}%)")
+            
+
             return pd.DataFrame([{
                 'timestamp': start_time,
                 'open': open_price,
@@ -142,8 +198,13 @@ class EnhancedWebSocketHandler:
                 'low': low,
                 'close': close,
                 'volume': candle_volume,
-                'tick_count': len(ticks)
+                'tick_count': len(ticks),
+                'oi': oi_val,
+                'oi_change': oi_change,
+                'oi_change_pct': oi_change_pct
             }]).set_index('timestamp')
+
+
         except Exception as e:
             logger.debug(f"_assemble_candle error: {e}")
             return pd.DataFrame()
@@ -224,6 +285,14 @@ class EnhancedWebSocketHandler:
         while self.running: 
             try: 
                 await asyncio.sleep(1.0) 
+                # Add max iteration counter for safety:
+                iteration_count = getattr(self, '_boundary_iterations', 0)
+                if iteration_count > 86400:  # 24 hours max
+                    logger.warning("Boundary loop max iterations reached, resetting")
+                    self._boundary_iterations = 0
+                else:
+                    self._boundary_iterations = iteration_count + 1
+                                    
                 # Check every second
                 now_ts = datetime.now(IST) 
                 start = self.current_candle.get('start_time')
@@ -233,27 +302,80 @@ class EnhancedWebSocketHandler:
                     logger.debug(f"Boundary loop alive at {now_ts.strftime('%H:%M:%S')}")
 
                 # Always check boundary close each second
+
                 if start and self.current_candle.get('ticks'):
                     close_time = start + timedelta(seconds=self.config.candle_interval_seconds)
                     if now_ts >= close_time and not self._bucket_closed:
+                        # Optional finalize buffer to let broker/resample settle
+                        buf = int(getattr(self.config, 'preclose_completion_buffer_sec', 1))
+                        if buf > 0 and (now_ts - close_time).total_seconds() < (buf + 5):
+                            logger.info("[PRECLOSE] Finalize buffer: sleeping %ds before closing bucket", buf)
+                            
+                            await asyncio.sleep(buf)
 
                         logger.info("=" * 60)
                         logger.info("⏱️ Boundary close %s→%s — creating candle & dispatching callbacks",
                                     start.strftime('%H:%M:%S'), close_time.strftime('%H:%M:%S'))
                         logger.info("=" * 60)
 
-                        
                         await self._create_candle(start, self.current_candle['ticks'])
                         self._bucket_closed = True
 
-                          
-                            
-                            
-                    
+
+
                         
             except Exception as e: 
                 logger.error(f"Boundary close loop error: {e}", exc_info=True) 
                 await asyncio.sleep(1.0)
+
+
+
+
+    def get_micro_features(self) -> Dict[str, float]:
+        """ Compute microstructure features over last ~60–120s: imbalance, slope, stdΔ, vwap drift.
+        Returns a dict; NaN/Inf-safe. High-visibility log on each call.
+        """
+        out = {'imbalance': 0.0, 'slope': 0.0, 'std_dltp': 0.0, 'vwap_drift_pct': 0.0, 'n': 0}
+        try:
+            if not self._micro_ticks:
+                return out
+            ts, px = zip(*list(self._micro_ticks))
+            n = len(px); out['n'] = n
+            px_arr = np.asarray(px, dtype=float)
+            d = np.diff(px_arr)
+            out['std_dltp'] = float(np.nan_to_num(np.std(d))) if len(d) > 0 else 0.0
+            ups = int(np.sum(d > 0)) if len(d) > 0 else 0
+            dns = int(np.sum(d < 0)) if len(d) > 0 else 0
+            total = ups + dns
+            out['imbalance'] = float((ups - dns) / max(1, total)) if total > 0 else 0.0
+            try:
+                x = np.arange(n, dtype=float)
+                x = (x - x.mean()) / max(1e-9, x.std())
+                y = (px_arr - px_arr.mean()) / max(1e-9, px_arr.std())
+                beta = float(np.dot(x, y) / max(1e-9, np.dot(x, x)))
+                out['slope'] = beta
+            except Exception:
+                out['slope'] = 0.0
+            try:
+                vwap = float(np.mean(px_arr)); last = float(px_arr[-1])
+                out['vwap_drift_pct'] = float(((last - vwap) / max(1e-9, vwap)) * 100.0)
+            except Exception:
+                out['vwap_drift_pct'] = 0.0
+            self._micro_last_snapshot = dict(out)
+            logger.info("[MICRO] n=%d | imb=%.2f | slope=%.3f | stdΔ=%.5f | drift=%.3f%%",
+                        out['n'], out['imbalance'], out['slope'], out['std_dltp'], out['vwap_drift_pct'])
+            
+        except Exception as e:
+            logger.debug(f"[MICRO] snapshot error: {e}")
+        return out
+
+
+
+
+
+
+
+
 
 
         
@@ -436,6 +558,22 @@ class EnhancedWebSocketHandler:
         if len(data) < 16:
             return None
         
+
+        # Optional packet integrity check (best-effort only; never drop packet)
+        if getattr(self, 'enable_packet_checksum_validation', False):
+            try:
+                computed = (sum(data[:15]) & 0xFF)
+                claimed = data[15]
+                if computed != claimed:
+                    self._checksum_mismatch_count += 1
+                    if not self._checksum_warned or (self._checksum_mismatch_count % 100 == 0):
+                        logger.warning(f"[Ticker] Checksum mismatch (computed={computed}, claimed={claimed}) — proceeding without drop")
+                        
+                        self._checksum_warned = True
+                    # Proceed with parsing regardless of mismatch
+            except Exception as _e:
+                logger.debug(f"[Ticker] Checksum validation skipped: {_e}")
+
         try:
             # Parse header (bytes 0-7)
             response_code = data[0]
@@ -695,6 +833,15 @@ class EnhancedWebSocketHandler:
 
 
             self.packet_stats['full'] += 1
+
+
+            try:
+                self.current_oi = int(oi)
+                logger.debug(f"[OI] Updated from FULL packet: {self.current_oi}")
+            except Exception:
+                logger.debug("[OI] FULL packet OI update skipped (cast error)")
+
+
             
             logger.info(f"Full packet: LTP={ltp:.2f}, Volume={volume:,} (synthetic), "
                        f"OI={oi}, Depth levels=5")
@@ -735,11 +882,21 @@ class EnhancedWebSocketHandler:
             
             # Log volume updates periodically
             if self.tick_count % 20 == 0:
-                logger.info(f"Tick #{self.tick_count}: Type={tick_data.get('packet_type')}, "
+                logger.debug(f"Tick #{self.tick_count}: Type={tick_data.get('packet_type')}, "
                            f"LTP={tick_data.get('ltp', 0):.2f}, Volume={volume:,}")
             
             # Add to buffer
             self.tick_buffer.append(tick_data)
+            
+            # Microstructure tracking
+            try:
+                self._micro_ticks.append((tick_data['timestamp'], float(tick_data.get('ltp', 0.0))))
+                if len(self._micro_ticks) % 50 == 0:
+                    logger.debug(f"[MICRO] buffer_len={len(self._micro_ticks)}")
+            except Exception as e:
+                logger.debug(f"[MICRO] append error: {e}")
+
+            
             if len(self.tick_buffer) > self.config.max_buffer_size:
                 self.tick_buffer.pop(0)
             
@@ -870,6 +1027,23 @@ class EnhancedWebSocketHandler:
             # Label candle by START time for real-time context
             interval_min = max(1, self.config.candle_interval_seconds // 60) 
             candle_start = timestamp 
+            
+
+            # OI integration for closed candle (safe defaults)
+            try:
+                oi_val = int(self.current_oi) if isinstance(self.current_oi, (int, float)) else int(self._last_candle_oi) if self._last_candle_oi is not None else 0
+            except Exception:
+                oi_val = 0
+
+            try:
+                prev_oi = int(self.candle_data['oi'].iloc[-1]) if ('oi' in self.candle_data.columns and not self.candle_data.empty) else oi_val
+            except Exception:
+                prev_oi = oi_val
+
+            oi_change = int(oi_val - prev_oi)
+            denom = abs(prev_oi) if prev_oi != 0 else 1
+            oi_change_pct = float((oi_change / denom) * 100.0)
+
             candle = pd.DataFrame([{
                 'timestamp': candle_start,  # Use start time for immediate context
                 'open': open_price,
@@ -877,9 +1051,14 @@ class EnhancedWebSocketHandler:
                 'low': low,
                 'close': close,
                 'volume': candle_volume,
-                'tick_count': len(ticks)
+                'tick_count': len(ticks),
+                'oi': oi_val,
+                'oi_change': oi_change,
+                'oi_change_pct': oi_change_pct
             }]).set_index('timestamp')
 
+            logger.info(f"[CANDLE] {candle_start.strftime('%H:%M:%S')} OI={oi_val} ΔOI={oi_change} ({oi_change_pct:.2f}%)")
+        
 
             # Update logging to show both times
             candle_end = candle_start + timedelta(minutes=interval_min)
@@ -895,7 +1074,15 @@ class EnhancedWebSocketHandler:
                 self.candle_data = pd.concat([self.candle_data, candle])
                 self.candle_data = self.candle_data.tail(self.config.max_candles_stored)
             
+
+            try:
+                self._last_candle_oi = oi_val
+                logger.debug(f"[OI] _last_candle_oi set → {self._last_candle_oi}")
+            except Exception:
+                logger.debug("[OI] _last_candle_oi set skipped")
+
             
+  
             self._bucket_closed = True
             
             # Trigger candle callback
@@ -1181,6 +1368,14 @@ class EnhancedWebSocketHandler:
                 oi = struct.unpack('<I', data[8:12])[0]
                 
                 self.packet_stats['oi'] = self.packet_stats.get('oi', 0) + 1
+               
+                try:
+                    self.current_oi = int(oi)
+                    logger.debug(f"[OI] Updated from OI packet: {self.current_oi}")
+                except Exception:
+                    logger.debug("[OI] OI packet update skipped (cast error)")
+                
+
                 
                 return {
                     "packet_type": "oi",
@@ -1336,6 +1531,15 @@ class EnhancedWebSocketHandler:
                     volume_change = volume - self.last_cumulative_volume
                     self.current_period_volume += volume_change
                     self.last_cumulative_volume = volume
+
+
+            try:
+                self.current_oi = int(oi)
+                logger.debug(f"[OI] Updated from EQUITY_FULL_44: {self.current_oi}")
+            except Exception:
+                logger.debug("[OI] EQUITY_FULL_44 OI update skipped (cast error)")
+
+
             
             logger.info(f"Equity Full: LTP={ltp:.2f}, Volume={volume:,}, OI={oi:,}")
             

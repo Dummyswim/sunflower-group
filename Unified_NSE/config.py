@@ -193,14 +193,14 @@ class UnifiedTradingConfig:
 
     indicator_weights: Dict[str, float] = field(default_factory=lambda: {
         # Leading indicators (predict)
-        "rsi": 0.17,
-        "macd": 0.26,       # +0.02 (momentum)
-        "bollinger": 0.10,  # −0.05 (reduce over-penalizing continuation)
-        
+        "rsi": 0.17,      # 17%
+        "macd": 0.26,     # 26% 
+        "bollinger": 0.10, # 10%        
         # Lagging/confirm
-        "ema": 0.19,        # +0.05 (trend structure)
-        "supertrend": 0.18, # −0.02 (less lag weight)
-        "keltner": 0.10
+
+        "ema": 0.19,      # 19%
+        "supertrend": 0.18, # 18%
+        "keltner": 0.10   # 10%        
     })
 
     # ============== INDICATOR GROUPS ==============
@@ -272,7 +272,7 @@ class UnifiedTradingConfig:
     # Risk tapering for burst momentum setups
     enable_rr_taper: bool = True
     rr_taper_floor: float = 0.80           # min R:R for high-confidence bursts
-    rr_taper_confidence_min: float = 0.75  # only taper when conf >= 75%
+    rr_taper_confidence_min: float = 75.0 # only taper when conf >= 75%
     rr_taper_burst_strength: float = 0.30  # |weighted_score| >= 0.30 defines 'burst'
 
     # ATR settings for volatility-scaled SL/TP
@@ -315,9 +315,19 @@ class UnifiedTradingConfig:
     mtf_rsi_extreme_sell: float = 25.0
 
 
+    enable_packet_checksum_validation: bool = False
     
     # Pre-close alerts (analyze about-to-close bar before boundary) 
     preclose_lead_seconds: int = 15 # analyze N seconds before close (min 5s)
+    
+    # Pre-close finalize buffer (reduce broker/resample mismatch)
+    preclose_completion_buffer_sec: int = 1
+
+    # Hit-rate JSONL rotation
+    hitrate_base_path: str = "logs/hitrate"
+    hitrate_rotate_daily: bool = True
+    hitrate_keep_days: int = 60
+    hitrate_symlink_latest: bool = True
     
         
     # Candlestick pattern layer (TA-Lib-backed)
@@ -374,6 +384,36 @@ class UnifiedTradingConfig:
     session_ranging_strength_delta: float = 0.02
 
 
+
+    # OI/PCR integration flags (bounded, confirmation-only)
+    enable_oi_integration: bool = True
+    oi_context_boost: float = 0.03  # tiny confirmation bump
+    oi_min_change_pct: float = 0.10  # only act when |ΔOI%| >= 0.10
+
+    # Supply/Demand (S/D) lightweight integration (confirmation-only)
+    enable_supply_demand_integration: bool = True
+    sd_zone_distance_bps: float = 8.0  # within 0.08% of price is "at zone"
+    sd_context_boost: float = 0.03  # tiny confirmation nudge
+
+    # Pattern location-quality
+    enable_pattern_location_quality: bool = True
+
+
+    # ============== 1m NEXT-MINUTE ENGINE (evaluation-first) ==============
+    enable_next_minute_engine: bool = True
+    next_minute_predict_second: int = 50   # :50 predict
+    next_minute_resolve_second: int = 10   # :10 resolve previous minute
+    next_minute_optional_alerts: bool = False  # alerts OFF by default
+    micro_imbalance_min: float = 0.50
+    micro_slope_min: float = 0.15
+    micro_noise_sigma_mult: float = 1.5
+
+
+    # ==============  Liberal pre-gate thresholds (shadow eval) ==============
+    liberal_min_abs_score: float = 0.05
+    liberal_min_mtf: float = 0.50
+
+
     
     def get_rsi_params(self, timeframe: str) -> Dict:
         """Get RSI parameters for timeframe."""
@@ -423,6 +463,26 @@ class UnifiedTradingConfig:
                 return False
             
 
+            # Add these validations:
+            if not (0.0 <= self.weak_mtf_band_extra_penalty <= 0.1):
+                logger.error(f"Invalid weak_mtf_band_extra_penalty: {self.weak_mtf_band_extra_penalty}")
+                return False
+            
+            if not (5 <= self.preclose_lead_seconds <= 60):
+                logger.error(f"Invalid preclose_lead_seconds: {self.preclose_lead_seconds}")
+                return False
+            
+                        
+            # Validate new parameters
+            new_params = [
+                ('weak_mtf_band_extra_penalty', self.weak_mtf_band_extra_penalty, 0.0, 0.1),
+                ('preclose_lead_seconds', self.preclose_lead_seconds, 5, 60),
+                ('mtf_borderline_conf_penalty', self.mtf_borderline_conf_penalty, 0.0, 50.0),
+            ]
+
+
+
+            
             # Finite checks for critical floats
             crit_pairs = [
                 ('min_signal_strength', self.min_signal_strength),
@@ -430,23 +490,22 @@ class UnifiedTradingConfig:
                 ('preclose_min_mtf_score', self.preclose_min_mtf_score),
                 ('weak_mtf_band_extra_penalty', self.weak_mtf_band_extra_penalty),
             ]
-            for name, val in crit_pairs:
+            for name, value, min_val, max_val in new_params:
                 try:
-                    v = float(val)
+                    v = float(value)
                 except Exception:
-                    logger.error(f"{name} is not numeric: {val}")
+                    logger.error(f"{name} is not numeric: {value}")
                     return False
-                if not math.isfinite(v):
-                    logger.error(f"{name} is NaN/Inf: {val}")
+                if not (min_val <= v <= max_val):
+                    logger.error(f"Invalid {name}: {value} (must be {min_val}-{max_val})")
                     return False
-                        
-                        
-            
+
             # Create required directories (file vs directory safe)
             Path(self.log_file).parent.mkdir(parents=True, exist_ok=True)
             Path(self.chart_save_path).mkdir(parents=True, exist_ok=True)
             Path("data").mkdir(parents=True, exist_ok=True)
 
+            logger.info("[WS] checksum_validation=%s", getattr(self, 'enable_packet_checksum_validation', False))
 
             logger.info("Configuration validated successfully") 
             
@@ -454,7 +513,7 @@ class UnifiedTradingConfig:
             logger.info("[GATE] require_expansion_for_promotion=%s", getattr(self, 'require_expansion_for_promotion', True))
             logger.info("[CFG] preclose_min_mtf_score=%.2f | weak_mtf_band_extra_penalty=%.3f | preclose_lead_seconds=%ds",
                         self.preclose_min_mtf_score, self.weak_mtf_band_extra_penalty, self.preclose_lead_seconds)
-            logger.info("continue logging")
+            
 
             
             logger.info(f"✓ Min Confidence: {self.min_confidence}%") 
@@ -490,7 +549,20 @@ class UnifiedTradingConfig:
                         True, self.enable_talib_patterns, self.pattern_min_strength,
                         self.pattern_as_confirmation_only, self.require_pattern_confirmation)
             logger.info("[PATTERN] list=%s", self.candlestick_patterns)
-            logger.info("continue logging")
+
+            logger.info("[OI] integration=%s | boost=%.3f | min_change_pct=%.2f%%", 
+                        getattr(self, 'enable_oi_integration', True), 
+                        float(getattr(self, 'oi_context_boost', 0.03)), 
+                        float(getattr(self, 'oi_min_change_pct', 0.10)))
+            
+            logger.info("[S/D] integration=%s | dist_bps=%.2f | boost=%.3f", 
+                        getattr(self, 'enable_supply_demand_integration', True), 
+                        float(getattr(self, 'sd_zone_distance_bps', 8.0)), 
+                        float(getattr(self, 'sd_context_boost', 0.03)))
+
+            logger.info("[PRECLOSE] buffer_sec=%d | lead_sec=%d", int(getattr(self, 'preclose_completion_buffer_sec', 1)), int(self.preclose_lead_seconds))
+            logger.info("[HR] rotate_daily=%s | base=%s | keep_days=%d | symlink_latest=%s", getattr(self, 'hitrate_rotate_daily', True), getattr(self, 'hitrate_base_path', 'logs/hitrate'), int(getattr(self, 'hitrate_keep_days', 60)), getattr(self, 'hitrate_symlink_latest', True))
+
 
                         
             return True

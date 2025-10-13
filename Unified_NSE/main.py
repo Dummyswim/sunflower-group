@@ -7,8 +7,6 @@ Enhanced Main Entry Point with Persistent Storage and Multi-Timeframe Support
 """
 import asyncio
 import sys
-import inspect
-import signal
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -67,8 +65,18 @@ class EnhancedUnifiedTradingSystem:
         # Pre-close prepared signals cache 
         self._preview_cache: Dict[datetime, Dict[str, Any]] = {}
 
-        self.hit_tracker = HitRateTracker()
-        logger.info("[HR] Hit-rate tracker initialized (JSONL=logs/hitrate.jsonl)")
+            
+
+        self._nm_task = None
+        self._last_nm_predicted: Optional[datetime] = None
+        self._last_nm_resolved: Optional[datetime] = None
+
+        
+        # self.hit_tracker = HitRateTracker(config=self.config)
+        self.hit_tracker = None
+
+        
+        logger.info("[HR] Hit-rate tracker pending init (awaiting validated config)")
 
                 
         # Tracking
@@ -98,11 +106,25 @@ class EnhancedUnifiedTradingSystem:
             if not self.config.validate():
                 logger.error("Configuration validation failed")
                 return False
+
+            # Initialize hit-rate tracker with validated config (ensures rotation knobs apply)
+            self.hit_tracker = HitRateTracker(config=self.config)
+            logger.info("[HR] Hit-rate tracker initialized: base=%s rotate=%s keep_days=%d symlink=%s", self.config.hitrate_base_path, self.config.hitrate_rotate_daily, self.config.hitrate_keep_days, self.config.hitrate_symlink_latest)
+
             logger.info("✅ Configuration loaded")
             logger.debug(self.config.get_summary())
             
+            # Initialize SetupStats for historical evidence
+            from setup_statistics import SetupStats
+            self.setup_stats = SetupStats(jsonl_base=self.config.hitrate_base_path)
+            self.setup_stats.build()
+            logger.info("[EVIDENCE] Setup tables built: recent=%d keys | long=%d keys", len(self.setup_stats.recent), len(self.setup_stats.long))
+
+            
+            
             # 2. Initialize Persistent Storage Manager (NEW)
             logger.info("[2/9] Initializing persistent storage...")
+
             self.persistence_manager = DataPersistenceManager(self.config)
             if not self.persistence_manager.initialize():
                 logger.error("Failed to initialize persistent storage")
@@ -125,6 +147,19 @@ class EnhancedUnifiedTradingSystem:
             
 
             logger.info("✅ WebSocket handler initialized")
+
+
+            # CHECK IF THIS SECTION IS ADDED CORRECTLY HERE.
+            # Start 1m next-minute loop (evaluation-first)
+            if getattr(self.config, 'enable_next_minute_engine', True):
+                self._nm_task = asyncio.create_task(self._next_minute_loop())
+                logger.info("[NEXT-1m] loop started (predict at :%02d, resolve at :%02d)",
+                            int(self.config.next_minute_predict_second),
+                            int(self.config.next_minute_resolve_second))
+                
+
+
+
 
             # 4. Initialize Telegram bot
             logger.info("[4/9] Initializing Telegram bot...")
@@ -166,6 +201,20 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 self.config, 
                 self.technical_analysis
             )
+            
+
+
+            try:
+                # This assumes self.setup_stats is initialized elsewhere, e.g., self.setup_stats = SetupStats()
+                if hasattr(self, 'setup_stats'):
+                    self.signal_analyzer.setup_stats = self.setup_stats
+                self.signal_analyzer.get_micro_features = getattr(self.websocket_handler, "get_micro_features", None)
+                logger.info("[WIRE] setup_stats and micro_features attached to analyzer")
+            except Exception:
+                pass
+
+
+            
             # Pass pattern detectors to signal analyzer
             self.signal_analyzer.pattern_detector = self.pattern_detector
         
@@ -190,6 +239,175 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             self.stats['errors'] += 1
             return False
     
+    
+    
+    
+    async def _next_minute_loop(self):
+        """Fire 1m prediction at :50, resolve previous at :10. Evaluation-first; alerts OFF."""
+        try:
+            ist = pytz.timezone("Asia/Kolkata")
+            while self.running:
+                await asyncio.sleep(0.2)
+                now = datetime.now(ist)
+                sec = now.second
+                # Predict at :50
+                if sec == int(getattr(self.config, 'next_minute_predict_second', 50)):
+                    await self._predict_next_minute(now)
+                    # avoid double-fire in same second
+                    await asyncio.sleep(1.0)
+                # Resolve at :10 → previous minute window
+                if sec == int(getattr(self.config, 'next_minute_resolve_second', 10)):
+                    await self._resolve_last_minute(now)
+                    await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            logger.debug("[NEXT-1m] loop cancelled")
+        except Exception as e:
+            logger.error(f"[NEXT-1m] loop error: {e}", exc_info=True)
+
+
+
+
+
+
+    async def _predict_next_minute(self, now_ist: datetime):
+        try:
+            # Next minute start boundary
+            next_start = now_ist.replace(second=0, microsecond=0) + timedelta(minutes=1)
+            if self._last_nm_predicted == next_start:
+                return
+            # Micro snapshot
+            micro = {}
+            try:
+                micro = self.websocket_handler.get_micro_features() if self.websocket_handler else {}
+            except Exception:
+                micro = {}
+
+            # Context: latest 5m/15m
+            df_5m = self.persistence_manager.get_data("5m", 100)
+            df_15m = self.persistence_manager.get_data("15m", 60)
+            indicators_5m = await self.technical_analysis.calculate_all_indicators(df_5m)
+            indicators_15m = None
+            if not df_15m.empty:
+                indicators_15m = await self.calculate_15m_indicators(df_15m)
+
+
+            
+
+            # Build a lightweight 5m scorer to compute MTF score BEFORE calling 1m analyzer
+            session_info = self.signal_analyzer.detect_session_characteristics(df_5m)
+            raw = self.signal_analyzer._calculate_weighted_signal(indicators_5m)
+            mtf_score = 0.0
+            try:
+                mtf_aligned, mtf_score, _ = self.signal_analyzer.mtf_analyzer.check_timeframe_alignment(
+                    raw if isinstance(raw, dict) else {},
+                    indicators_15m,
+                    df_15m if indicators_15m is not None else None,
+                    session_info
+                ) if indicators_15m is not None and df_15m is not None else (True, 0.0, "")
+            except Exception:
+                mtf_score = 0.0
+
+            # Now call the 1m analyzer with a real mtf_score and session
+            session = "open" if now_ist.hour*60+now_ist.minute <= 10*60+15 else "mid" if now_ist.hour*60+now_ist.minute < 14*60+30 else "close"
+            nm = self.signal_analyzer.analyze_next_minute(indicators_5m, indicators_15m, micro, mtf_score, session)
+
+            direction = str(nm.get('composite_signal', nm.get('direction', 'NEUTRAL'))).upper()
+
+            
+            
+            
+            
+            
+            logger.info("NEXT -> %s | t+1m=%s | conf=%.1f%%", direction, next_start.strftime('%H:%M'), float(nm.get('confidence',0.0)))
+            
+
+
+            # Build a lightweight 5m-scorer snapshot to fill candidate analytics
+            raw = self.signal_analyzer._calculate_weighted_signal(indicators_5m)
+            # Compute MTF score for heads-up bookkeeping (no gate/alerts)
+            mtf_score = 0.0
+            try:
+                mtf_aligned, mtf_score, _ = self.signal_analyzer.mtf_analyzer.check_timeframe_alignment(
+                    {'composite_signal': direction},
+                    indicators_15m,
+                    df_15m,
+                    self.signal_analyzer.detect_session_characteristics(df_5m)
+                ) if indicators_15m and df_15m is not None else (True, 0.0, "")
+            except Exception:
+                mtf_score = 0.0
+
+
+            # Save evaluation candidate (alerts OFF)
+            cand = Candidate(
+                next_bar_time=next_start,
+                direction=direction,
+                actionable=False,
+                rejection_reason="1m_eval",
+                mtf_score=float(mtf_score),
+                breadth=int(raw.get('active_indicators', 0)),
+                weighted_score=float(raw.get('weighted_score', 0.0)),
+                macd_hist_slope=float(raw.get('contributions', {}).get('macd', {}).get('hist_slope', 0.0)),
+                rsi_value=float(raw.get('contributions', {}).get('rsi', {}).get('rsi_value', 50.0)),
+                rsi_cross_up=bool(raw.get('contributions', {}).get('rsi', {}).get('rsi_cross_up', False)),
+                rsi_cross_down=bool(raw.get('contributions', {}).get('rsi', {}).get('rsi_cross_down', False)),
+                pattern_used=bool(raw.get('contributions', {}).get('pattern_boost_applied', False)),
+                sr_room=str(getattr(self.signal_analyzer.mtf_analyzer, '_last_sr_room', 'UNKNOWN')),
+                regime=str(self.signal_analyzer.detect_session_characteristics(df_5m).get('session', 'UNKNOWN')),
+                confidence=float(nm.get('confidence', 0.0))/100.0,
+                oi_signal=raw.get('contributions', {}).get('oi', {}).get('signal', 'neutral'),
+                oi_change_pct=float(raw.get('contributions', {}).get('oi', {}).get('oi_change_pct', 0.0)),
+                saved_at=datetime.now(),
+                horizon="1m",
+                liberal_direction=None  # not used for 1m
+            )
+            self.hit_tracker.save_candidate(cand)
+            self._last_nm_predicted = next_start
+        except Exception as e:
+            logger.error(f"[NEXT-1m] predict error: {e}", exc_info=True)
+
+
+
+    async def _resolve_last_minute(self, now_ist: datetime):
+        try:
+            # Resolve previous minute (start boundary one minute ago)
+            prev_start = now_ist.replace(second=0, microsecond=0) - timedelta(minutes=1)
+            if self._last_nm_resolved == prev_start:
+                return
+            # Window [prev_start, prev_start+1m)
+            wnd_end = prev_start + timedelta(minutes=1)
+            ticks = []
+            try:
+                ticks = self.websocket_handler.get_ticks_between(prev_start, wnd_end) if self.websocket_handler else []
+            except Exception:
+                ticks = []
+            if not ticks:
+                logger.info("[NEXT-1m] No ticks in window %s→%s; deferring", prev_start.strftime('%H:%M'), wnd_end.strftime('%H:%M'))
+                
+                return
+            prices = [float(t.get('ltp', 0.0)) for t in ticks if 'ltp' in t]
+            if not prices:
+                return
+            open_px = prices[0]
+            close_px = prices[-1]
+            # Use horizon="1m"
+            self.hit_tracker.resolve_bar(prev_start, open_px, close_px, logger, horizon="1m")
+            self._last_nm_resolved = prev_start
+        except Exception as e:
+            logger.error(f"[NEXT-1m] resolve error: {e}", exc_info=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     async def send_predictive_alert(self, signal: Dict, next_candle_start: datetime, df: pd.DataFrame) -> None:
         """Send alert PREDICTING the next candle."""
         try:
@@ -289,6 +507,7 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
     async def on_preclose_predict(self, preview_candle: pd.DataFrame, all_candles: pd.DataFrame) -> None: 
         """Prepare next-candle forecast before the current bar closes.""" 
         try: 
+            liberal_direction = "NEUTRAL"
             if preview_candle is None or preview_candle.empty: 
                 return 
             preview_start = preview_candle.index[0] 
@@ -310,13 +529,16 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             # Build 15m from stored 5m (resample) up to preview close
             df_15m = pd.DataFrame()
             try:
-                if not self.persistence_manager.data_5m.empty:
+                if not self.persistence_manager.data_5m.empty:         
+
                     df_15m_resampled = (
-                        self.persistence_manager.data_5m
+                        self.persistence_manager.data_5m.tail(800)
                         .resample('15min', label='left', closed='left', origin='start_day', offset='15min')
-                        .agg({'open': 'first', 'high':'max','low':'min','close':'last','volume':'sum'})
+                        .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
                         .dropna()
                     )
+          
+                    
                     df_15m_resampled.index = df_15m_resampled.index - pd.Timedelta(minutes=15)
                     df_15m = df_15m_resampled[df_15m_resampled.index <= preview_close].tail(50).copy()
             except Exception as e:
@@ -408,6 +630,14 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                         mtf_score = 0.0
 
 
+
+
+
+
+
+
+
+
                     sr_room = getattr(self.signal_analyzer.mtf_analyzer, '_last_sr_room', 'UNKNOWN')
 
 
@@ -438,11 +668,45 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 pass
 
 
+            try:
+                oi_ctx = contrib.get('oi', {}) or {}
+                cand_oi_signal = str(oi_ctx.get('signal', 'neutral'))
+                cand_oi_chg = float(oi_ctx.get('oi_change_pct', 0.0))
+            except Exception:
+                cand_oi_signal = None
+                cand_oi_chg = 0.0
+            logger.info(f"[Pre-close] OI ctx: {cand_oi_signal} ΔOI%={cand_oi_chg:.2f}")
+
+
+
+            eligible = False
+            try:
+                if signal:
+                    # Evaluate alert-eligibility without actually sending
+                    eligible = await self._should_send_alert(signal)
+                    logger.info("[PRECLOSE] Eligibility (no-send) → %s", eligible)
+
+            except Exception as e:
+                logger.debug(f"[PRECLOSE] Eligibility check skipped: {e}")
+
+
+            # Liberal shadow classification (pre-gate; eval-only)
+            try:
+                lib_abs = float(getattr(self.config, 'liberal_min_abs_score', 0.05))
+                lib_mtf = float(getattr(self.config, 'liberal_min_mtf', 0.50))
+                if abs(float(w_score)) >= lib_abs and float(mtf_score) >= lib_mtf:
+                    liberal_direction = "BUY" if float(w_score) > 0 else "SELL"
+                logger.info("[LIBERAL] shadow=%s | score=%+.3f mtf=%.2f (min |s|=%.2f, mtf>=%.2f)",
+                            liberal_direction, float(w_score), float(mtf_score), lib_abs, lib_mtf)
+                
+            except Exception:
+                liberal_direction = "NEUTRAL"
+
 
             cand = Candidate(
                 next_bar_time=preview_close,
                 direction=direction,
-                actionable=False, # pre-close candidates are calibration only
+                actionable=bool(eligible),
                 rejection_reason=rej,
                 mtf_score=mtf_score,
                 breadth=breadth,
@@ -455,8 +719,15 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 sr_room=sr_room,
                 regime=str(session_info.get('session', 'UNKNOWN')),
                 confidence=float(conf) / 100.0,
-                saved_at=datetime.now()
+                oi_signal=cand_oi_signal,
+                oi_change_pct=cand_oi_chg,
+                saved_at=datetime.now(),
+                horizon="5m",
+                liberal_direction=liberal_direction
             )
+
+
+
             self.hit_tracker.save_candidate(cand)
             logger.info(f"[CAL] Saved pre-close candidate {preview_close.strftime('%H:%M:%S')} "
                         f"{direction} | mtf={mtf_score:.2f} | active={breadth}/6 | "
@@ -478,7 +749,7 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 if signal and getattr(self.config, 'require_expansion_for_promotion', True):
                     if not self._release_ok(signal):
                         logger.info("[Pre-Close] Blocked: release not confirmed (expansion=False)")
-                        logger.info("continue logging")
+                        
                         return
             except Exception:
                 pass
@@ -640,15 +911,52 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
 
             # If a pre-close signal was prepared for this start time, send it immediately 
             preview = self._preview_cache.pop(timestamp, None) 
-            if preview: 
-                logger.info("Using pre-close prepared signal (no extra analysis)") 
-                prepared = preview['signal'] 
-                if await self._should_send_alert(prepared): 
-                    await self.send_alert(prepared, preview['indicators_5m'], preview['df_5m']) 
-                    return 
-                else: 
-                    logger.info("Prepared pre-close signal did not meet alert criteria; proceeding to full analysis")
+            
 
+            if preview:
+                logger.info("Using pre-close prepared signal (no extra analysis)")
+                
+
+                prepared = preview['signal']
+
+                # Recompute final signal on the closed bar to compare with preview
+                try:
+                    indicators_5m_final = await self.technical_analysis.calculate_all_indicators(preview['df_5m'])
+                    # Rebuild a current 15m snapshot
+                    indicators_15m_final = None
+                    try:
+                        df15 = self.persistence_manager.get_data("15m", 50)
+                        if not df15.empty:
+                            indicators_15m_final = await self.calculate_15m_indicators(df15)
+                    except Exception:
+                        indicators_15m_final = None
+
+                    final_sig = await self.signal_analyzer.analyze_and_generate_signal(
+                        indicators_5m_final,
+                        preview['df_5m'],
+                        indicators_15m_final,
+                        df15 if 'df15' in locals() else None
+                    )
+                    # Drift sentinel
+                    try:
+                        self._compare_preview_vs_final(prepared, final_sig)
+                    except Exception as e:
+                        logger.debug(f"[PRECLOSE] Drift compare skipped: {e}")
+                except Exception as e:
+                    logger.debug(f"[PRECLOSE] Final recompute skipped: {e}")
+
+                # If suspended, skip sending preview alerts
+                if getattr(self, "_preclose_suspended", False):
+                    logger.info("[PRE-CLOSE] Suspended for the day due to repeated preview→final drifts")
+                    
+                else:
+                    if await self._should_send_alert(prepared):
+                        await self.send_alert(prepared, preview['indicators_5m'], preview['df_5m'])
+                        return
+                    else:
+                        logger.info("Prepared pre-close signal did not meet alert criteria; proceeding to full analysis")
+
+            
 
             # Update persistent storage for 5-min
             self.persistence_manager.update_candle(candle, "5m")
@@ -672,6 +980,16 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 o = float(df_5m['open'].iloc[-1])
                 c = float(df_5m['close'].iloc[-1])
                 self.hit_tracker.resolve_bar(timestamp, o, c, logger)
+                
+
+                try:
+                    if hasattr(self, 'setup_stats') and self.setup_stats:
+                        self.setup_stats.update_from_tail()
+                        logger.info("[EVIDENCE] Tables refreshed if hitrate files changed")
+                except Exception:
+                    pass
+                
+                
             except Exception as e:
                 logger.debug(f"[HR] resolve_bar error: {e}")
 
@@ -686,11 +1004,14 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
 
                     # Stable NSE quarter-hour bins: include right edge, then shift label to left edge 
                     
-                    df_15m_resampled = ( self.persistence_manager.data_5m 
-                                        .resample('15min', label='left', closed='left', origin='start_day', offset='15min') 
-                                        .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}) 
-                                        .dropna() ) 
                     
+                    df_15m_resampled = (
+                        self.persistence_manager.data_5m.tail(800)
+                        .resample('15min', label='left', closed='left', origin='start_day', offset='15min')
+                        .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
+                        .dropna()
+                    )
+
 
                     # Shift labels to bin start (e.g., 14:30 → 14:15) 
                     df_15m_resampled.index = df_15m_resampled.index - pd.Timedelta(minutes=15) 
@@ -934,13 +1255,33 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                         slope = 0.0
                     rsi_up = bool(contrib.get('rsi', {}).get('rsi_cross_up', False))
                     rsi_dn = bool(contrib.get('rsi', {}).get('rsi_cross_down', False))
+                    
+                    
                     rr_val = float(signal.get('risk_reward', 0.0))
                     if pd.isna(rr_val) or np.isinf(rr_val):
                         rr_val = 0.0
-                    rr_ok = rr_val >= max(
-                        self.config.min_risk_reward_floor,
-                        self.config.rr_taper_floor if self.config.enable_rr_taper else self.config.min_risk_reward_floor
-                    )
+                    rr_floor = float(self.config.min_risk_reward_floor)
+                    taper_ok = False
+                    try:
+                        conf = float(signal.get('confidence', 0.0))
+                        mtf_val = float(signal.get('mtf_score', 0.0))
+                        wscore = float(signal.get('weighted_score', 0.0))
+                        contrib = signal.get('contributions', {}) or {}
+                        macd_closed = float(contrib.get('macd', {}).get('hist_slope', 0.0))
+                        if (self.config.enable_rr_taper and
+                            conf >= float(self.config.rr_taper_confidence_min) and
+                            mtf_val >= 0.70 and
+                            abs(wscore) >= float(self.config.rr_taper_burst_strength) and
+                            abs(macd_closed) >= 0.10):
+                            taper_ok = True
+                    except Exception:
+                        taper_ok = False
+                    rr_ok = rr_val >= (float(self.config.rr_taper_floor) if taper_ok else rr_floor)
+                    
+                    
+
+
+
 
                     
                     buy_ok = (cand == 'BUY_CANDIDATE' and mtf >= 0.65 and slope > 0 and rsi_up and rr_ok)
@@ -954,17 +1295,17 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                         exp_ok = self._release_ok(signal)
                         if not exp_ok:
                             logger.info("[PROMOTE] Blocked: expansion release not confirmed")
-                            logger.info("continue logging")
+                            
                             return False
                 except Exception:
                     pass
 
                 if buy_ok or sell_ok:
                     logger.info(f"[PROMOTE] Golden-lane neutral → actionable ({cand}, mtf={mtf:.2f}, slope={slope:+.6f}, rr_ok={rr_ok})")
-                    logger.info("continue logging")
+                    
                     return True
 
-                logger.info("continue logging")
+                
                 return False
 
             
@@ -978,7 +1319,35 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                     if elapsed < self.config.base_cooldown_seconds:
                         return False
             
+            
+            
+            # Extra guard for LIMITED S/R room for ANY alert
+            try:
+                sr_room = str(signal.get('mtf_analysis', {}).get('sr_room', 'UNKNOWN'))
+                if sr_room == 'LIMITED':
+                    mtf = float(signal.get('mtf_score', 0.0))
+                    contrib = signal.get('contributions', {}) or {}
+                    atr = float(contrib.get('atr', {}).get('value', 0.0)) if isinstance(contrib.get('atr'), dict) else 0.0
+                    sd = contrib.get('supply_demand', {}) or {}
+                    up = sd.get('nearest_up'); dn = sd.get('nearest_dn')
+                    price = float(signal.get('price', 0.0) or 0.0)
+                    dist = None
+                    if isinstance(up, (int, float)) and price>0:
+                        dist = abs(float(up)-price)
+                    if isinstance(dn, (int, float)) and price>0:
+                        d2 = abs(price-float(dn)); dist = min(dist, d2) if dist is not None else d2
+                    
+                    if not (mtf >= 0.70 and dist is not None and atr > 0 and dist >= 0.5 * atr):
+                        logger.info("[ALERT] Blocked in LIMITED room: mtf=%.2f, dist=%.2f, atr=%.2f", mtf, dist or -1.0, atr)
+                        return False
+            except Exception:
+                pass
+            
+            
+            
             return True
+        
+        
         except Exception as e:
             logger.error(f"Alert check error: {e}")
             return False
@@ -1054,7 +1423,7 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                             pat.get('name','NONE'), 
                             pat.get('signal','NEUTRAL'), 
                             str(pat.get('confidence','0')))
-                logger.info("continue logging")
+                
             except Exception:
                 pass
 
@@ -1128,6 +1497,36 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                     )
                 except Exception as e:
                     logger.error(f"Chart generation failed: {e}")
+
+
+            # Telemetry: OI context and top pattern (display-only)
+            try:
+                contrib = signal.get('contributions', {}) or {}
+                oi_ctx = contrib.get('oi', {}) or {}
+                pat_top = contrib.get('pattern_top', {}) or {}
+                
+                oi_line = f"• OI: {oi_ctx.get('signal','neutral')} (ΔOI%={float(oi_ctx.get('oi_change_pct', 0.0)):.2f})"
+                pat_line = f"• Pattern: {pat_top.get('name','NONE')} • {pat_top.get('signal','NEUTRAL')} ({int(pat_top.get('confidence',0))}%)"
+                
+                message += f"\n<b>CONTEXT:</b>\n{oi_line}\n{pat_line}\n"
+                
+                logger.info("[ALERT] Context → %s | %s", oi_line, pat_line)
+                
+            except Exception as e:
+                logger.debug(f"[ALERT] OI/pattern telemetry skipped: {e}")
+
+
+            # WHY explainer (guarded): add the human-readable explanation if present
+            try:
+                why = signal.get('why')
+                if why:
+                    message += f"\n<b>WHY:</b>\n{why}\n"
+                    logger.info("[ALERT] WHY → %s", why)
+                    
+            except Exception as e:
+                logger.debug(f"[ALERT] WHY block skipped: {e}")
+
+
 
             # Send alert — capture success and only mark stats/last_alert_time when successful
             send_success = False
@@ -1228,6 +1627,46 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             logger.info(f"[WithdrawWatch] Armed for {window_start.strftime('%H:%M:%S')} - {window_end.strftime('%H:%M:%S')} (predicted window only)")
         except Exception as e:
             logger.debug(f"Withdraw watch arm failed: {e}")
+
+
+
+    def _compare_preview_vs_final(self, preview_sig: Dict[str, Any], final_sig: Optional[Dict[str, Any]]):
+        """Detect preview→final drift; auto-suspend if exceeded K events."""
+        try:
+            if not preview_sig or not final_sig:
+                return
+            prev_side = str(preview_sig.get('composite_signal', 'NEUTRAL')).upper()
+            fin_side = str(final_sig.get('composite_signal', 'NEUTRAL')).upper()
+            prev_conf = float(preview_sig.get('confidence', 0.0))
+            fin_conf = float(final_sig.get('confidence', 0.0))
+            sign_flip = ((('BUY' in prev_side) and ('SELL' in fin_side)) or (('SELL' in prev_side) and ('BUY' in fin_side)))
+            drift_pp = abs(prev_conf - fin_conf)
+            logger.info("[PRECLOSE] Drift check: preview=%s(%.1f%%) → final=%s(%.1f%%) | flip=%s | Δ=%.1f pp",
+                        prev_side, prev_conf, fin_side, fin_conf, sign_flip, drift_pp)
+            
+
+            # Settings from config
+            pp_thresh = float(getattr(self.config, 'preclose_drift_pp', 12.0))
+            k_limit = int(getattr(self.config, 'preclose_drift_cutout_K', 3))
+            if not hasattr(self, "_preclose_drift_events"):
+                self._preclose_drift_events = 0
+            if not hasattr(self, "_preclose_suspended"):
+                self._preclose_suspended = False
+
+            if sign_flip or (drift_pp > pp_thresh):
+                self._preclose_drift_events += 1
+                logger.warning("[PRECLOSE] Drift event #%d (flip=%s, Δ=%.1f pp)",
+                               self._preclose_drift_events, sign_flip, drift_pp)
+                if self._preclose_drift_events >= k_limit:
+                    self._preclose_suspended = True
+                    logger.warning("[PRE-CLOSE SUSPEND] 3+ drift events → suspending pre-close alerts for the session")
+                    
+                    try:
+                        self.telegram_bot.send_message("[PRE-CLOSE SUSPEND] 3+ preview→final drift events. Suspending pre-close alerts today.")
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"[PRECLOSE] Drift detection error: {e}")
 
 
 
@@ -1373,6 +1812,27 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 await self.websocket_handler.disconnect()
             
             logger.info("✅ Enhanced shutdown complete")
+            
+            # CHECK IF THIS SECTION IS ADDED CORRECTLY HERE.   
+            try:
+                if self._nm_task:
+                    self._nm_task.cancel()
+                    try:
+                        await self._nm_task
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            try:
+                # Weekly summary (last 7 days)
+                if hasattr(self, 'setup_stats') and self.setup_stats:
+                    self.setup_stats.weekly_summary(logger, days=7)
+            except Exception:
+                pass
+
+
+
             
         except Exception as e:
             logger.error(f"Shutdown error: {e}")

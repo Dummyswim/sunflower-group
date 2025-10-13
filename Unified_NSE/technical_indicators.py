@@ -100,6 +100,30 @@ class ConsolidatedTechnicalAnalysis:
             logger.error(f"Impulse calculation failed: {e}")
             indicators['impulse'] = self._get_default_impulse()
         
+        try:
+            indicators['atr'] = self._calculate_atr(df, timeframe)
+            logger.info("[ATR] %.2f (period=%d)", indicators['atr'].get('value', 0.0), int(indicators['atr'].get('period', 14)))
+            
+        except Exception as e:
+            logger.error(f"ATR calculation failed: {e}")
+            indicators['atr'] = {'value': 0.0, 'period': 14}
+        
+
+        try:
+            if getattr(self.config, 'enable_oi_integration', True):
+                indicators['oi'] = self._calculate_oi_context(df, timeframe)
+                logger.debug("[OI] context=%s ΔOI%%=%.2f (oi=%s, Δ=%s)", 
+                            indicators['oi'].get('signal', 'neutral'), 
+                            float(indicators['oi'].get('oi_change_pct', 0.0)), 
+                            str(indicators['oi'].get('oi', 0)), 
+                            str(indicators['oi'].get('oi_change', 0)))
+                
+        except Exception as e:
+            logger.error(f"OI context calculation failed: {e}")
+        
+
+        
+        
         # Add current price and volatility
         indicators['price'] = float(df['close'].iloc[-1]) if not df.empty else 0
         indicators['volatility'] = self._calculate_volatility(df, timeframe)
@@ -112,11 +136,32 @@ class ConsolidatedTechnicalAnalysis:
             float(indicators['macd'].get('histogram', 0.0)) if 'macd' in indicators else 0.0,
             indicators['ema'].get('signal', 'NA') if 'ema' in indicators else 'NA',
             f"{indicators['bollinger'].get('bandwidth', 0.0):.2f}" if 'bollinger' in indicators else 'NA')
-        logger.info("continue logging")
+        
 
 
 
         return indicators
+    
+    
+    
+    
+    def _calculate_atr(self, df: pd.DataFrame, timeframe: str = "5m", period: int = 14) -> Dict:
+        """ATR(14) proxy using True Range; NaN/Inf safe."""
+        try:
+            if len(df) < period + 2:
+                return {'value': 0.0, 'period': period}
+            high = pd.to_numeric(df['high'], errors='coerce').replace([np.inf, -np.inf], np.nan)
+            low = pd.to_numeric(df['low'], errors='coerce').replace([np.inf, -np.inf], np.nan)
+            close = pd.to_numeric(df['close'], errors='coerce').replace([np.inf, -np.inf], np.nan)
+            prev_close = close.shift(1)
+            tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1).dropna()
+            atr = tr.rolling(window=period).mean().dropna()
+            val = float(atr.iloc[-1]) if not atr.empty and np.isfinite(atr.iloc[-1]) else 0.0
+            return {'value': val, 'period': period}
+        except Exception:
+            return {'value': 0.0, 'period': period}
+
+
     
     def _calculate_volatility(self, df: pd.DataFrame, timeframe: str = "5m") -> Dict:
         """Calculate price volatility using standard deviation."""
@@ -227,6 +272,7 @@ class ConsolidatedTechnicalAnalysis:
             fallback_used = False
             if len(rsi_series) > 0:
                 last_val = rsi_series[-1]
+                
                 if pd.notna(last_val) and not np.isinf(last_val) and 0 <= last_val <= 100:
                     current_rsi = float(last_val)
                 else:
@@ -390,7 +436,22 @@ class ConsolidatedTechnicalAnalysis:
             if np.isnan(sig_val) or np.isinf(sig_val):
                 sig_val = 0.0
 
-            
+
+
+            hist_slope_closed = 0.0
+            hist_slope_forming = 0.0
+            try:
+                ser = pd.Series(hist).astype(float)
+                # Closed slope: mean of last 3 diffs on closed bars
+                diffs_closed = ser.diff().dropna().tail(3)
+                if len(diffs_closed) >= 1:
+                    hist_slope_closed = float(diffs_closed.mean())
+                # Forming slope: last diff only
+                if len(ser) >= 2:
+                    hist_slope_forming = float(ser.iloc[-1] - ser.iloc[-2])
+            except Exception:
+                pass
+
             return {
                 'macd': macd_val,
                 'signal': sig_val,
@@ -399,8 +460,11 @@ class ConsolidatedTechnicalAnalysis:
                 'crossover': crossover,
                 'macd_series': pd.Series(macd, index=df.index),
                 'signal_series': pd.Series(signal, index=df.index),
-                'histogram_series': pd.Series(hist, index=df.index)
+                'histogram_series': pd.Series(hist, index=df.index),
+                'hist_slope_closed': hist_slope_closed,    # ADD THIS
+                'hist_slope_forming': hist_slope_forming   # ADD THIS
             }
+
         except Exception as e:
             logger.error(f"MACD calculation error: {e}")
             return self._get_default_macd()
@@ -658,6 +722,61 @@ class ConsolidatedTechnicalAnalysis:
             logger.error(f"Impulse MACD calculation error: {e}")
             return self._get_default_impulse()
     
+    
+        
+
+    def _calculate_oi_context(self, df: pd.DataFrame, timeframe: str = "5m") -> Dict:
+        """
+        Compute OI change context from df['oi'] vs price change over last bar.
+        Returns a small, NaN/Inf-safe context indicator.
+        """
+        try:
+            if df is None or df.empty or 'oi' not in df.columns or len(df) < 2:
+                return {'signal': 'neutral', 'oi': 0, 'oi_change': 0, 'oi_change_pct': 0.0}
+            
+            
+            oi2 = pd.to_numeric(df['oi'].tail(2), errors='coerce').ffill().fillna(0).astype(float)
+            px2 = pd.to_numeric(df['close'].tail(2), errors='coerce').ffill().fillna(0).astype(float)
+            
+            if len(oi2) < 2 or len(px2) < 2:
+                return {'signal': 'neutral', 'oi': float(oi2.iloc[-1]) if len(oi2) else 0.0, 'oi_change': 0, 'oi_change_pct': 0.0}
+            
+            oi_now, oi_prev = float(oi2.iloc[-1]), float(oi2.iloc[-2])
+            px_now, px_prev = float(px2.iloc[-1]), float(px2.iloc[-2])
+            
+            oi_change = oi_now - oi_prev
+            denom = abs(oi_prev) if oi_prev != 0 else 1.0
+            oi_change_pct = (oi_change / denom) * 100.0
+            
+            price_up = px_now > px_prev
+            price_down = px_now < px_prev
+            oi_up = oi_change > 0
+            oi_down = oi_change < 0
+
+            # Map to common futures context
+            # Price↑ & OI↑ → Long build-up; Price↓ & OI↑ → Short build-up
+            # Price↑ & OI↓ → Short covering; Price↓ & OI↓ → Long unwinding
+            signal = 'neutral'
+            if price_up and oi_up:
+                signal = 'long_build_up'
+            elif price_up and oi_down:
+                signal = 'short_covering'
+            elif price_down and oi_up:
+                signal = 'short_build_up'
+            elif price_down and oi_down:
+                signal = 'long_unwinding'
+
+            return {
+                'signal': signal,
+                'oi': oi_now,
+                'oi_change': oi_change,
+                'oi_change_pct': oi_change_pct
+            }
+        except Exception:
+            return {'signal': 'neutral', 'oi': 0, 'oi_change': 0, 'oi_change_pct': 0.0}
+
+
+    
     # Default value methods
     def _get_default_indicators(self, df: pd.DataFrame) -> Dict:
         """Return default indicator values when insufficient data."""
@@ -683,17 +802,22 @@ class ConsolidatedTechnicalAnalysis:
             'rsi_series': pd.Series([50])
         }
     
+
+    
     def _get_default_macd(self) -> Dict:
         return {
-            'macd': 0,
-            'signal': 0,
-            'histogram': 0,
+            'macd': 0.0,
+            'signal': 0.0,
+            'histogram': 0.0,
             'signal_type': 'neutral',
             'crossover': None,
-            'macd_series': pd.Series([0]),
-            'signal_series': pd.Series([0]),
-            'histogram_series': pd.Series([0])
+            'macd_series': pd.Series([0.0]),
+            'signal_series': pd.Series([0.0]),
+            'histogram_series': pd.Series([0.0]),
+            'hist_slope_closed': 0.0,
+            'hist_slope_forming': 0.0
         }
+
     
     def _get_default_ema(self) -> Dict:
         return {

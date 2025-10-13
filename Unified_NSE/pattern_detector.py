@@ -106,7 +106,7 @@ class CandlestickPatternDetector:
             st = merged.get("CDLSPINNINGTOP", 0)
             if abs(int(st)) >= self._min_strength:
                 logger.info("[PATTERN] Indecision: CDLSPINNINGTOP (%+d) — veto in compression", int(st))
-                logger.info("continue logging")
+                
         
             return {'name': 'NONE', 'signal': 'NEUTRAL', 'confidence': 0}
 
@@ -117,17 +117,17 @@ class CandlestickPatternDetector:
         # High-visibility INFO for users
         if top_name == "CDLSPINNINGTOP":
             logger.info("[PATTERN] Indecision: %s (%+d) — veto in compression", top_name, int(top_val))
-            logger.info("continue logging")
+            
         else:
             logger.info("[PATTERN] Recognized: %s (%+d) | dir=%s",
                         top_name, int(top_val), "BULLISH" if direction == 'LONG' else "BEARISH")
-            logger.info("continue logging")
+            
 
         # Log custom tweezer specifically (user-friendly naming)
         if top_name in ("TWEEZER_TOP", "TWEEZER_BOTTOM"):
             logger.info("[PATTERN] Tweezer detected: %s → %s", top_name,
                         "bearish" if top_name.endswith("TOP") else "bullish")
-            logger.info("continue logging")
+            
 
         return {'name': top_name, 'signal': direction, 'confidence': conf}
 
@@ -146,11 +146,14 @@ class CandlestickPatternDetector:
             if func is None:
                 continue
             try:
-                
+                                
+                                
                 v = func(o, h, l, c)
                 last = v[-1] if v is not None and len(v) else 0
                 val = int(last) if np.isfinite(last) else 0
                 out[name] = val
+                logger.debug(f"[PATTERN] TA-Lib {name} last={last} → val={val}")
+
 
             except Exception as e:
                 logger.debug("[PATTERN] TA‑Lib %s failed: %s", name, e)

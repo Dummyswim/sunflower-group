@@ -185,9 +185,15 @@ class UnifiedChartGenerator:
         try:
             # Limit to last N candles for clarity
             plot_df = df.tail(self.config.chart_candles_to_show)
-            plot_df = plot_df.replace([np.nan, np.inf, -np.inf], 0) 
+            
+            plot_df = plot_df.replace([np.nan, np.inf, -np.inf], 0).ffill()
 
 
+            # Validate minimum data requirements
+            if len(plot_df) < 5:
+                logger.warning("Insufficient data for chart generation")
+                return
+            
             x = np.arange(len(plot_df))
             
             # Plot candlesticks
