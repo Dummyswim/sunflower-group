@@ -44,7 +44,9 @@ class UnifiedTradingConfig:
     base_cooldown_seconds: int = 30
     min_signal_strength: float = 0.10  # Slightly decreased from 0.30
     min_confidence: float = 50.0  # RAISED FROM 40 to 50
-    min_active_indicators: int = 2  # REDUCED FROM 3 to 2
+    min_active_indicators: int = 4  # INCREASED to 4/6 for all signals
+    min_active_indicators_calibration: int = 2  # Lower for calibration candidates only
+        
     confidence_hard_floor: float = 25.0  # NEW: Hard floor
     
     # Dynamic cooldown factors
@@ -90,6 +92,14 @@ class UnifiedTradingConfig:
 
     # Require more breadth for directional alerts; candidates can use the lower global value
     min_active_indicators_for_alert: int = 4
+
+
+    # Momentum exhaustion detection
+    enable_momentum_exhaustion: bool = True
+    momentum_exhaustion_rsi_threshold: float = 75.0  # Overbought for BUY signals
+    momentum_exhaustion_rsi_low: float = 25.0  # Oversold for SELL signals
+    momentum_exhaustion_macd_bars: int = 3  # Number of bars to check MACD weakening
+    momentum_exhaustion_divergence_check: bool = True
 
 
     # ============== OPTIMIZED RSI PARAMETERS (5m/15m) ==============
@@ -177,28 +187,16 @@ class UnifiedTradingConfig:
         "multiplier": 3.0
     })
     
-    
-    # ============== INDICATOR WEIGHTS (Leading vs Lagging) ==============
-    # indicator_weights: Dict[str, float] = field(default_factory=lambda: {
-    #     # Leading indicators (predict) - 50%
-    #     "rsi": 0.15,        # Leading
-    #     "macd": 0.20,       # Leading
-    #     "bollinger": 0.15,  # Leading
-        
-    #     # Lagging indicators (confirm) - 50%
-    #     "ema": 0.20,        # Lagging
-    #     "supertrend": 0.20, # Lagging
-    #     "keltner": 0.10,    # Mixed
-    # })
+
+
 
     indicator_weights: Dict[str, float] = field(default_factory=lambda: {
-        # Leading indicators (predict)
-        "rsi": 0.17,      # 17%
-        "macd": 0.26,     # 26% 
-        "bollinger": 0.10, # 10%        
+        # Leading indicators (predict) - REBALANCED
+        "rsi": 0.25,      # 25% (INCREASED from 17%)
+        "macd": 0.15,     # 15% (REDUCED from 26%)
+        "bollinger": 0.12, # 12% (slight increase)        
         # Lagging/confirm
-
-        "ema": 0.19,      # 19%
+        "ema": 0.20,      # 20%
         "supertrend": 0.18, # 18%
         "keltner": 0.10   # 10%        
     })
@@ -272,8 +270,12 @@ class UnifiedTradingConfig:
     # Risk tapering for burst momentum setups
     enable_rr_taper: bool = True
     rr_taper_floor: float = 0.80           # min R:R for high-confidence bursts
-    rr_taper_confidence_min: float = 75.0 # only taper when conf >= 75%
+    rr_taper_confidence_min: float = 64.0 # only taper when conf ≥ 64%
     rr_taper_burst_strength: float = 0.30  # |weighted_score| >= 0.30 defines 'burst'
+
+
+    rr_taper_confidence_soft_min: float = 0.64
+    rr_taper_mtf_min_strong: float = 0.70
 
     # ATR settings for volatility-scaled SL/TP
     atr_period: int = 14
@@ -299,6 +301,23 @@ class UnifiedTradingConfig:
     # Logging and release-gate feature flags (high-verbosity until stable)
     verbose_logging: bool = True
     require_expansion_for_promotion: bool = True
+
+
+    # Losing streak protection
+    enable_losing_streak_protection: bool = True
+    losing_streak_threshold: int = 3  # After 3 losses, increase confidence
+    losing_streak_confidence_boost: float = 10.0  # +10% confidence required
+    losing_streak_pause_after: int = 5  # Pause after 5 consecutive losses
+    losing_streak_pause_minutes: int = 30  # Pause duration
+    losing_streak_reset_after_wins: int = 2  # Reset after 2 wins
+
+
+
+    # Regime-adaptive R:R thresholds
+    rr_floor_use_adaptive: bool = True
+    rr_floor_ranging: float = 0.60
+    rr_floor_trending: float = 1.00
+
 
 
     # ============== Dynamic MTF threshold tuning ============== 
@@ -328,6 +347,13 @@ class UnifiedTradingConfig:
     hitrate_rotate_daily: bool = True
     hitrate_keep_days: int = 60
     hitrate_symlink_latest: bool = True
+    
+
+    # Regime-adaptive MTF thresholds
+    mtf_threshold_pullback: float = 0.40  # Lower threshold for pullback entries
+    mtf_threshold_reversal: float = 0.60  # Higher threshold for reversal trades
+    mtf_regime_detection: bool = True  # Enable regime-based threshold switching
+
     
         
     # Candlestick pattern layer (TA-Lib-backed)
@@ -401,18 +427,56 @@ class UnifiedTradingConfig:
 
     # ============== 1m NEXT-MINUTE ENGINE (evaluation-first) ==============
     enable_next_minute_engine: bool = True
-    next_minute_predict_second: int = 50   # :50 predict
+    next_minute_predict_second: int = 57   # :57 predict (late-minute momentum capture)
     next_minute_resolve_second: int = 10   # :10 resolve previous minute
     next_minute_optional_alerts: bool = False  # alerts OFF by default
-    micro_imbalance_min: float = 0.50
+
+    micro_imbalance_min: float = 0.30        # was 0.50; easier to trigger decisive micro
     micro_slope_min: float = 0.15
-    micro_noise_sigma_mult: float = 1.5
+    micro_noise_sigma_mult: float = 2.0      # was 1.5; less false noise blocks
+
+
+    micro_persistence_min_checks: int = 1    # was hardcoded 2; 1 call per minute needs 1
+    micro_tick_window: int = 200             # was 400; less smoothing of micro signals
+    micro_macd_slope_soft_min: float = 0.05  # slope magnitude below this won't veto in GATE2
+    micro_extreme_imb_min: float = 0.60      # micro needed near extremes when MTF is weak
+    quiet_mtf_in_1m: bool = True             # suppress verbose 15m logs in 1m gating
+
+
+
+    # ============== 1m NEXT-MINUTE PRIOR TUNING (Correctness-first) ==============
+    # Micro-first weights (reduced 5m MACD influence)
+    next_minute_macd_prior_weight: float = 2.5      # Minimal 5m MACD influence
+    next_minute_imb_weight: float = 45.0            # Max micro imbalance weight
+    next_minute_slope_weight: float = 17.5          # Strong micro slope weight
+    next_minute_rsi_prior_weight: float = 0.05      # Minimal RSI influence
+
+    # Neutral band and drift guard
+    next_minute_forecast_neutral_band: float = 0.03  # 3% around 50 → [47,53] becomes NEUTRAL (higher 1m coverage)
+    next_minute_drift_guard_pct: float = 0.02        # 0.02% ~ 2 bps
 
 
     # ==============  Liberal pre-gate thresholds (shadow eval) ==============
     liberal_min_abs_score: float = 0.05
     liberal_min_mtf: float = 0.50
 
+
+    # ============== NEW SETUP: PIVOT SWIPE ==============
+    enable_pivot_swipe: bool = True
+    pivot_swipe_bps_tolerance: float = 6.0  # wick cross tolerance in bps of price
+    pivot_swipe_levels: list = field(default_factory=lambda: ["PDH", "PDL", "SWING_5m"])
+    pivot_swipe_min_reclaim_closes: int = 1
+    pivot_swipe_weight: float = 0.06  # score nudge when aligned
+    pivot_swipe_as_confirmation_only: bool = True
+
+    # ============== NEW SETUP: IMBALANCE STRUCTURE ==============
+    enable_imbalance_structure: bool = True
+    imbalance_c2_min_body_ratio: float = 0.60  # C2 body/total
+    imbalance_min_gap_bars: int = 1  # enforce C1–C3 gap logic
+    ema_widen_pair: tuple = (20, 50)  # use EMA20 vs EMA50 widening
+    ema_widen_min_bps: float = 8.0
+    imbalance_weight: float = 0.07  # score nudge when aligned
+    imbalance_as_confirmation_only: bool = True
 
     
     def get_rsi_params(self, timeframe: str) -> Dict:
@@ -516,34 +580,38 @@ class UnifiedTradingConfig:
             
 
             
-            logger.info(f"✓ Min Confidence: {self.min_confidence}%") 
-            logger.info(f"✓ Min Active Indicators: {self.min_active_indicators}") 
-            logger.info(f"✓ Price Action Validation: {self.price_action_validation}") 
-            logger.info(f"✓ Multi-Timeframe Alignment: {self.multi_timeframe_alignment}") 
-            logger.info(f"✓ Persistent Storage: {self.use_persistent_storage}")
+            # logger.info(f"✓ Min Confidence: {self.min_confidence}%") 
+            # logger.info(f"✓ Min Active Indicators: {self.min_active_indicators}") 
+            # logger.info(f"✓ Price Action Validation: {self.price_action_validation}") 
+            # logger.info(f"✓ Multi-Timeframe Alignment: {self.multi_timeframe_alignment}") 
+            # logger.info(f"✓ Persistent Storage: {self.use_persistent_storage}")
             
-            logger.info(f"✓ R:R Floor: {self.min_risk_reward_floor:.2f}")
-            mv = float(getattr(self, 'min_volatility_range_pct', 0.002))
-            logger.info(f"✓ Min Volatility Range (pct): {mv:.3f}")
-            logger.info(f"✓ MTF Threshold (at-close): {self.trend_alignment_threshold:.2f}")
+            # logger.info(f"✓ R:R Floor: {self.min_risk_reward_floor:.2f}")
+            # mv = float(getattr(self, 'min_volatility_range_pct', 0.002))
+            # logger.info(f"✓ Min Volatility Range (pct): {mv:.3f}")
+            # logger.info(f"✓ MTF Threshold (at-close): {self.trend_alignment_threshold:.2f}")
 
 
-            logger.info("[MTF] borderline soft-allow: %s (%.2f–%.2f, penalty=%.1f)",
-                        self.enable_mtf_borderline_soft_allow,
-                        self.mtf_borderline_min,
-                        self.mtf_borderline_max,
-                        self.mtf_borderline_conf_penalty)
+            # logger.info("[MTF] borderline soft-allow: %s (%.2f–%.2f, penalty=%.1f)",
+            #             self.enable_mtf_borderline_soft_allow,
+            #             self.mtf_borderline_min,
+            #             self.mtf_borderline_max,
+            #             self.mtf_borderline_conf_penalty)
 
 
-            logger.info("[GUARD] buy_guard_htf_enabled=%s | buy_guard_mtf_threshold=%.2f",
-                        self.buy_guard_htf_enabled, self.buy_guard_mtf_threshold)
-            logger.info("[GUARD] sell_guard_htf_enabled=%s | sell_guard_mtf_threshold=%.2f",
-                        self.sell_guard_htf_enabled, self.sell_guard_mtf_threshold)
+            # logger.info("[GUARD] buy_guard_htf_enabled=%s | buy_guard_mtf_threshold=%.2f",
+            #             self.buy_guard_htf_enabled, self.buy_guard_mtf_threshold)
+            # logger.info("[GUARD] sell_guard_htf_enabled=%s | sell_guard_mtf_threshold=%.2f",
+            #             self.sell_guard_htf_enabled, self.sell_guard_mtf_threshold)
 
             logger.info("[SOFT-ALLOW] slope_soft_allow_min_mag=%.3f", self.slope_soft_allow_min_mag)
             logger.info("[SESSION] ranging_strength_delta=%.3f", self.session_ranging_strength_delta)
 
 
+            logger.info("[SETUP] PivotSwipe: enabled=%s tol=%.1f bps levels=%s weight=%.2f confirm_only=%s", getattr(self, 'enable_pivot_swipe', True), float(getattr(self, 'pivot_swipe_bps_tolerance', 6.0)), getattr(self, 'pivot_swipe_levels', []), float(getattr(self, 'pivot_swipe_weight', 0.06)), getattr(self, 'pivot_swipe_as_confirmation_only', True))
+            logger.info("[SETUP] Imbalance: enabled=%s C2_body>=%.2f EMA_pair=%s widen_min=%.1f bps weight=%.2f confirm_only=%s", getattr(self, 'enable_imbalance_structure', True), float(getattr(self, 'imbalance_c2_min_body_ratio', 0.60)), str(getattr(self, 'ema_widen_pair', (20,50))), float(getattr(self, 'ema_widen_min_bps', 8.0)), float(getattr(self, 'imbalance_weight', 0.07)), getattr(self, 'imbalance_as_confirmation_only', True))
+            
+        
 
             logger.info("[PATTERN] talib=%s | enabled=%s | min_strength=%d | confirm_only=%s | require=%s",
                         True, self.enable_talib_patterns, self.pattern_min_strength,
@@ -555,13 +623,13 @@ class UnifiedTradingConfig:
                         float(getattr(self, 'oi_context_boost', 0.03)), 
                         float(getattr(self, 'oi_min_change_pct', 0.10)))
             
-            logger.info("[S/D] integration=%s | dist_bps=%.2f | boost=%.3f", 
-                        getattr(self, 'enable_supply_demand_integration', True), 
-                        float(getattr(self, 'sd_zone_distance_bps', 8.0)), 
-                        float(getattr(self, 'sd_context_boost', 0.03)))
+            # logger.info("[S/D] integration=%s | dist_bps=%.2f | boost=%.3f", 
+            #             getattr(self, 'enable_supply_demand_integration', True), 
+            #             float(getattr(self, 'sd_zone_distance_bps', 8.0)), 
+            #             float(getattr(self, 'sd_context_boost', 0.03)))
 
-            logger.info("[PRECLOSE] buffer_sec=%d | lead_sec=%d", int(getattr(self, 'preclose_completion_buffer_sec', 1)), int(self.preclose_lead_seconds))
-            logger.info("[HR] rotate_daily=%s | base=%s | keep_days=%d | symlink_latest=%s", getattr(self, 'hitrate_rotate_daily', True), getattr(self, 'hitrate_base_path', 'logs/hitrate'), int(getattr(self, 'hitrate_keep_days', 60)), getattr(self, 'hitrate_symlink_latest', True))
+            # logger.info("[PRECLOSE] buffer_sec=%d | lead_sec=%d", int(getattr(self, 'preclose_completion_buffer_sec', 1)), int(self.preclose_lead_seconds))
+            # logger.info("[HR] rotate_daily=%s | base=%s | keep_days=%d | symlink_latest=%s", getattr(self, 'hitrate_rotate_daily', True), getattr(self, 'hitrate_base_path', 'logs/hitrate'), int(getattr(self, 'hitrate_keep_days', 60)), getattr(self, 'hitrate_symlink_latest', True))
 
 
                         

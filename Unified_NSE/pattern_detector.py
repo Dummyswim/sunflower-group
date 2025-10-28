@@ -99,9 +99,29 @@ class CandlestickPatternDetector:
             for k, v in rnd.items():
                 merged[k] = int(v * 100)
 
-        # Pick top pattern by |score| ≥ min_strength
+        
+
+
+        # ENHANCED: Require completed bar for pattern confirmation
+        if df is None or df.empty or len(df) < 3:
+            logger.info("[PATTERN] Insufficient data for confirmation")
+            return {'name': 'NONE', 'signal': 'NEUTRAL', 'confidence': 0}
+
+        # Verify last bar is closed (not forming)
+        last_bar = df.iloc[-1]
+        is_forming = False  # Assume closed unless marked otherwise
+        if hasattr(df.index[-1], 'second') and df.index[-1].second != 0:
+            is_forming = True  # Bar timestamp not at boundary
+            logger.warning("[PATTERN] ⚠️ Last bar is forming - skipping pattern detection")
+            return {'name': 'NONE', 'signal': 'NEUTRAL', 'confidence': 0}
+
+        # Pick top pattern by |score| ≥ min_strength (ONLY ON CLOSED BARS)
         top_name, top_val = self._select_top(merged, self._min_strength)
         if not top_name:
+            logger.info("[PATTERN] No pattern meets minimum strength threshold")
+
+
+            
             # If nothing strong, still surface a Spinning Top if it’s pronounced (indecision/veto)
             st = merged.get("CDLSPINNINGTOP", 0)
             if abs(int(st)) >= self._min_strength:
@@ -114,14 +134,16 @@ class CandlestickPatternDetector:
         direction = 'LONG' if top_val > 0 else 'SHORT' if top_val < 0 else 'NEUTRAL'
         conf = int(min(90, 60 + min(100, abs(int(top_val))) * 0.2))
 
-        # High-visibility INFO for users
+
+        # Treat Spinning Top as true indecision (no boost)
         if top_name == "CDLSPINNINGTOP":
             logger.info("[PATTERN] Indecision: %s (%+d) — veto in compression", top_name, int(top_val))
-            
-        else:
-            logger.info("[PATTERN] Recognized: %s (%+d) | dir=%s",
-                        top_name, int(top_val), "BULLISH" if direction == 'LONG' else "BEARISH")
-            
+            return {'name': top_name, 'signal': 'NEUTRAL', 'confidence': 0}
+
+        # High-visibility INFO for users
+        logger.info("[PATTERN] Recognized: %s (%+d) | dir=%s",
+                    top_name, int(top_val), "BULLISH" if direction == 'LONG' else "BEARISH")
+                    
 
         # Log custom tweezer specifically (user-friendly naming)
         if top_name in ("TWEEZER_TOP", "TWEEZER_BOTTOM"):

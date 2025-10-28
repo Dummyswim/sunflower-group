@@ -29,6 +29,20 @@ from pattern_detector import CandlestickPatternDetector, ResistanceDetector
 from hitrate import HitRateTracker, Candidate # Hit-rate buckets and calibration
 from logging_setup import log_span
 
+from contextlib import contextmanager
+
+
+@contextmanager
+def _quiet_logger(name: str, level=logging.WARNING):
+    lg = logging.getLogger(name)
+    prev = lg.level
+    try:
+        lg.setLevel(level)
+        yield
+    finally:
+        lg.setLevel(prev)
+
+
 
 # Setup logging
 setup_logging(
@@ -67,7 +81,16 @@ class EnhancedUnifiedTradingSystem:
 
             
 
+        # Losing streak protection
+        self.losing_streak_count = 0
+        self.losing_streak_active = False
+        self.losing_streak_pause_until = None
+        self.recent_trade_outcomes = []  # Track last N outcomes for reset
+
+
         self._nm_task = None
+        self._nm_lock = asyncio.Lock()  # prevent duplicate :50 predictions
+
         self._last_nm_predicted: Optional[datetime] = None
         self._last_nm_resolved: Optional[datetime] = None
 
@@ -94,6 +117,42 @@ class EnhancedUnifiedTradingSystem:
         self.candle_aggregator_15m = []  # Aggregate 5-min candles to 15-min
 
         logger.info("System components initialized")
+    
+    
+    
+    
+
+    def _compute_5m_micro_context(self, indicators_5m: dict, session_info: dict) -> float:
+        """
+        Lightweight 5m context score (0.0-1.0) for 1m micro gating.
+        Does NOT inherit 15m alignment — only checks if 5m momentum supports micro.
+        """
+        try:
+            score = 0.5  # neutral baseline
+            
+            # 1) 5m MACD slope magnitude (momentum strength, not direction)
+            macd_closed = float(indicators_5m.get('macd', {}).get('hist_slope_closed', 0.0) or 0.0)
+            if abs(macd_closed) >= 0.10:
+                score += 0.15  # momentum present
+            
+            # 2) RSI not at extreme
+            rsi5 = float(indicators_5m.get('rsi', {}).get('value', 50.0) or 50.0)
+            if 30 < rsi5 < 70:
+                score += 0.15  # room to move
+            
+            # 3) BB position not extreme
+            bb_pos = float(indicators_5m.get('bollinger', {}).get('position', 0.5) or 0.5)
+            if 0.15 < bb_pos < 0.85:
+                score += 0.20  # not at range edge
+            
+            logger.debug(f"[5m-CONTEXT] score={score:.2f} (macd={abs(macd_closed):.2f}, rsi={rsi5:.1f}, bb={bb_pos:.2f})")
+            return float(max(0.0, min(1.0, score)))
+        except Exception as e:
+            logger.debug(f"[5m-CONTEXT] calc error: {e}")
+            return 0.5
+
+        
+
     
     async def initialize(self) -> bool:
         """Initialize all system components with persistent storage."""
@@ -267,101 +326,201 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
 
 
 
-
-
     async def _predict_next_minute(self, now_ist: datetime):
         try:
-            # Next minute start boundary
-            next_start = now_ist.replace(second=0, microsecond=0) + timedelta(minutes=1)
-            if self._last_nm_predicted == next_start:
-                return
-            # Micro snapshot
-            micro = {}
-            try:
-                micro = self.websocket_handler.get_micro_features() if self.websocket_handler else {}
-            except Exception:
-                micro = {}
+            async with self._nm_lock:
+                # Compute the next minute start and mark it early to avoid double-fire
+                next_start = now_ist.replace(second=0, microsecond=0) + timedelta(minutes=1)
+                
+                logger.info("[NEXT-1m][ENTRY] now=%s next_start=%s", now_ist.strftime('%H:%M:%S'), next_start.strftime('%H:%M'))
 
-            # Context: latest 5m/15m
-            df_5m = self.persistence_manager.get_data("5m", 100)
-            df_15m = self.persistence_manager.get_data("15m", 60)
-            indicators_5m = await self.technical_analysis.calculate_all_indicators(df_5m)
-            indicators_15m = None
-            if not df_15m.empty:
-                indicators_15m = await self.calculate_15m_indicators(df_15m)
+                
+                
+                if self._last_nm_predicted == next_start:
+                    logger.debug("[NEXT-1m] duplicate guard: already predicted %s", next_start.strftime('%H:%M'))
+                    return
+                self._last_nm_predicted = next_start
 
+                # Micro snapshot
+                try:
+                    micro = self.websocket_handler.get_micro_features() if self.websocket_handler else {}
+                except Exception:
+                    micro = {}
 
-            
+                # Context: latest 5m/15m
+                df_5m = self.persistence_manager.get_data("5m", 100)
+                df_15m = self.persistence_manager.get_data("15m", 60)
+                indicators_5m = await self.technical_analysis.calculate_all_indicators(df_5m)
+                indicators_15m = None
+                if not df_15m.empty:
+                    indicators_15m = await self.calculate_15m_indicators(df_15m)
 
-            # Build a lightweight 5m scorer to compute MTF score BEFORE calling 1m analyzer
-            session_info = self.signal_analyzer.detect_session_characteristics(df_5m)
-            raw = self.signal_analyzer._calculate_weighted_signal(indicators_5m)
-            mtf_score = 0.0
-            try:
-                mtf_aligned, mtf_score, _ = self.signal_analyzer.mtf_analyzer.check_timeframe_alignment(
-                    raw if isinstance(raw, dict) else {},
-                    indicators_15m,
-                    df_15m if indicators_15m is not None else None,
-                    session_info
-                ) if indicators_15m is not None and df_15m is not None else (True, 0.0, "")
-            except Exception:
+                # 5m scorer and MTF once per cycle
+                session_info = self.signal_analyzer.detect_session_characteristics(df_5m)
+                raw = self.signal_analyzer._calculate_weighted_signal(indicators_5m)
                 mtf_score = 0.0
 
-            # Now call the 1m analyzer with a real mtf_score and session
-            session = "open" if now_ist.hour*60+now_ist.minute <= 10*60+15 else "mid" if now_ist.hour*60+now_ist.minute < 14*60+30 else "close"
-            nm = self.signal_analyzer.analyze_next_minute(indicators_5m, indicators_15m, micro, mtf_score, session)
+                try:
+                    checker = (self.signal_analyzer.mtf_analyzer.check_timeframe_alignment_quiet
+                            if getattr(self.config, 'quiet_mtf_in_1m', True)
+                            else self.signal_analyzer.mtf_analyzer.check_timeframe_alignment)
+                    mtf_aligned, mtf_score, _ = (
+                        checker(raw if isinstance(raw, dict) else {},
+                                indicators_15m,
+                                df_15m if indicators_15m is not None else None,
+                                session_info)
+                        if indicators_15m is not None and df_15m is not None
+                        else (True, 0.0, "")
+                    )
+                except Exception:
+                    mtf_score = 0.0
 
-            direction = str(nm.get('composite_signal', nm.get('direction', 'NEUTRAL'))).upper()
+                session = "open" if now_ist.hour*60+now_ist.minute <= 10*60+15 else "mid" if now_ist.hour*60+now_ist.minute < 14*60+30 else "close"
 
-            
-            
-            
-            
-            
-            logger.info("NEXT -> %s | t+1m=%s | conf=%.1f%%", direction, next_start.strftime('%H:%M'), float(nm.get('confidence',0.0)))
-            
+                # Use 5m-only context for 1m (not 15m-influenced mtf_score)
+                micro_context_score = self._compute_5m_micro_context(indicators_5m, session_info)
+                logger.info(f"[NEXT-1m] Using micro_context_score={micro_context_score:.2f} (NOT mtf_score={mtf_score:.2f})")
+                nm = self.signal_analyzer.analyze_next_minute(
+                    indicators_5m, indicators_15m, micro, micro_context_score, session
+                )
 
-
-            # Build a lightweight 5m-scorer snapshot to fill candidate analytics
-            raw = self.signal_analyzer._calculate_weighted_signal(indicators_5m)
-            # Compute MTF score for heads-up bookkeeping (no gate/alerts)
-            mtf_score = 0.0
-            try:
-                mtf_aligned, mtf_score, _ = self.signal_analyzer.mtf_analyzer.check_timeframe_alignment(
-                    {'composite_signal': direction},
-                    indicators_15m,
-                    df_15m,
-                    self.signal_analyzer.detect_session_characteristics(df_5m)
-                ) if indicators_15m and df_15m is not None else (True, 0.0, "")
-            except Exception:
-                mtf_score = 0.0
+                
+                
+                # ========== REPLACEMENT STARTS HERE ==========
+                
+                # Color forecast + confidence (always available); trade classifier may still be neutral
+                side_cls = str(nm.get('composite_signal', 'NEUTRAL')).upper()
+                forecast_dir = str(nm.get('forecast_color', side_cls)).upper()
+                forecast_prob = float(nm.get('forecast_prob', nm.get('confidence', 30.0)))
+                                
 
 
-            # Save evaluation candidate (alerts OFF)
-            cand = Candidate(
-                next_bar_time=next_start,
-                direction=direction,
-                actionable=False,
-                rejection_reason="1m_eval",
-                mtf_score=float(mtf_score),
-                breadth=int(raw.get('active_indicators', 0)),
-                weighted_score=float(raw.get('weighted_score', 0.0)),
-                macd_hist_slope=float(raw.get('contributions', {}).get('macd', {}).get('hist_slope', 0.0)),
-                rsi_value=float(raw.get('contributions', {}).get('rsi', {}).get('rsi_value', 50.0)),
-                rsi_cross_up=bool(raw.get('contributions', {}).get('rsi', {}).get('rsi_cross_up', False)),
-                rsi_cross_down=bool(raw.get('contributions', {}).get('rsi', {}).get('rsi_cross_down', False)),
-                pattern_used=bool(raw.get('contributions', {}).get('pattern_boost_applied', False)),
-                sr_room=str(getattr(self.signal_analyzer.mtf_analyzer, '_last_sr_room', 'UNKNOWN')),
-                regime=str(self.signal_analyzer.detect_session_characteristics(df_5m).get('session', 'UNKNOWN')),
-                confidence=float(nm.get('confidence', 0.0))/100.0,
-                oi_signal=raw.get('contributions', {}).get('oi', {}).get('signal', 'neutral'),
-                oi_change_pct=float(raw.get('contributions', {}).get('oi', {}).get('oi_change_pct', 0.0)),
-                saved_at=datetime.now(),
-                horizon="1m",
-                liberal_direction=None  # not used for 1m
-            )
-            self.hit_tracker.save_candidate(cand)
-            self._last_nm_predicted = next_start
+
+                # Optional: evidence-conditioned setup nudge to forecast (bounded, location-aware)
+                try:
+                    # Pull 5m raw contributions for setups
+                    contrib = raw.get('contributions', {}) if isinstance(raw, dict) else {}
+                    ps = contrib.get('pivot_swipe', {}) or {}
+                    im = contrib.get('imbalance', {}) or {}
+
+                    # Build context key for SetupStats (if available)
+                    p_recent = n_recent = None
+                    if hasattr(self, 'setup_stats') and self.setup_stats:
+                        try:
+                            from setup_statistics import make_setup_key
+                            rec = {
+                                "direction": "BUY" if "BUY" in str(forecast_dir) else ("SELL" if "SELL" in str(forecast_dir) else "NEUTRAL"),
+                                "mtf_score": float(mtf_score or 0.0),
+                                "breadth": int(raw.get('active_indicators', 0) or 0),
+                                "weighted_score": float(raw.get('weighted_score', 0.0) or 0.0),
+                                "macd_hist_slope": float(contrib.get('macd', {}).get('hist_slope', 0.0) or 0.0),
+                                "rsi_value": float(contrib.get('rsi', {}).get('rsi_value', 50.0) or 50.0),
+                                "rsi_cross_up": bool(contrib.get('rsi', {}).get('rsi_cross_up', False)),
+                                "rsi_cross_down": bool(contrib.get('rsi', {}).get('rsi_cross_down', False)),
+                                "sr_room": str(getattr(self.signal_analyzer.mtf_analyzer, '_last_sr_room', 'UNKNOWN')),
+                                "tod": session
+                            }
+                            key = make_setup_key(rec)
+                            p_recent, lo, hi, n_recent = self.setup_stats.get(key, window="recent")
+                        except Exception as _e:
+                            p_recent = n_recent = None
+
+                    # Apply a tiny nudge only when:
+                    # - A setup exists AND matches forecast_dir,
+                    # - Location is good (not sr_room LIMITED at high BB for BUY; not LIMITED at low BB for SELL),
+                    # - Enough evidence (p_recent>=0.60 with n>=30), else skip
+                    bb_pos = float(indicators_5m.get('bollinger', {}).get('position', 0.5) or 0.5)
+                    sr_room = str(getattr(self.signal_analyzer.mtf_analyzer, '_last_sr_room', 'UNKNOWN'))
+                    setup_dir = None
+                    if isinstance(ps, dict) and ps.get('direction'):
+                        setup_dir = 'BUY' if ps.get('direction') == 'LONG' else 'SELL'
+                    if isinstance(im, dict) and im.get('direction') and setup_dir is None:
+                        setup_dir = 'BUY' if im.get('direction') == 'LONG' else 'SELL'
+
+                    loc_ok = True
+                    if setup_dir == 'BUY' and (sr_room == 'LIMITED' and bb_pos >= 0.65):
+                        loc_ok = False
+                    if setup_dir == 'SELL' and (sr_room == 'LIMITED' and bb_pos <= 0.35):
+                        loc_ok = False
+
+                    if setup_dir in ('BUY','SELL') and setup_dir == forecast_dir and loc_ok and p_recent is not None and n_recent is not None and p_recent >= 0.60 and n_recent >= 30:
+                        old = float(forecast_prob)
+                        # bounded nudge 0–4 pp toward the setup-supported side (scale by evidence and keep prob in [10,90])
+                        nud = min(4.0, max(1.0, (p_recent*100.0 - 50.0) * 0.08))
+                        forecast_prob = float(max(10.0, min(90.0, old + (nud if forecast_dir == 'BUY' else -nud))))
+                        logger.info("[SETUP-EVIDENCE1m] %s supported (p=%.1f%%, n=%d) → prob %.1f→%.1f (sr=%s, bb=%.2f)",
+                                    setup_dir, p_recent*100.0, n_recent, old, forecast_prob, sr_room, bb_pos)
+                    else:
+                        if setup_dir:
+                            logger.info("[SETUP-EVIDENCE1m] No nudge (setup=%s, loc_ok=%s, p=%s, n=%s, sr=%s, bb=%.2f)",
+                                        setup_dir, loc_ok, f"{p_recent:.2f}" if p_recent is not None else "NA",
+                                        f"{n_recent}" if n_recent is not None else "NA", sr_room, bb_pos)
+                except Exception as _e:
+                    logger.debug(f"[SETUP-EVIDENCE1m] skipped: {_e}")
+
+                # Final forecast log after setup nudge
+                logger.info("NEXT (forecast-only) -> %s | t+1m=%s | prob=%.1f%%", forecast_dir, next_start.strftime('%H:%M'), forecast_prob)
+
+                # Save 1m forecast as calibration (direction kept NEUTRAL for trade abstention)
+                cand = Candidate(
+                    next_bar_time=next_start,
+                    direction="NEUTRAL",
+                    actionable=False,
+                    rejection_reason="1m_eval",
+                    mtf_score=float(mtf_score),
+                    breadth=int(raw.get('active_indicators', 0)),
+                    weighted_score=float(raw.get('weighted_score', 0.0)),
+                    macd_hist_slope=float(raw.get('contributions', {}).get('macd', {}).get('hist_slope', 0.0)),
+                    rsi_value=float(raw.get('contributions', {}).get('rsi', {}).get('rsi_value', 50.0)),
+                    rsi_cross_up=bool(raw.get('contributions', {}).get('rsi', {}).get('rsi_cross_up', False)),
+                    rsi_cross_down=bool(raw.get('contributions', {}).get('rsi', {}).get('rsi_cross_down', False)),
+                    pattern_used=bool(raw.get('contributions', {}).get('pattern_boost_applied', False)),
+                    sr_room=str(getattr(self.signal_analyzer.mtf_analyzer, '_last_sr_room', 'UNKNOWN')),
+                    regime=str(session_info.get('session', 'UNKNOWN')),
+                    confidence=float(forecast_prob) / 100.0,  # store forecast probability
+                    oi_signal=raw.get('contributions', {}).get('oi', {}).get('signal', 'neutral'),
+                    oi_change_pct=float(raw.get('contributions', {}).get('oi', {}).get('oi_change_pct', 0.0)),
+                    saved_at=datetime.now(),
+                    horizon="1m",
+                    liberal_direction=("BUY" if "BUY" in forecast_dir else ("SELL" if "SELL" in forecast_dir else "NEUTRAL"))
+                )
+
+                # Attach setup tags (for JSON ease-of-use) and :57 micro snapshot
+                try:
+                    cand.pivot_swipe = ps.get('direction')
+                    cand.pivot_level = ps.get('name')
+                    cand.imbalance = im.get('direction')
+                    logger.info("[NEXT-1m][CAL] setups -> pivot_swipe=%s @%s | imbalance=%s",
+                                cand.pivot_swipe, cand.pivot_level, cand.imbalance)
+                except Exception as e:
+                    logger.debug(f"[NEXT-1m] setup populate skipped: {e}")
+
+                # Save :57 micro snapshot for calibration/virtual lab (added to JSON by HitRateTracker)
+                try:
+                    cand.nm_micro = {
+                        'imbalance': float(micro.get('imbalance', 0.0) or 0.0),
+                        'slope': float(micro.get('slope', 0.0) or 0.0),
+                        'std_dltp': float(micro.get('std_dltp', 0.0) or 0.0),
+                        'drift': float(micro.get('vwap_drift_pct', 0.0) or 0.0),
+                        'n': int(micro.get('n', 0) or 0)
+                    }
+                    logger.info("[NEXT-1m][MICRO] saved to candidate: imb=%.2f slope=%.3f stdΔ=%.5f drift=%.3f%% n=%d",
+                                cand.nm_micro['imbalance'], cand.nm_micro['slope'],
+                                cand.nm_micro['std_dltp'], cand.nm_micro['drift'], cand.nm_micro['n'])
+                except Exception as _e:
+                    logger.debug(f"[NEXT-1m] micro attach skipped: {_e}")
+
+                self.hit_tracker.save_candidate(cand)
+
+                
+                
+                
+                
+                
+                
+                
+                # ========== REPLACEMENT ENDS HERE ==========
+                
         except Exception as e:
             logger.error(f"[NEXT-1m] predict error: {e}", exc_info=True)
 
@@ -369,6 +528,11 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
 
     async def _resolve_last_minute(self, now_ist: datetime):
         try:
+            
+            logger.info("[NEXT-1m][RESOLVE] window=%s→%s",
+                (now_ist.replace(second=0, microsecond=0) - timedelta(minutes=1)).strftime('%H:%M'),
+                (now_ist.replace(second=0, microsecond=0)).strftime('%H:%M'))
+
             # Resolve previous minute (start boundary one minute ago)
             prev_start = now_ist.replace(second=0, microsecond=0) - timedelta(minutes=1)
             if self._last_nm_resolved == prev_start:
@@ -599,11 +763,11 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                     rej = signal.get('rejection_reason')
                     
                     if isinstance(rej, str) and rej.upper() in {'PA','MTF','VALIDATION','CONFIDENCE','RR'}:
-                        mapper = {'PA': 'pa_veto', 'MTF': 'mtf_not_aligned', 'VALIDATION': 'validation', 'CONFIDENCE': 'confidence_floor', 'RR': 'rr_floor'}
+                        mapper = {'PA': 'pa_veto', 'MTF': 'mtf_not_aligned', 'VALIDATION': 'validation', 'CONFIDENCE': 'confidence_floor', 'RR': 'rr_floor', 'MOMENTUM': 'momentum_exhaustion'}
                         rej = mapper[rej.upper()]
                     if not rej and getattr(self.signal_analyzer, "_last_reject", None):
                         stage = str(self.signal_analyzer._last_reject.get('stage', '')).upper()
-                        mapper = {'PA': 'pa_veto', 'MTF': 'mtf_not_aligned', 'VALIDATION': 'validation', 'CONFIDENCE': 'confidence_floor', 'RR': 'rr_floor'}
+                        mapper = {'PA': 'pa_veto', 'MTF': 'mtf_not_aligned', 'VALIDATION': 'validation', 'CONFIDENCE': 'confidence_floor', 'RR': 'rr_floor', 'MOMENTUM': 'momentum_exhaustion'}
                         rej = mapper.get(stage, stage.lower() or None)
 
 
@@ -623,9 +787,14 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                     direction = str(raw.get('composite_signal', 'NEUTRAL')) 
                     breadth = int(raw.get('active_indicators', 0)) # FIX: carry actual active indicator count # Compute MTF score … 
                     try: 
-                        mtf_aligned, mtf_score, _ = self.signal_analyzer.mtf_analyzer.check_timeframe_alignment( 
+                    
+                        
+                        mtf_aligned, mtf_score, _ = self.signal_analyzer.mtf_analyzer.check_timeframe_alignment_quiet( 
                             raw, indicators_15m, df_15m, session_info 
-                            ) if indicators_15m and df_15m is not None else (True, 0.0, "") 
+                        ) if indicators_15m and df_15m is not None else (True, 0.0, "")
+                        
+                        
+                        
                     except Exception: 
                         mtf_score = 0.0
 
@@ -645,7 +814,7 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                     try:
                         if getattr(self.signal_analyzer, "_last_reject", None):
                             stage = str(self.signal_analyzer._last_reject.get('stage', '')).upper()
-                            mapper = {'PA': 'pa_veto', 'MTF': 'mtf_not_aligned', 'VALIDATION': 'validation', 'CONFIDENCE': 'confidence_floor', 'RR': 'rr_floor'}
+                            mapper = {'PA': 'pa_veto', 'MTF': 'mtf_not_aligned', 'VALIDATION': 'validation', 'CONFIDENCE': 'confidence_floor', 'RR': 'rr_floor', 'MOMENTUM': 'momentum_exhaustion'}
                             rej = mapper.get(stage, stage.lower() or None)
                     except Exception:
                         pass
@@ -703,6 +872,10 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 liberal_direction = "NEUTRAL"
 
 
+            contrib = signal.get('contributions', {}) if signal else raw.get('contributions', {})
+            ps = contrib.get('pivot_swipe', {}) or {}
+            imb = contrib.get('imbalance', {}) or {}
+
             cand = Candidate(
                 next_bar_time=preview_close,
                 direction=direction,
@@ -723,6 +896,9 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                 oi_change_pct=cand_oi_chg,
                 saved_at=datetime.now(),
                 horizon="5m",
+                pivot_swipe=ps.get('direction'),
+                pivot_level=ps.get('name'),
+                imbalance=imb.get('direction'),                
                 liberal_direction=liberal_direction
             )
 
@@ -931,12 +1107,19 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
                     except Exception:
                         indicators_15m_final = None
 
-                    final_sig = await self.signal_analyzer.analyze_and_generate_signal(
-                        indicators_5m_final,
-                        preview['df_5m'],
-                        indicators_15m_final,
-                        df15 if 'df15' in locals() else None
-                    )
+
+
+
+
+                    # Quiet recompute: suppress INFO spam during drift-only recompute
+                    with _quiet_logger('consolidated_signal_analyzer', logging.WARNING):
+                        final_sig = await self.signal_analyzer.analyze_and_generate_signal(
+                            indicators_5m_final,
+                            preview['df_5m'],
+                            indicators_15m_final,
+                            df15 if 'df15' in locals() else None
+                        )
+
                     # Drift sentinel
                     try:
                         self._compare_preview_vs_final(prepared, final_sig)
@@ -979,8 +1162,66 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             try:
                 o = float(df_5m['open'].iloc[-1])
                 c = float(df_5m['close'].iloc[-1])
-                self.hit_tracker.resolve_bar(timestamp, o, c, logger)
-                
+
+                # Resolve and track for losing streak
+                try:
+                    o = float(df_5m['open'].iloc[-1])
+                    c = float(df_5m['close'].iloc[-1])
+                    
+                    # Check if this resolves a recent signal
+                    if hasattr(self, 'last_signal_timestamp') and self.last_signal_timestamp == timestamp:
+                        move = c - o
+                        last_signal_direction = getattr(self, 'last_signal_direction', 'NEUTRAL')
+                        
+                        was_correct = False
+                        if "BUY" in last_signal_direction and move > 0:
+                            was_correct = True
+                        elif "SELL" in last_signal_direction and move < 0:
+                            was_correct = True
+                        
+                        # Update losing streak
+                        self.recent_trade_outcomes.append(was_correct)
+                        if len(self.recent_trade_outcomes) > 10:
+                            self.recent_trade_outcomes.pop(0)
+                        
+                        if was_correct:
+                            self.losing_streak_count = max(0, self.losing_streak_count - 1)
+                            logger.info(f"[LOSING-STREAK] ✅ WIN - Streak reset to {self.losing_streak_count}")
+                            
+                            # Check for reset after consecutive wins
+                            reset_wins = int(getattr(self.config, 'losing_streak_reset_after_wins', 2))
+                            recent_wins = sum(self.recent_trade_outcomes[-reset_wins:])
+                            if recent_wins >= reset_wins:
+                                self.losing_streak_count = 0
+                                self.losing_streak_pause_until = None
+                                logger.info(f"[LOSING-STREAK] 🔄 Full reset after {reset_wins} consecutive wins")
+                        else:
+                            self.losing_streak_count += 1
+                            logger.warning(f"[LOSING-STREAK] ❌ LOSS - Streak increased to {self.losing_streak_count}")
+                            
+                            # Check if pause needed
+                            pause_after = int(getattr(self.config, 'losing_streak_pause_after', 5))
+                            if self.losing_streak_count >= pause_after and not self.losing_streak_pause_until:
+                                pause_minutes = int(getattr(self.config, 'losing_streak_pause_minutes', 30))
+                                self.losing_streak_pause_until = datetime.now() + timedelta(minutes=pause_minutes)
+                                logger.critical(
+                                    f"[LOSING-STREAK] 🛑 PAUSING TRADING for {pause_minutes} minutes "
+                                    f"after {self.losing_streak_count} consecutive losses"
+                                )
+                                
+                                # Send Telegram notification
+                                if self.telegram_bot:
+                                    self.telegram_bot.send_message(
+                                        f"⚠️ TRADING PAUSED\n"
+                                        f"Losing streak: {self.losing_streak_count}\n"
+                                        f"Resuming at: {self.losing_streak_pause_until.strftime('%H:%M')}"
+                                    )
+                    
+                    self.hit_tracker.resolve_bar(timestamp, o, c, logger)
+                    
+                except Exception as e:
+                    logger.error(f"[LOSING-STREAK] Tracking error: {e}")
+
 
                 try:
                     if hasattr(self, 'setup_stats') and self.setup_stats:
@@ -1227,12 +1468,48 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
         except Exception as e:
             logger.error(f"Analysis error: {e}", exc_info=True)
             self.stats['errors'] += 1
-           
+                       
+            
 
     async def _should_send_alert(self, signal: Dict) -> bool:
         """Determine if alert should be sent."""
         log_span("[ALERT] Eligibility Check")    
-            
+        
+        # Extract signal metadata FIRST (before any gates)
+        try:
+            signal_type = str(signal.get('composite_signal', 'NEUTRAL'))
+            confidence = float(signal.get('confidence', 0.0))
+        except Exception:
+            signal_type = 'NEUTRAL'
+            confidence = 0.0
+        
+        # Losing streak protection gate (uses extracted confidence)
+        if getattr(self.config, 'enable_losing_streak_protection', True):
+            # Pause period check
+            if self.losing_streak_pause_until and datetime.now() < self.losing_streak_pause_until:
+                remaining = (self.losing_streak_pause_until - datetime.now()).total_seconds() / 60
+                logger.warning(f"[LOSING-STREAK] 🚫 Trading paused for {remaining:.1f} more minutes")
+                return False
+        
+            # Boosted threshold after N losses
+            streak_threshold = int(getattr(self.config, 'losing_streak_threshold', 3))
+            if self.losing_streak_count >= streak_threshold:
+                confidence_boost = float(getattr(self.config, 'losing_streak_confidence_boost', 10.0))
+                adjusted_min_confidence = float(self.config.min_confidence) + confidence_boost
+        
+                if confidence < adjusted_min_confidence:
+                    logger.warning(
+                        f"[LOSING-STREAK] ❌ Confidence {confidence:.1f}% < {adjusted_min_confidence:.1f}% "
+                        f"(streak={self.losing_streak_count}, boost=+{confidence_boost}%)"
+                    )
+                    return False
+        
+                logger.info(
+                    f"[LOSING-STREAK] ✅ Meets boosted threshold "
+                    f"(conf={confidence:.1f}% >= {adjusted_min_confidence:.1f}%, streak={self.losing_streak_count})"
+                )
+        
+                    
         try:
             signal_type = signal.get('composite_signal', 'NEUTRAL')
             confidence = signal.get('confidence', 0)
@@ -1556,6 +1833,13 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
             else:
                 logger.error("Failed to send scalping alert via Telegram")
 
+
+
+            # Store for losing streak tracking
+            self.last_signal_timestamp = next_candle_start  # The predicted candle time
+            self.last_signal_direction = signal_type
+            logger.info(f"[SIGNAL-TRACKING] Stored signal metadata for outcome tracking")
+
             
         except Exception as e:
             logger.error(f"Alert sending error: {e}")
@@ -1630,43 +1914,92 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
 
 
 
+
+
+
+
     def _compare_preview_vs_final(self, preview_sig: Dict[str, Any], final_sig: Optional[Dict[str, Any]]):
-        """Detect preview→final drift; auto-suspend if exceeded K events."""
+        """
+        Enhanced drift detection with stricter gating and suspension logic.
+        Detects preview→final drift and auto-suspends if K events exceeded.
+        """
         try:
             if not preview_sig or not final_sig:
+                logger.debug("[PRECLOSE-DRIFT] Skipping: missing signals")
                 return
+            
             prev_side = str(preview_sig.get('composite_signal', 'NEUTRAL')).upper()
             fin_side = str(final_sig.get('composite_signal', 'NEUTRAL')).upper()
             prev_conf = float(preview_sig.get('confidence', 0.0))
             fin_conf = float(final_sig.get('confidence', 0.0))
-            sign_flip = ((('BUY' in prev_side) and ('SELL' in fin_side)) or (('SELL' in prev_side) and ('BUY' in fin_side)))
-            drift_pp = abs(prev_conf - fin_conf)
-            logger.info("[PRECLOSE] Drift check: preview=%s(%.1f%%) → final=%s(%.1f%%) | flip=%s | Δ=%.1f pp",
-                        prev_side, prev_conf, fin_side, fin_conf, sign_flip, drift_pp)
             
-
-            # Settings from config
+            # Detailed logging
+            logger.info("=" * 60)
+            logger.info("[PRECLOSE-DRIFT] Stability Check:")
+            logger.info(f"  Preview:  {prev_side} @ {prev_conf:.1f}%")
+            logger.info(f"  Final:    {fin_side} @ {fin_conf:.1f}%")
+            
+            # Detect issues
+            sign_flip = ((('BUY' in prev_side) and ('SELL' in fin_side)) or 
+                        (('SELL' in prev_side) and ('BUY' in fin_side)))
+            drift_pp = abs(prev_conf - fin_conf)
+            
+            # Check for NEUTRAL drift (signal disappeared)
+            neutral_drift = (prev_side != 'NEUTRAL' and fin_side == 'NEUTRAL')
+            
+            logger.info(f"  Sign flip: {sign_flip}")
+            logger.info(f"  Confidence drift: {drift_pp:.1f} pp")
+            logger.info(f"  Neutral drift: {neutral_drift}")
+            
+            # Drift thresholds
             pp_thresh = float(getattr(self.config, 'preclose_drift_pp', 12.0))
             k_limit = int(getattr(self.config, 'preclose_drift_cutout_K', 3))
+            
             if not hasattr(self, "_preclose_drift_events"):
                 self._preclose_drift_events = 0
             if not hasattr(self, "_preclose_suspended"):
                 self._preclose_suspended = False
-
-            if sign_flip or (drift_pp > pp_thresh):
+            
+            # Detect drift event
+            is_drift_event = sign_flip or neutral_drift or (drift_pp > pp_thresh)
+            
+            if is_drift_event:
                 self._preclose_drift_events += 1
-                logger.warning("[PRECLOSE] Drift event #%d (flip=%s, Δ=%.1f pp)",
-                               self._preclose_drift_events, sign_flip, drift_pp)
-                if self._preclose_drift_events >= k_limit:
+                
+                logger.warning(
+                    f"[PRECLOSE-DRIFT] ⚠️ DRIFT EVENT #{self._preclose_drift_events}/"
+                    f"{k_limit} (flip={sign_flip}, neutral={neutral_drift}, Δ={drift_pp:.1f}pp)"
+                )
+                
+                # Check for suspension
+                if self._preclose_drift_events >= k_limit and not self._preclose_suspended:
                     self._preclose_suspended = True
-                    logger.warning("[PRE-CLOSE SUSPEND] 3+ drift events → suspending pre-close alerts for the session")
+                    logger.critical(
+                        f"[PRECLOSE-DRIFT] 🚫 SUSPENDED pre-close alerts for the session "
+                        f"after {k_limit} drift events"
+                    )
                     
-                    try:
-                        self.telegram_bot.send_message("[PRE-CLOSE SUSPEND] 3+ preview→final drift events. Suspending pre-close alerts today.")
-                    except Exception:
-                        pass
+                    # Send Telegram notification
+                    if hasattr(self, 'telegram_bot') and self.telegram_bot:
+                        self.telegram_bot.send_message(
+                            f"⚠️ PRE-CLOSE ALERTS SUSPENDED\n\n"
+                            f"Reason: {self._preclose_drift_events} drift events detected\n"
+                            f"- Sign flips or confidence drifts > {pp_thresh}pp\n"
+                            f"- Pre-close predictions unstable\n"
+                            f"- Switching to at-close analysis only\n\n"
+                            f"Will resume tomorrow"
+                        )
+            else:
+                logger.info("[PRECLOSE-DRIFT] ✅ Stable - no significant drift detected")
+            
+            logger.info("=" * 60)
+            
         except Exception as e:
-            logger.debug(f"[PRECLOSE] Drift detection error: {e}")
+            logger.error(f"[PRECLOSE-DRIFT] Error: {e}", exc_info=True)
+
+
+
+
 
 
 

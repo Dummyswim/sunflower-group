@@ -438,19 +438,33 @@ class ConsolidatedTechnicalAnalysis:
 
 
 
+
+
+
             hist_slope_closed = 0.0
             hist_slope_forming = 0.0
             try:
                 ser = pd.Series(hist).astype(float)
-                # Closed slope: mean of last 3 diffs on closed bars
-                diffs_closed = ser.diff().dropna().tail(3)
-                if len(diffs_closed) >= 1:
-                    hist_slope_closed = float(diffs_closed.mean())
-                # Forming slope: last diff only
+                # CRITICAL FIX: Use only CLOSED bars for slope calculation
+                # Exclude last bar (forming) for closed slope
+                if len(ser) >= 5:
+                    closed_bars = ser.iloc[:-1]  # Exclude forming bar
+                    diffs_closed = closed_bars.diff().dropna().tail(3)
+                    if len(diffs_closed) >= 3:
+                        hist_slope_closed = float(diffs_closed.mean())
+                        logger.info(f"[MACD-SLOPE] Closed slope={hist_slope_closed:+.6f} (last 3 closed diffs)")
+                    else:
+                        logger.warning("[MACD-SLOPE] Insufficient closed bars for slope calculation")
+                
+                # Forming slope: only for pre-close analysis reference (NOT for decisions)
                 if len(ser) >= 2:
                     hist_slope_forming = float(ser.iloc[-1] - ser.iloc[-2])
-            except Exception:
+                    logger.debug(f"[MACD-SLOPE] Forming slope={hist_slope_forming:+.6f} (reference only)")
+            except Exception as e:
+                logger.error(f"[MACD-SLOPE] Calculation error: {e}")
                 pass
+
+
 
             return {
                 'macd': macd_val,

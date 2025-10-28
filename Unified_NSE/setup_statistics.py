@@ -187,6 +187,7 @@ class SetupStats:
         now = datetime.now(IST)
         self.recent.clear()
         self.long.clear()
+        logger.info("[EVIDENCE] Build started: base=%s | recent_days=%d | long_days=%d", self.jsonl_base, self.recent_days, self.long_days)
 
         files = self._iter_files()
         if not files:

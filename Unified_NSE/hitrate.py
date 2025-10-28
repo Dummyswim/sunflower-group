@@ -32,6 +32,9 @@ class Candidate:
     # NEW: multi-horizon + liberal shadow classification
     horizon: str = "5m"
     liberal_direction: Optional[str] = None  # 'BUY'|'SELL'|'NEUTRAL' or None
+    pivot_swipe: Optional[str] = None # 'LONG'|'SHORT'|None
+    pivot_level: Optional[str] = None # 'PDH'|'PDL'|'SWING_H'|'SWING_L'|None
+    imbalance: Optional[str] = None # 'LONG'|'SHORT'|None
 
 
 def _bucket_mtf(x: float) -> str:
@@ -143,6 +146,9 @@ class HitRateTracker:
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+                
+
+                
         except Exception:
             with open(self._current_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
@@ -169,14 +175,12 @@ class HitRateTracker:
             c = self.pending.pop(('5m', next_bar_time), None)
         if not c:
             return
-        
 
         dir_up = (c.direction or "NEUTRAL").upper()
         base_dir = dir_up.replace("STRONG_", "")
-        # Liberal evaluation target (BUY/SELL?) saved at candidate time
         lib_dir = (getattr(c, 'liberal_direction', None) or "NEUTRAL").upper()
 
-        # sanitize open/close (as-is)
+        # sanitize prices
         try:
             open_price = float(open_price)
         except Exception:
@@ -191,47 +195,72 @@ class HitRateTracker:
             close_price = 0.0
 
         move = close_price - open_price
-        # Same micro-move skip rule
-        
 
-
+        # Micro-move gate (more permissive for 1m)
         try:
             pts_min = 1.0
             pct_min = 0.0003
             if str(horizon).lower() == "1m":
-                pts_min = 0.5
-                pct_min = 0.0001
-            tiny = abs(move) < max(pts_min, pct_min * max(1.0, open_price))
+                pts_min = 0.2
+                pct_min = 0.00003
+                  
+            thr = max(pts_min, pct_min * max(1.0, open_price))
+            tiny = abs(move) < thr
         except Exception:
+            thr = 0.0
             tiny = False
 
+        if logger:
+            logger.info(f"[HR] micro-move gate ({horizon}): pts_min={pts_min:.3f} pct_min={pct_min:.5f} thr={thr:.2f} move={move:+.2f}")
 
-        lib_correct = None  # default
         if tiny:
-            # liberal trial counted as trial-only
             if lib_dir in ("BUY","SELL"):
                 self._lib_trials += 1
-                
-            self._dump_jsonl(c, correct=None, open_price=open_price, close_price=close_price, liberal_correct=None, scored=False, skipped_reason="micro_move")
-          
+            self._dump_jsonl(c, correct=None, open_price=open_price, close_price=close_price,
+                            liberal_correct=None, scored=False, skipped_reason="micro_move")
             if logger:
                 logger.info(f"[HR] Skipped micro-move scoring (Δ={move:+.2f}) for {base_dir} ({horizon})")
-                
-            return
-
-
-        # Strict correctness (unchanged)
-        if base_dir not in ("BUY", "SELL"):
-            # persist NEUTRAL for coverage
-            
-            self._dump_jsonl(c, correct=None, open_price=open_price, close_price=close_price, liberal_correct=None, scored=False, skipped_reason="neutral")
             return
 
         up = (move > 0)
-        correct = (base_dir == "BUY" and up) or (base_dir == "SELL" and not up)
 
+        # Strict path (unchanged)
+        if base_dir in ("BUY","SELL"):
+            correct = (base_dir == "BUY" and up) or (base_dir == "SELL" and not up)
 
-        # Liberal correctness (if BUY/SELL)
+            lib_correct = None
+            if lib_dir in ("BUY","SELL"):
+                self._lib_trials += 1
+                self._lib_scored += 1
+                lib_correct = (lib_dir == "BUY" and up) or (lib_dir == "SELL" and not up)
+                if lib_correct:
+                    self._lib_wins += 1
+
+            key = (
+                _bucket_mtf(c.mtf_score),
+                _bucket_breadth(c.breadth),
+                _bucket_strength(c.weighted_score),
+                _bucket_slope(c.macd_hist_slope),
+                _bucket_rsi(c.rsi_value, c.rsi_cross_up, c.rsi_cross_down),
+                "pattern_used" if c.pattern_used else "pattern_off",
+                c.sr_room or "UNKNOWN",
+                _bucket_tod(next_bar_time)
+            )
+            row = self.stats[key]
+            row[0] += 1
+            row[1] += int(bool(correct))
+            if c.actionable:
+                row[2] += 1
+                row[3] += int(bool(correct))
+
+            self._dump_jsonl(c, correct=correct, open_price=open_price, close_price=close_price,
+                            liberal_correct=lib_correct, scored=True, skipped_reason=None)
+            if logger:
+                tag = "[ACT]" if c.actionable else "[CAL]"
+                logger.info(f"{tag} {'✓' if correct else '✗'} Next-bar({horizon}): {c.direction} | move={move:+.2f} | mtf={c.mtf_score:.2f} | active={c.breadth}/6 | strength={c.weighted_score:+.3f} | slope={c.macd_hist_slope:+.6f} | rsi={c.rsi_value:.1f} { '(upX)' if c.rsi_cross_up else '(dnX)' if c.rsi_cross_down else '' } | pattern={'Y' if c.pattern_used else 'N'} | sr={c.sr_room} | rej={c.rejection_reason or '-'} | conf={c.confidence:.0%}")
+            return
+
+        # Liberal scoring path when base is NEUTRAL but a forecast exists
         if lib_dir in ("BUY","SELL"):
             self._lib_trials += 1
             self._lib_scored += 1
@@ -239,34 +268,16 @@ class HitRateTracker:
             if lib_correct:
                 self._lib_wins += 1
 
-        key = (
-            _bucket_mtf(c.mtf_score),
-            _bucket_breadth(c.breadth),
-            _bucket_strength(c.weighted_score),
-            _bucket_slope(c.macd_hist_slope),
-            _bucket_rsi(c.rsi_value, c.rsi_cross_up, c.rsi_cross_down),
-            "pattern_used" if c.pattern_used else "pattern_off",
-            c.sr_room or "UNKNOWN",
-            _bucket_tod(next_bar_time)
-        )
+            self._dump_jsonl(c, correct=None, open_price=open_price, close_price=close_price,
+                            liberal_correct=lib_correct, scored=True, skipped_reason=None)
+            if logger:
+                logger.info(f"[HR][LIBERAL] Scored forecast-only {lib_dir} → {'✓' if lib_correct else '✗'} | move={move:+.2f} ({horizon}) | prob={c.confidence*100:.1f}%")
+            return
 
+        # Base NEUTRAL and no forecast → keep coverage
+        self._dump_jsonl(c, correct=None, open_price=open_price, close_price=close_price,
+                        liberal_correct=None, scored=False, skipped_reason="neutral")
 
-        row = self.stats[key]
-        # row indices: 0=total, 1=correct, 2=act_total, 3=act_correct
-        row[0] += 1
-        row[1] += int(bool(correct))
-        if c.actionable:
-            row[2] += 1
-            row[3] += int(bool(correct))
-
-
-        
-        self._dump_jsonl(c, correct=correct, open_price=open_price, close_price=close_price, liberal_correct=lib_correct, scored=True, skipped_reason=None)
-        
-        if logger:
-            tag = "[ACT]" if c.actionable else "[CAL]"
-            logger.info(f"{tag} {'✓' if correct else '✗'} Next-bar({horizon}): {c.direction} | move={close_price-open_price:+.2f} | mtf={c.mtf_score:.2f} | active={c.breadth}/6 | strength={c.weighted_score:+.3f} | slope={c.macd_hist_slope:+.6f} | rsi={c.rsi_value:.1f} { '(upX)' if c.rsi_cross_up else '(dnX)' if c.rsi_cross_down else '' } | pattern={'Y' if c.pattern_used else 'N'} | sr={c.sr_room} | rej={c.rejection_reason or '-'} | conf={c.confidence:.0%}")
-            
 
 
     # add liberal fields, horizon to JSONL
@@ -298,8 +309,41 @@ class HitRateTracker:
             "correct": correct,
             "liberal_correct": liberal_correct,
             "scored": bool(scored) if scored is not None else (correct is not None),
+            "pivot_swipe": getattr(c, 'pivot_swipe', None),
+            "pivot_level": getattr(c, 'pivot_level', None),
+            "imbalance": getattr(c, 'imbalance', None),            
             "skipped_reason": skipped_reason
         }
+        
+
+
+        # Add explicit forecast fields (mirror of liberal_direction/confidence) for easier analytics
+        try:
+            rec["forecast_color"] = rec.get("liberal_direction", None)
+            # confidence is stored fraction [0..1] in Candidate; convert to pct for forecast_prob
+            conf_frac = float(rec.get("confidence", 0.0))
+            rec["forecast_prob"] = float(max(0.0, min(100.0, conf_frac * 100.0)))
+        except Exception:
+            rec["forecast_color"] = rec.get("liberal_direction", None)
+            rec["forecast_prob"] = None
+
+        # For horizon=1m, include the :57 micro snapshot if attached
+        try:
+            if str(getattr(c, 'horizon', '5m')).lower() == "1m":
+                micro = getattr(c, 'nm_micro', {}) or {}
+                rec["micro_imbalance"] = float(micro.get('imbalance', 0.0) or 0.0)
+                rec["micro_slope"] = float(micro.get('slope', 0.0) or 0.0)
+                rec["micro_std_dltp"] = float(micro.get('std_dltp', 0.0) or 0.0)
+                rec["micro_drift"] = float(micro.get('drift', 0.0) or 0.0)
+                rec["micro_n"] = int(micro.get('n', 0) or 0)
+        except Exception:
+            # keep JSON writable even if micro is missing or malformed
+            pass
+
+
+
+
+        
         self._append_jsonl(rec)
 
 

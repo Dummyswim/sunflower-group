@@ -76,8 +76,13 @@ class EnhancedWebSocketHandler:
         self.on_preclose = None # NEW: pre-close analysis callback
         
         # Microstructure buffers (last ~60–120s)
+
         from collections import deque
-        self._micro_ticks = deque(maxlen=400)
+        win = int(getattr(self.config, 'micro_tick_window', 400))
+        self._micro_ticks = deque(maxlen=max(50, win))
+        logger.info("[MICRO] tick window size set to %d", self._micro_ticks.maxlen)
+
+        
         self._micro_last_snapshot = {}
         logger.debug("Microstructure buffers initialized")
 
@@ -362,6 +367,23 @@ class EnhancedWebSocketHandler:
             except Exception:
                 out['vwap_drift_pct'] = 0.0
             self._micro_last_snapshot = dict(out)
+
+
+            # Outlier guards (prevent one-off pollution of 1m micro snapshot)
+            if not np.isfinite(out['std_dltp']) or out['std_dltp'] < 0:
+                out['std_dltp'] = 0.0
+            if out['std_dltp'] > 50.0:
+                logger.warning("[MICRO-GUARD] stdΔ outlier detected (%.4f) → clamped to 0.0", out['std_dltp'])
+                out['std_dltp'] = 0.0
+
+            if not np.isfinite(out['vwap_drift_pct']):
+                out['vwap_drift_pct'] = 0.0
+            if abs(out['vwap_drift_pct']) > 2.0:  # ±2.0% over ~120s is implausible for index
+                logger.warning("[MICRO-GUARD] drift%% outlier detected (%.4f%%) → clamped to ±2.0%%", out['vwap_drift_pct'])
+                out['vwap_drift_pct'] = 2.0 if out['vwap_drift_pct'] > 0 else -2.0
+
+            
+            
             logger.info("[MICRO] n=%d | imb=%.2f | slope=%.3f | stdΔ=%.5f | drift=%.3f%%",
                         out['n'], out['imbalance'], out['slope'], out['std_dltp'], out['vwap_drift_pct'])
             
@@ -518,14 +540,15 @@ class EnhancedWebSocketHandler:
                 "InstrumentCount": 1,
                 "InstrumentList": [{
                     "ExchangeSegment": self.config.nifty_exchange_segment,
-                    "SecurityId": str(self.config.nifty_security_id)  # int, not str str(self.config.nifty_security_id)
+                    "SecurityId": str(self.config.nifty_security_id)  # str str(self.config.nifty_security_id) as per API spec
                 }]
             }  
 
             # Send subscription and wait for response
             try:
-                logger.info(f"[Subscribe] Sending subscription at {datetime.now(IST).strftime('%H:%M:%S')} with params: {subscription}")
-                
+                # logger.info(f"[Subscribe] Sending subscription at {datetime.now(IST).strftime('%H:%M:%S')} with params: {subscription}")
+                logger.info(f"[Subscribe] Sending subscription at {datetime.now(IST).strftime('%H:%M:%S')} with params: " f"RequestCode={subscription['RequestCode']} " f"ExchangeSegment={subscription['InstrumentList'][0]['ExchangeSegment']} " f"SecurityId={subscription['InstrumentList'][0]['SecurityId']}")
+                logger.info(f"[Subscribe] subscription: {subscription}")
                 await self.websocket.send(json.dumps(subscription))
                 self._last_subscribe_time = datetime.now(IST)
                 logger.info(f"[Subscribe] _last_subscribe_time set to {self._last_subscribe_time.strftime('%H:%M:%S')}")
@@ -889,12 +912,28 @@ class EnhancedWebSocketHandler:
             self.tick_buffer.append(tick_data)
             
             # Microstructure tracking
+            # try:
+            #     self._micro_ticks.append((tick_data['timestamp'], float(tick_data.get('ltp', 0.0))))
+            #     if len(self._micro_ticks) % 50 == 0:
+            #         logger.debug(f"[MICRO] buffer_len={len(self._micro_ticks)}")
+            # except Exception as e:
+            #     logger.debug(f"[MICRO] append error: {e}")
+                
+            # Microstructure tracking (guard out-of-order ts)
             try:
-                self._micro_ticks.append((tick_data['timestamp'], float(tick_data.get('ltp', 0.0))))
-                if len(self._micro_ticks) % 50 == 0:
-                    logger.debug(f"[MICRO] buffer_len={len(self._micro_ticks)}")
+                ts = tick_data.get('timestamp')
+                ltp = float(tick_data.get('ltp', 0.0))
+                if self._micro_ticks and ts and ts <= self._micro_ticks[-1][0]:
+                    logger.debug("[MICRO] out-of-order tick skipped: %s <= %s", 
+                                ts.strftime('%H:%M:%S') if hasattr(ts, 'strftime') else ts,
+                                self._micro_ticks[-1][0].strftime('%H:%M:%S') if hasattr(self._micro_ticks[-1][0], 'strftime') else self._micro_ticks[-1][0])
+                elif ts and ltp > 0:
+                    self._micro_ticks.append((ts, ltp))
+                    if len(self._micro_ticks) % 50 == 0:
+                        logger.debug("[MICRO] buffer_len=%d", len(self._micro_ticks))
             except Exception as e:
-                logger.debug(f"[MICRO] append error: {e}")
+                logger.debug("[MICRO] append error: %s", e)
+
 
             
             if len(self.tick_buffer) > self.config.max_buffer_size:
