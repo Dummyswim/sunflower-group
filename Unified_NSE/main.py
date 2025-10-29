@@ -171,6 +171,10 @@ class EnhancedUnifiedTradingSystem:
             logger.info("[HR] Hit-rate tracker initialized: base=%s rotate=%s keep_days=%d symlink=%s", self.config.hitrate_base_path, self.config.hitrate_rotate_daily, self.config.hitrate_keep_days, self.config.hitrate_symlink_latest)
 
             logger.info("✅ Configuration loaded")
+            
+
+
+            
             logger.debug(self.config.get_summary())
             
             # Initialize SetupStats for historical evidence
@@ -326,244 +330,374 @@ MTF Alignment: {self.config.multi_timeframe_alignment}
 
 
 
+
     async def _predict_next_minute(self, now_ist: datetime):
+        """
+        Predict next 1m bar at :predict_second with high-visibility, de-duplicated logging.
+        Flow: ENTRY → FRAMES → INDICATORS → CONTEXT → NEXT-1m → SETUPS → MICRO SAVE → CANDIDATE SAVE
+        """
         try:
             async with self._nm_lock:
-                # Compute the next minute start and mark it early to avoid double-fire
-                next_start = now_ist.replace(second=0, microsecond=0) + timedelta(minutes=1)
-                
-                logger.info("[NEXT-1m][ENTRY] now=%s next_start=%s", now_ist.strftime('%H:%M:%S'), next_start.strftime('%H:%M'))
+                predict_sec = int(getattr(self.config, 'next_minute_predict_second', 57))
+                resolve_sec = int(getattr(self.config, 'next_minute_resolve_second', 10))
 
-                
-                
+                # 1) ENTRY and duplicate-guard
+                next_start = now_ist.replace(second=0, microsecond=0) + timedelta(minutes=1)
+                logger.info("[NEXT-1m][ENTRY] now=%s | target_next_start=%s | predict_sec=:%02d | resolve_sec=:%02d",
+                            now_ist.strftime('%H:%M:%S'), next_start.strftime('%H:%M'), predict_sec, resolve_sec)
                 if self._last_nm_predicted == next_start:
-                    logger.debug("[NEXT-1m] duplicate guard: already predicted %s", next_start.strftime('%H:%M'))
+                    logger.debug("[NEXT-1m][ENTRY] Duplicate guard: already predicted %s", next_start.strftime('%H:%M'))
                     return
                 self._last_nm_predicted = next_start
 
-                # Micro snapshot
+                # 2) Reset per-minute noise baseline for 1m analyzer
+                try:
+                    if self.signal_analyzer:
+                        self.signal_analyzer._nm_std_ref = None
+                        logger.debug("[NEXT-1m][INIT] Analyzer 1m std baseline reset")
+                except Exception as e:
+                    logger.debug("[NEXT-1m][INIT] Baseline reset skipped: %s", e)
+
+                # 3) MICRO snapshot (always try; used even if setups fail later)
                 try:
                     micro = self.websocket_handler.get_micro_features() if self.websocket_handler else {}
-                except Exception:
+                except Exception as e:
+                    logger.debug("[NEXT-1m][MICRO] snapshot failed: %s", e)
                     micro = {}
 
-                # Context: latest 5m/15m
-                df_5m = self.persistence_manager.get_data("5m", 100)
-                df_15m = self.persistence_manager.get_data("15m", 60)
-                indicators_5m = await self.technical_analysis.calculate_all_indicators(df_5m)
+                # 4) FRAMES: persisted 5m and 15m, plus ws-tail fallback for setup derivation
+                df_5m = pd.DataFrame()
+                df_15m = pd.DataFrame()
+                try:
+                    df_5m = self.persistence_manager.get_data("5m", 100)
+                    df_15m = self.persistence_manager.get_data("15m", 60)
+                except Exception as e:
+                    logger.error("[NEXT-1m][FRAME] persist get_data error: %s", e)
+
+                # ws-tail (fresh) frame for setups
+                df_5m_ws = None
+                try:
+                    if (self.websocket_handler and isinstance(self.websocket_handler.candle_data, pd.DataFrame)
+                        and not self.websocket_handler.candle_data.empty):
+                        df_5m_ws = self.websocket_handler.candle_data.tail(100).copy()
+                except Exception as e:
+                    logger.debug("[NEXT-1m][FRAME] ws-tail fetch skipped: %s", e)
+
+                # Choose frame for setup detectors
+                df_5m_for_setups = df_5m
+                persist_ref = df_5m.index[-1].strftime('%H:%M') if not df_5m.empty else "no persisted 5m"
+                ws_ref = (df_5m_ws.index[-1].strftime('%H:%M') if (df_5m_ws is not None and not df_5m_ws.empty)
+                        else "no websocket 5m")
+
+                try:
+                    if (df_5m_ws is not None and not df_5m_ws.empty and not df_5m.empty
+                            and df_5m_ws.index[-1] > df_5m.index[-1]):
+                        df_5m_for_setups = df_5m_ws
+                        logger.info("[NEXT-1m][FRAME] ws ahead of persist → setups will use ws-frame (persist=%s, ws=%s)", persist_ref, ws_ref)
+                    else:
+                        logger.info("[NEXT-1m][FRAME] setups will use persist-frame (persist=%s, ws=%s)", persist_ref, ws_ref)
+                except Exception as e:
+                    logger.debug("[NEXT-1m][FRAME] selection fallback to persist: %s", e)
+
+                # 5) INDICATORS (persisted 5m and 15m)
+                indicators_5m = {}
                 indicators_15m = None
-                if not df_15m.empty:
-                    indicators_15m = await self.calculate_15m_indicators(df_15m)
+                if df_5m.empty:
+                    logger.info("[NEXT-1m][IND] No 5m data available; aborting this :%02d cycle", predict_sec)
+                    return
+                try:
+                    indicators_5m = await self.technical_analysis.calculate_all_indicators(df_5m)
+                    if not df_15m.empty:
+                        indicators_15m = await self.calculate_15m_indicators(df_15m)
+                    logger.info("[NEXT-1m][IND] Indicators computed: 5m=%d blocks | 15m=%s", len(indicators_5m), "yes" if indicators_15m else "no")
+                except Exception as e:
+                    logger.error("[NEXT-1m][IND] Indicator calc error: %s", e)
+                    return
 
-                # 5m scorer and MTF once per cycle
+                # 6) CONTEXT (session characteristics and MTF score for visibility only)
                 session_info = self.signal_analyzer.detect_session_characteristics(df_5m)
-                raw = self.signal_analyzer._calculate_weighted_signal(indicators_5m)
-                mtf_score = 0.0
+                try:
+                    self.signal_analyzer.current_df = df_5m  # scorer ref
+                except Exception:
+                    pass
 
+                mtf_score = 0.0
                 try:
                     checker = (self.signal_analyzer.mtf_analyzer.check_timeframe_alignment_quiet
                             if getattr(self.config, 'quiet_mtf_in_1m', True)
                             else self.signal_analyzer.mtf_analyzer.check_timeframe_alignment)
-                    mtf_aligned, mtf_score, _ = (
-                        checker(raw if isinstance(raw, dict) else {},
-                                indicators_15m,
-                                df_15m if indicators_15m is not None else None,
-                                session_info)
-                        if indicators_15m is not None and df_15m is not None
-                        else (True, 0.0, "")
+                    mtf_aligned, mtf_score, _desc = (
+                        checker({'composite_signal': 'NEUTRAL'}, indicators_15m, df_15m, session_info)
+                        if indicators_15m is not None and not df_15m.empty else (True, 0.0, "no-15m")
                     )
                 except Exception:
                     mtf_score = 0.0
 
-                session = "open" if now_ist.hour*60+now_ist.minute <= 10*60+15 else "mid" if now_ist.hour*60+now_ist.minute < 14*60+30 else "close"
-
-                # Use 5m-only context for 1m (not 15m-influenced mtf_score)
+                # Use only 5m context score for next-1m gating
                 micro_context_score = self._compute_5m_micro_context(indicators_5m, session_info)
-                logger.info(f"[NEXT-1m] Using micro_context_score={micro_context_score:.2f} (NOT mtf_score={mtf_score:.2f})")
+                logger.info("[NEXT-1m][CTX] session=%s | micro_ctx=%.2f | mtf_score(15m view)=%.2f",
+                            session_info.get('session', 'unknown'), micro_context_score, mtf_score)
+
+                # 7) NEXT-1m forecast/classifier (single call; sanitized in analyzer)
                 nm = self.signal_analyzer.analyze_next_minute(
-                    indicators_5m, indicators_15m, micro, micro_context_score, session
+                    indicators_5m, indicators_15m, micro, micro_context_score,
+                    "open" if now_ist.hour*60+now_ist.minute <= 10*60+15 else "mid" if now_ist.hour*60+now_ist.minute < 14*60+30 else "close"
                 )
 
-                
-                
-                # ========== REPLACEMENT STARTS HERE ==========
-                
-                # Color forecast + confidence (always available); trade classifier may still be neutral
+
+                # Store ML example for later learning (at resolve)
+                try:
+                    if nm.get('nm_features') is not None and nm.get('model_p') is not None:
+                        self.signal_analyzer.remember_nm_example(next_start, np.array(nm['nm_features'], dtype=float), float(nm['model_p']))
+                except Exception as e:
+                    logger.debug("[NM-ML] remember example skipped: %s", e)
+
+
+                # 8) FORECAST (display-only) summary
                 side_cls = str(nm.get('composite_signal', 'NEUTRAL')).upper()
                 forecast_dir = str(nm.get('forecast_color', side_cls)).upper()
                 forecast_prob = float(nm.get('forecast_prob', nm.get('confidence', 30.0)))
-                                
+                logger.info("[NEXT-1m][FORECAST] t+1m=%s | dir=%s | prob=%.1f%% | classifier_side=%s",
+                            next_start.strftime('%H:%M'), forecast_dir, forecast_prob, side_cls)
 
-
-
-                # Optional: evidence-conditioned setup nudge to forecast (bounded, location-aware)
+                # 9) SETUPS: derive directly on freshest 5m frame; provide meaningful messages
+                pivot_dir = None
+                pivot_name = None
+                imb_dir = None
+                imb_why = None
                 try:
-                    # Pull 5m raw contributions for setups
-                    contrib = raw.get('contributions', {}) if isinstance(raw, dict) else {}
-                    ps = contrib.get('pivot_swipe', {}) or {}
-                    im = contrib.get('imbalance', {}) or {}
+                    self.signal_analyzer.current_df = df_5m_for_setups
+                except Exception:
+                    pass
 
-                    # Build context key for SetupStats (if available)
-                    p_recent = n_recent = None
-                    if hasattr(self, 'setup_stats') and self.setup_stats:
-                        try:
-                            from setup_statistics import make_setup_key
-                            rec = {
-                                "direction": "BUY" if "BUY" in str(forecast_dir) else ("SELL" if "SELL" in str(forecast_dir) else "NEUTRAL"),
-                                "mtf_score": float(mtf_score or 0.0),
-                                "breadth": int(raw.get('active_indicators', 0) or 0),
-                                "weighted_score": float(raw.get('weighted_score', 0.0) or 0.0),
-                                "macd_hist_slope": float(contrib.get('macd', {}).get('hist_slope', 0.0) or 0.0),
-                                "rsi_value": float(contrib.get('rsi', {}).get('rsi_value', 50.0) or 50.0),
-                                "rsi_cross_up": bool(contrib.get('rsi', {}).get('rsi_cross_up', False)),
-                                "rsi_cross_down": bool(contrib.get('rsi', {}).get('rsi_cross_down', False)),
-                                "sr_room": str(getattr(self.signal_analyzer.mtf_analyzer, '_last_sr_room', 'UNKNOWN')),
-                                "tod": session
-                            }
-                            key = make_setup_key(rec)
-                            p_recent, lo, hi, n_recent = self.setup_stats.get(key, window="recent")
-                        except Exception as _e:
-                            p_recent = n_recent = None
+                # Detectors (safe)
+                ps_det = {}
+                imb_det = {}
+                try:
+                    ps_det = self.signal_analyzer.detect_pivot_swipe(df_5m_for_setups, indicators_5m, self.config) or {}
+                except Exception as e:
+                    logger.debug("[NEXT-1m][SETUPS] pivot_swipe detect skipped: %s", e)
+                try:
+                    imb_det = self.signal_analyzer.detect_imbalance_structure(df_5m_for_setups, indicators_5m, self.config) or {}
+                except Exception as e:
+                    logger.debug("[NEXT-1m][SETUPS] imbalance detect skipped: %s", e)
 
-                    # Apply a tiny nudge only when:
-                    # - A setup exists AND matches forecast_dir,
-                    # - Location is good (not sr_room LIMITED at high BB for BUY; not LIMITED at low BB for SELL),
-                    # - Enough evidence (p_recent>=0.60 with n>=30), else skip
-                    bb_pos = float(indicators_5m.get('bollinger', {}).get('position', 0.5) or 0.5)
-                    sr_room = str(getattr(self.signal_analyzer.mtf_analyzer, '_last_sr_room', 'UNKNOWN'))
-                    setup_dir = None
-                    if isinstance(ps, dict) and ps.get('direction'):
-                        setup_dir = 'BUY' if ps.get('direction') == 'LONG' else 'SELL'
-                    if isinstance(im, dict) and im.get('direction') and setup_dir is None:
-                        setup_dir = 'BUY' if im.get('direction') == 'LONG' else 'SELL'
+                pivot_dir = ps_det.get('direction')          # LONG/SHORT or None
+                pivot_name = ps_det.get('level_name')        # PDH/PDL/SWING_H/SWING_L or None
+                imb_dir = imb_det.get('direction')           # LONG/SHORT or None
+                imb_why = imb_det.get('why')                 # reason if not detected
 
-                    loc_ok = True
-                    if setup_dir == 'BUY' and (sr_room == 'LIMITED' and bb_pos >= 0.65):
-                        loc_ok = False
-                    if setup_dir == 'SELL' and (sr_room == 'LIMITED' and bb_pos <= 0.35):
-                        loc_ok = False
+                # 1m micro-direction hint when 5m imbalance setup is absent
+                micro_hint = None
+                try:
+                    imbL = float(micro.get('imbalance', 0.0) or 0.0)
+                    imbS = float(micro.get('imbalance_short', 0.0) or 0.0)
+                    nS = int(micro.get('n_short', 0) or 0)
+                    wS = 0.60 if nS >= int(getattr(self.config, 'micro_short_min_ticks_1m', 12)) else 0.0
+                    wL = 0.40
+                    blend = (wS*imbS + wL*imbL) / max(1e-9, wS + wL)
+                    if abs(blend) >= 0.15:
+                        micro_hint = 'LONG' if blend > 0 else 'SHORT'
+                except Exception:
+                    micro_hint = None
 
-                    if setup_dir in ('BUY','SELL') and setup_dir == forecast_dir and loc_ok and p_recent is not None and n_recent is not None and p_recent >= 0.60 and n_recent >= 30:
-                        old = float(forecast_prob)
-                        # bounded nudge 0–4 pp toward the setup-supported side (scale by evidence and keep prob in [10,90])
-                        nud = min(4.0, max(1.0, (p_recent*100.0 - 50.0) * 0.08))
-                        forecast_prob = float(max(10.0, min(90.0, old + (nud if forecast_dir == 'BUY' else -nud))))
-                        logger.info("[SETUP-EVIDENCE1m] %s supported (p=%.1f%%, n=%d) → prob %.1f→%.1f (sr=%s, bb=%.2f)",
-                                    setup_dir, p_recent*100.0, n_recent, old, forecast_prob, sr_room, bb_pos)
-                    else:
-                        if setup_dir:
-                            logger.info("[SETUP-EVIDENCE1m] No nudge (setup=%s, loc_ok=%s, p=%s, n=%s, sr=%s, bb=%.2f)",
-                                        setup_dir, loc_ok, f"{p_recent:.2f}" if p_recent is not None else "NA",
-                                        f"{n_recent}" if n_recent is not None else "NA", sr_room, bb_pos)
-                except Exception as _e:
-                    logger.debug(f"[SETUP-EVIDENCE1m] skipped: {_e}")
+                # Build friendly "meaningful messages"
+                swipe_msg = (f"{pivot_dir} @{pivot_name}" if (pivot_dir and pivot_name)
+                            else "no swipe on last closed 5m bar (no PDH/PDL/SWING reclaim)")
+                if imb_dir:
+                    imb_msg = f"{imb_dir}"
+                else:
+                    imb_msg = ("no 5m imbalance setup on last closed bar"
+                            + (f" (why={imb_why})" if imb_why else ""))
 
-                # Final forecast log after setup nudge
-                logger.info("NEXT (forecast-only) -> %s | t+1m=%s | prob=%.1f%%", forecast_dir, next_start.strftime('%H:%M'), forecast_prob)
+                # Include both frames for transparency
+                logger.info("[NEXT-1m][SETUPS] 5m_ref(persist)=%s | 5m_ref(ws)=%s | swipe=%s | imbalance_5m=%s%s",
+                            persist_ref, ws_ref, swipe_msg,
+                            imb_msg,
+                            (f" | micro_hint={micro_hint}" if (not imb_dir and micro_hint) else ""))
 
-                # Save 1m forecast as calibration (direction kept NEUTRAL for trade abstention)
+                # 10) Build and save Candidate for hit-rate (forecast-only evaluation)
                 cand = Candidate(
                     next_bar_time=next_start,
                     direction="NEUTRAL",
                     actionable=False,
                     rejection_reason="1m_eval",
                     mtf_score=float(mtf_score),
-                    breadth=int(raw.get('active_indicators', 0)),
-                    weighted_score=float(raw.get('weighted_score', 0.0)),
-                    macd_hist_slope=float(raw.get('contributions', {}).get('macd', {}).get('hist_slope', 0.0)),
-                    rsi_value=float(raw.get('contributions', {}).get('rsi', {}).get('rsi_value', 50.0)),
-                    rsi_cross_up=bool(raw.get('contributions', {}).get('rsi', {}).get('rsi_cross_up', False)),
-                    rsi_cross_down=bool(raw.get('contributions', {}).get('rsi', {}).get('rsi_cross_down', False)),
-                    pattern_used=bool(raw.get('contributions', {}).get('pattern_boost_applied', False)),
+                    breadth=int(0),
+                    weighted_score=0.0,
+                    macd_hist_slope=float(indicators_5m.get('macd', {}).get('hist_slope_closed', 0.0) or 0.0),
+                    rsi_value=float(indicators_5m.get('rsi', {}).get('value', 50.0) or 50.0),
+                    rsi_cross_up=False,
+                    rsi_cross_down=False,
+                    pattern_used=False,
                     sr_room=str(getattr(self.signal_analyzer.mtf_analyzer, '_last_sr_room', 'UNKNOWN')),
                     regime=str(session_info.get('session', 'UNKNOWN')),
-                    confidence=float(forecast_prob) / 100.0,  # store forecast probability
-                    oi_signal=raw.get('contributions', {}).get('oi', {}).get('signal', 'neutral'),
-                    oi_change_pct=float(raw.get('contributions', {}).get('oi', {}).get('oi_change_pct', 0.0)),
+                    confidence=float(forecast_prob) / 100.0,
+                    oi_signal=(indicators_5m.get('oi', {}) or {}).get('signal', 'neutral'),
+                    oi_change_pct=float((indicators_5m.get('oi', {}) or {}).get('oi_change_pct', 0.0) or 0.0),
                     saved_at=datetime.now(),
                     horizon="1m",
-                    liberal_direction=("BUY" if "BUY" in forecast_dir else ("SELL" if "SELL" in forecast_dir else "NEUTRAL"))
+                    liberal_direction=("BUY" if "BUY" in side_cls else ("SELL" if "SELL" in side_cls else "NEUTRAL"))
                 )
 
-                # Attach setup tags (for JSON ease-of-use) and :57 micro snapshot
+                # Attach setup tags (with reasons and hint)
                 try:
-                    cand.pivot_swipe = ps.get('direction')
-                    cand.pivot_level = ps.get('name')
-                    cand.imbalance = im.get('direction')
-                    logger.info("[NEXT-1m][CAL] setups -> pivot_swipe=%s @%s | imbalance=%s",
-                                cand.pivot_swipe, cand.pivot_level, cand.imbalance)
+                    cand.pivot_swipe = pivot_dir
+                    cand.pivot_level = pivot_name
+                    cand.imbalance = imb_dir               # 5m setup (LONG/SHORT or None)
+                    cand.imbalance_why = imb_why           # reason when None
+                    cand.imbalance_micro_hint = micro_hint # 1m micro hint when 5m setup missing
                 except Exception as e:
-                    logger.debug(f"[NEXT-1m] setup populate skipped: {e}")
+                    logger.debug("[NEXT-1m][SETUPS] attach skipped: %s", e)
 
-                # Save :57 micro snapshot for calibration/virtual lab (added to JSON by HitRateTracker)
+                # Attach :57 micro snapshot (both windows) for calibration
                 try:
                     cand.nm_micro = {
                         'imbalance': float(micro.get('imbalance', 0.0) or 0.0),
+                        'imbalance_short': float(micro.get('imbalance_short', 0.0) or 0.0),
                         'slope': float(micro.get('slope', 0.0) or 0.0),
+                        'slope_short': float(micro.get('slope_short', 0.0) or 0.0),
+                        'momentum_delta': float(micro.get('momentum_delta', 0.0) or 0.0),
                         'std_dltp': float(micro.get('std_dltp', 0.0) or 0.0),
+                        'std_dltp_short': float(micro.get('std_dltp_short', 0.0) or 0.0),
                         'drift': float(micro.get('vwap_drift_pct', 0.0) or 0.0),
-                        'n': int(micro.get('n', 0) or 0)
+                        'n': int(micro.get('n', 0) or 0),
+                        'n_short': int(micro.get('n_short', 0) or 0)
                     }
-                    logger.info("[NEXT-1m][MICRO] saved to candidate: imb=%.2f slope=%.3f stdΔ=%.5f drift=%.3f%% n=%d",
-                                cand.nm_micro['imbalance'], cand.nm_micro['slope'],
-                                cand.nm_micro['std_dltp'], cand.nm_micro['drift'], cand.nm_micro['n'])
-                except Exception as _e:
-                    logger.debug(f"[NEXT-1m] micro attach skipped: {_e}")
+                    logger.info("[NEXT-1m][MICRO] saved: n=%d|%d imbL=%.2f imbS=%.2f slpL=%.3f slpS=%.3f momΔ=%.3f stdL=%.5f stdS=%.5f drift=%.3f%%",
+                                cand.nm_micro['n'], cand.nm_micro['n_short'],
+                                cand.nm_micro['imbalance'], cand.nm_micro['imbalance_short'],
+                                cand.nm_micro['slope'], cand.nm_micro['slope_short'],
+                                cand.nm_micro['momentum_delta'], cand.nm_micro['std_dltp'],
+                                cand.nm_micro['std_dltp_short'], cand.nm_micro['drift'])
+                except Exception as e:
+                    logger.debug("[NEXT-1m][MICRO] attach skipped: %s", e)
 
+                # Finally save candidate to hit-rate
                 self.hit_tracker.save_candidate(cand)
+                logger.info("[NEXT-1m][SAVE] Candidate saved for t+1m=%s (forecast=%s @ %.1f%%)",
+                            next_start.strftime('%H:%M'), forecast_dir, forecast_prob)
 
-                
-                
-                
-                
-                
-                
-                
-                # ========== REPLACEMENT ENDS HERE ==========
-                
+            
+                # Store ML example for later learning (at resolve)
+                try:
+                    if nm.get('nm_features') is not None and nm.get('model_p') is not None:
+                        self.signal_analyzer.remember_nm_example(next_start, np.array(nm['nm_features'], dtype=float), float(nm['model_p']))
+                except Exception as e:
+                    logger.debug("[NM-ML] remember example skipped: %s", e)
+
+
         except Exception as e:
             logger.error(f"[NEXT-1m] predict error: {e}", exc_info=True)
 
 
 
+
     async def _resolve_last_minute(self, now_ist: datetime):
+        """
+        Resolve the previous 1m bar using tick data in [prev_start, prev_start+1m).
+        Flow: ENTRY → WINDOW → TICKS → BAR → SAVE
+        High-visibility logs; idempotent and race-safe under _nm_lock.
+        """
         try:
-            
-            logger.info("[NEXT-1m][RESOLVE] window=%s→%s",
-                (now_ist.replace(second=0, microsecond=0) - timedelta(minutes=1)).strftime('%H:%M'),
-                (now_ist.replace(second=0, microsecond=0)).strftime('%H:%M'))
+            async with self._nm_lock:
+                # 1) ENTRY and window
+                window_end = now_ist.replace(second=0, microsecond=0)  # current minute start
+                prev_start = window_end - timedelta(minutes=1)  # previous minute start
+                logger.info("[NEXT-1m][RESOLVE][ENTRY] now=%s | window=%s→%s",
+                            now_ist.strftime('%H:%M:%S'),
+                            prev_start.strftime('%H:%M:%S'),
+                            window_end.strftime('%H:%M:%S'))
 
-            # Resolve previous minute (start boundary one minute ago)
-            prev_start = now_ist.replace(second=0, microsecond=0) - timedelta(minutes=1)
-            if self._last_nm_resolved == prev_start:
-                return
-            # Window [prev_start, prev_start+1m)
-            wnd_end = prev_start + timedelta(minutes=1)
-            ticks = []
-            try:
-                ticks = self.websocket_handler.get_ticks_between(prev_start, wnd_end) if self.websocket_handler else []
-            except Exception:
-                ticks = []
-            if not ticks:
-                logger.info("[NEXT-1m] No ticks in window %s→%s; deferring", prev_start.strftime('%H:%M'), wnd_end.strftime('%H:%M'))
+                # Idempotent guard
+                if self._last_nm_resolved == prev_start:
+                    logger.debug("[NEXT-1m][RESOLVE][ENTRY] Duplicate guard: already resolved %s",
+                                prev_start.strftime('%H:%M'))
+                    return
+
+                # 2) Safety: no handler
+                if not self.websocket_handler:
+                    logger.info("[NEXT-1m][RESOLVE] No WebSocket handler available; skipping resolution")
+                    return
+
+                # 3) Pull ticks in the exact minute window [prev_start, window_end)
+                try:
+                    ticks = self.websocket_handler.get_ticks_between(prev_start, window_end) or []
+                except Exception as e:
+                    logger.debug("[NEXT-1m][RESOLVE] get_ticks_between failed: %s", e)
+                    ticks = []
+
+                if not ticks:
+                    logger.info("[NEXT-1m][RESOLVE][MISS] 0 ticks in window %s→%s; will retry next :%02d",
+                                prev_start.strftime('%H:%M:%S'),
+                                window_end.strftime('%H:%M:%S'),
+                                int(getattr(self.config, 'next_minute_resolve_second', 10)))
+                    return
+
+                # 4) Sanitize and sort by timestamp; keep only finite prices > 0
+                try:
+                    valid = [t for t in ticks
+                             if t.get('timestamp') is not None
+                             and isinstance(t.get('ltp'), (int, float))
+                             and float(t.get('ltp')) > 0]
+                    ticks_sorted = sorted(valid, key=lambda x: x['timestamp'])
+                except Exception:
+                    ticks_sorted = []
+
+                if not ticks_sorted:
+                    logger.info("[NEXT-1m][RESOLVE][MISS] No valid price ticks in window; deferring")
+                    return
+
+                first_ts = ticks_sorted[0]['timestamp']
+                last_ts = ticks_sorted[-1]['timestamp']
+                open_px = float(ticks_sorted[0]['ltp'])
+                close_px = float(ticks_sorted[-1]['ltp'])
+
+                # 5) Diagnostics on coverage inside the window
+                try:
+                    gap_pre = (first_ts - prev_start).total_seconds()
+                    gap_post = (window_end - last_ts).total_seconds()
+                except Exception:
+                    gap_pre = gap_post = 0.0
+
+                logger.info("[NEXT-1m][RESOLVE][TICKS] count=%d | first=%s (+%.1fs) | last=%s (-%.1fs)",
+                            len(ticks_sorted),
+                            first_ts.strftime('%H:%M:%S'),
+                            gap_pre,
+                            last_ts.strftime('%H:%M:%S'),
+                            gap_post)
+
+                # 6) Compute bar outcome
+                move = close_px - open_px
+                direction = "UP" if move > 0 else ("DOWN" if move < 0 else "FLAT")
+                logger.info("[NEXT-1m][RESOLVE][BAR] open=%.2f close=%.2f Δ=%.2f (%s)",
+                            open_px, close_px, move, direction)
+
+
+                # Online learning for 1m ML model (label = 1 if UP else 0)
+                try:
+                    if hasattr(self.signal_analyzer, '_nm_pending'):
+                        ex = self.signal_analyzer._nm_pending.pop(prev_start, None)
+                        if ex and self.signal_analyzer.nm_model is not None:
+                            y = 1 if move > 0 else 0
+                            self.signal_analyzer.nm_model.update(ex['x'], y)
+                            logger.info("[NM-ML] learned @%s | y=%d | p_ml(prev)=%.3f", prev_start.strftime('%H:%M'), y, float(ex.get('p_ml', 0.0)))
+                except Exception as e:
+                    logger.debug("[NM-ML] learn skipped: %s", e)
                 
-                return
-            prices = [float(t.get('ltp', 0.0)) for t in ticks if 'ltp' in t]
-            if not prices:
-                return
-            open_px = prices[0]
-            close_px = prices[-1]
-            # Use horizon="1m"
-            self.hit_tracker.resolve_bar(prev_start, open_px, close_px, logger, horizon="1m")
-            self._last_nm_resolved = prev_start
+
+
+                # 7) Persist result into hit-rate and mark resolved
+                try:
+                    self.hit_tracker.resolve_bar(prev_start, open_px, close_px, logger, horizon="1m")
+                except Exception as e:
+                    logger.error("[NEXT-1m][RESOLVE] hit_tracker.resolve_bar error: %s", e, exc_info=True)
+
+                self._last_nm_resolved = prev_start
+                logger.info("[NEXT-1m][RESOLVE][DONE] resolved_minute=%s", prev_start.strftime('%H:%M'))
+
         except Exception as e:
-            logger.error(f"[NEXT-1m] resolve error: {e}", exc_info=True)
-
-
-
-
-
-
+            logger.error("[NEXT-1m][RESOLVE] error: %s", e, exc_info=True)
 
 
 

@@ -1219,12 +1219,28 @@ class ConsolidatedSignalAnalyzer:
         self.current_df = None 
         self._nm_std_ref = None
         
+ 
         self._nm_last_side = 0
         self._nm_side_streak = 0
         
+        # Online micro-only next-1m model
+        self.nm_model = None
+        self._nm_pending = {}  # next_bar_time -> {'x': np.array, 'p_ml': float}
+        try:
+            if getattr(self.config, 'enable_next_minute_ml', True):
+                from next_minute_model import OnlineLogit
+                # We use 10 features (see _build_nm_features)
+                self.nm_model = OnlineLogit(n_features=10,
+                                            lr=float(getattr(self.config,'nm_ml_lr',0.03)),
+                                            l2=float(getattr(self.config,'nm_ml_l2',0.0005)))
+                logger.info("[NM-ML] OnlineLogit initialized (n=10, lr=%.3f, l2=%.5f)",
+                            float(getattr(self.config,'nm_ml_lr',0.03)),
+                            float(getattr(self.config,'nm_ml_l2',0.0005)))
+        except Exception as e:
+            logger.warning("[NM-ML] init skipped: %s", e)
+            self.nm_model = None
+        
         logger.info("Enhanced ConsolidatedSignalAnalyzer initialized")
-
-
 
 
 
@@ -1453,57 +1469,116 @@ class ConsolidatedSignalAnalyzer:
 
 
 
-
     def detect_imbalance_structure(self, df: pd.DataFrame, indicators: dict, cfg) -> dict:
-        """3-candle imbalance (C1,C2,C3) + EMA(20/50) widening."""
+        """
+        3-candle imbalance (C1,C2,C3) + EMA(20/50) widening with reason logging on miss.
+        Returns:
+        - {'detected': True, 'direction': 'LONG'|'SHORT', 'quality': {...}}
+        - {'detected': False, 'why': '<reason>'} when not detected
+        """
         out = {'detected': False}
         try:
-            if df is None or len(df) < 3 or not getattr(cfg, 'enable_imbalance_structure', True):
+            # Guards
+            if df is None or len(df) < 3:
+                out['why'] = "insufficient bars (<3)"
+                logger.info("[IMB][MISS] %s", out['why'])
                 return out
-            c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-            body = abs(c2['close'] - c2['open'])
-            total = max(1e-9, c2['high'] - c2['low'])
-            body_ratio_min = float(getattr(cfg, 'imbalance_c2_min_body_ratio', 0.60))
-            if (body / total) < body_ratio_min:
-                return out
-            
-            bull = c1['high'] < c3['low']
-            bear = c1['low'] > c3['high']
-            if not (bull or bear):
+            if not getattr(cfg, 'enable_imbalance_structure', True):
+                out['why'] = "disabled in config"
+                logger.info("[IMB][MISS] %s", out['why'])
                 return out
 
-            # EMA 20/50 widening
+            # Last three closed 5m bars
+            c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
+
+            # C2 body strength
+            body = abs(float(c2['close']) - float(c2['open']))
+            total = max(1e-9, float(c2['high']) - float(c2['low']))
+            body_ratio = float(body / total)
+            body_ratio_min = float(getattr(cfg, 'imbalance_c2_min_body_ratio', 0.60))
+            if body_ratio < body_ratio_min:
+                out['why'] = f"C2 body {body_ratio:.2f} < {body_ratio_min:.2f}"
+                logger.info("[IMB][MISS] %s", out['why'])
+                return out
+
+            # C1–C3 displacement (gap)
+            bull = float(c1['high']) < float(c3['low'])
+            bear = float(c1['low']) > float(c3['high'])
+            if not (bull or bear):
+                out['why'] = "no C1–C3 displacement (gap)"
+                logger.info("[IMB][MISS] %s", out['why'])
+                return out
+
+            # EMA 20/50 widening (bps)
             widening_ok = True
             spread_bps = None
             try:
-                p = df['close']
+                p = pd.to_numeric(df['close'], errors='coerce').ffill()
                 pair = getattr(cfg, 'ema_widen_pair', (20, 50))
                 ema20 = p.ewm(span=int(pair[0]), adjust=False).mean()
                 ema50 = p.ewm(span=int(pair[1]), adjust=False).mean()
-                spread_bps = self._bps(float(ema20.iloc[-1]), float(ema50.iloc[-1]))
-                widening_ok = spread_bps >= float(getattr(cfg, 'ema_widen_min_bps', 8.0))
+                a, b = float(ema20.iloc[-1]), float(ema50.iloc[-1])
+                # basis points relative to EMA50 for stability
+                spread_bps = self._bps(a, b)
+                widen_min = float(getattr(cfg, 'ema_widen_min_bps', 8.0))
+                widening_ok = spread_bps >= widen_min
+                if not widening_ok:
+                    out['why'] = f"EMA widen {spread_bps:.1f} bps < {widen_min:.1f} bps"
             except Exception:
+                # If EMA calc fails, don't block detection just because of EMA
                 widening_ok = True
-            
+
             if not widening_ok:
+                logger.info("[IMB][MISS] %s", out.get('why', 'EMA widening below minimum'))
                 return out
 
-            out = {'detected': True,
-                'direction': 'LONG' if bull else 'SHORT',
-                'quality': {'c2_body_ratio': float(body / total),
-                            'ema_widen_bps': float(spread_bps) if spread_bps is not None else None}}
+            # Detected
+            direction = 'LONG' if bull else 'SHORT'
+            out = {
+                'detected': True,
+                'direction': direction,
+                'quality': {
+                    'c2_body_ratio': body_ratio,
+                    'ema_widen_bps': float(spread_bps) if spread_bps is not None else None
+                }
+            }
             logger.info("[IMB] %s c2_body=%.2f widen_bps=%s",
-                        out['direction'],
-                        out['quality']['c2_body_ratio'],
+                        direction, body_ratio,
                         f"{spread_bps:.1f}" if spread_bps is not None else "N/A")
             return out
-        except Exception:
+
+        except Exception as e:
+            out['why'] = f"error: {e}"
+            logger.debug("[IMB][MISS] %s", out['why'])
             return out
- 
-        
-        
 
 
+
+    def _build_nm_features(self, micro: Dict[str, float], imb_blend: float, slp_avg: float, z_sig: float) -> np.ndarray:
+        """
+        Construct micro-only feature vector (length 10), NaN/Inf safe:
+        [imb, imbS, slp_avg, slpS, momΔ, stdΔ, drift, nL/100, nS/50, z_sig]
+        """
+        try:
+            imbS = float(micro.get('imbalance_short', 0.0) or 0.0)
+            slpS = float(micro.get('slope_short', 0.0) or 0.0)
+            std_d = float(micro.get('std_dltp', 0.0) or 0.0)
+            drift = float(micro.get('vwap_drift_pct', 0.0) or 0.0) / 100.0
+            nL = float(micro.get('n', 0) or 0.0)
+            nS = float(micro.get('n_short', 0) or 0.0)
+            mom = float(micro.get('momentum_delta', 0.0) or 0.0)
+            x = np.array([imb_blend, imbS, slp_avg, slpS, mom, std_d, drift, nL/100.0, nS/50.0, float(z_sig)], dtype=float)
+            x[~np.isfinite(x)] = 0.0
+            return x
+        except Exception:
+            return np.zeros(10, dtype=float)
+
+    def remember_nm_example(self, next_bar_time, x: np.ndarray, p_ml: float):
+        try:
+            self._nm_pending[next_bar_time] = {'x': np.asarray(x, dtype=float), 'p_ml': float(p_ml)}
+            logger.info("[NM-ML] stored example for %s | p_ml=%.3f", str(next_bar_time), float(p_ml))
+        except Exception as e:
+            logger.debug("[NM-ML] remember skipped: %s", e)
 
 
 
@@ -1516,276 +1591,377 @@ class ConsolidatedSignalAnalyzer:
         session: str
     ) -> Dict:
         """
-        Classify next 1m candle using a 5m-only micro_context_score with SOFT application at extremes.
-        The previous mtf_score (15m-influenced) is NOT used here to avoid 15m→1m cascade.
+        Predict next 1m candle using dual micro windows (short+long) and 5m context.
+        High-visibility and sanitized; includes:
+        - micro conflict arbitration (boundary flip, slope dominates),
+        - volatility shock visibility and binomial significance,
+        - adaptive threshold with sign-aware extremes,
+        - sign-preserving reversal penalty,
+        - drift guard (display neutralization only),
+        - Gate‑1 with magnitude OR significance, plus edge/slope/accel assists,
+        - final classification with clear OUT logs.
         """
         try:
-            # --- 1) Context Extraction (NaN/Inf safe) ---
             import numpy as np
             import pandas as pd
-            
-            def _flt(x, default=0.0):
+
+            def _flt(x, d=0.0):
                 try:
                     v = float(x)
-                    return v if np.isfinite(v) else float(default)
+                    return v if np.isfinite(v) else float(d)
                 except Exception:
-                    return float(default)
+                    return float(d)
 
-            imb = _flt(micro.get('imbalance', 0.0), 0.0)
-            slope = _flt(micro.get('slope', 0.0), 0.0)
-            std_d = _flt(micro.get('std_dltp', 0.0), 0.0)
-            drift = _flt(micro.get('vwap_drift_pct', 0.0), 0.0)
+            def _clip(v, lo, hi):
+                return float(max(lo, min(hi, float(v))))
 
-            macd_closed = _flt(self._get_value(indicators_5m, 'macd', 'hist_slope_closed', default=0.0), 0.0)
-            rsi5 = _flt(self._get_value(indicators_5m, 'rsi', 'value', default=50.0), 50.0)
-            bb_pos = _flt(self._get_value(indicators_5m, 'bollinger', 'position', default=0.5), 0.5)
-            ctx = _flt(micro_context_score, 0.5)
+            # --- micro (dual window) ---
+            imbL = _flt(micro.get('imbalance', 0.0))
+            imbS = _flt(micro.get('imbalance_short', 0.0))
+            slpL = _flt(micro.get('slope', 0.0))
+            slpS = _flt(micro.get('slope_short', 0.0))
+            nL   = int(micro.get('n', 0) or 0)
+            nS   = int(micro.get('n_short', 0) or 0)
+            std_d = _flt(micro.get('std_dltp', 0.0))
+            drift = _flt(micro.get('vwap_drift_pct', 0.0))
+            ctx   = _flt(micro_context_score, 0.5)
 
-            # Context snapshot for high-visibility debugging
-            logger.info("[NEXT-1m][CTX] imb=%+.2f slope=%+.3f stdΔ=%.5f drift=%+.2f%% | macd5_slope=%+.3f rsi5=%.1f bb=%.2f 5m_ctx=%.2f",
-                imb, slope, std_d, drift, macd_closed, rsi5, bb_pos, ctx
-            )
+            # 5m context (for priors/guards only)
+            macd_closed = _flt(self._get_value(indicators_5m, 'macd', 'hist_slope_closed', default=0.0))
+            rsi5        = _flt(self._get_value(indicators_5m, 'rsi', 'value', default=50.0), 50.0)
+            bb_pos      = _flt(self._get_value(indicators_5m, 'bollinger', 'position', default=0.5), 0.5)
 
-            # --- 2) Hierarchical Gates (micro-first) ---
-            base_th = _flt(getattr(self.config, 'micro_imbalance_min', 0.30), 0.30)
-            noise_k = _flt(getattr(self.config, 'micro_noise_sigma_mult', 2.0), 2.0)
-            need_checks = int(getattr(self.config, 'micro_persistence_min_checks', 1))
-            slope_soft_min = _flt(getattr(self.config, 'micro_macd_slope_soft_min', 0.05), 0.05)
+            # Weights (picked from config)
+            w_macd = _flt(getattr(self.config, 'next_minute_macd_prior_weight', 2.5), 2.5)
+            w_imb  = _flt(getattr(self.config, 'next_minute_imb_weight', 55.0), 55.0)
+            w_slp  = _flt(getattr(self.config, 'next_minute_slope_weight', 10.0), 10.0)
+            w_rsi  = _flt(getattr(self.config, 'next_minute_rsi_prior_weight', 0.05), 0.05)
+
+            # Blend windows
+            wS = _flt(getattr(self.config, 'next_minute_imb_short_weight', 0.60), 0.60) if nS >= int(getattr(self.config, 'micro_short_min_ticks_1m', 12)) else 0.0
+            wL = _flt(getattr(self.config, 'next_minute_imb_long_weight', 0.40), 0.40)
+            w_sum = max(1e-9, wS + wL)
+
+            imb = (wS*imbS + wL*imbL) / w_sum
+            slp_avg = ((wS*slpS + wL*slpL) / w_sum)
+            slp_aligned = np.sign(imb) * max(0.0, np.sign(imb) * slp_avg)
+
+            # Fresh-ticks guard
+            minL = int(getattr(self.config, 'micro_min_ticks_1m', 30))
+            minS = int(getattr(self.config, 'micro_short_min_ticks_1m', 12))
+            if nL < minL:
+                logger.info("[NEXT-1m][SAN] NEUTRAL: insufficient long-window ticks (n=%d<%d)", nL, minL)
+                return {'composite_signal':'NEUTRAL','confidence':30.0,'forecast_color':'NEUTRAL','forecast_prob':50.0,'why':"Insufficient long-window ticks"}
+
+            logger.info("[NEXT-1m][SAN][CTX] imbL=%+.2f imbS=%+.2f → imb*=%+.2f | slpL=%+.3f slpS=%+.3f → slp_avg=%+.3f | stdΔ=%.5f drift=%+.3f%% | bb=%.2f ctx5m=%.2f",
+                        imbL, imbS, imb, slpL, slpS, slp_avg, std_d, drift, bb_pos, ctx)
+
+            # --- MICRO CONFLICTS ---
+
+            # 1) Boundary flip: short window dominates when it clearly flips vs long
+            try:
+                mom_delta = _flt(micro.get('momentum_delta', 0.0), 0.0)
+                flip_ratio = _flt(getattr(self.config, 'next_minute_boundary_flip_ratio', 1.40), 1.40)
+                flip_mom   = _flt(getattr(self.config, 'next_minute_boundary_flip_mom_delta', 0.25), 0.25)
+                if np.sign(imbS) != 0 and np.sign(imbL) != 0 and np.sign(imbS) != np.sign(imbL):
+                    if (abs(imbS) >= flip_ratio*abs(imbL)) or (abs(mom_delta) >= flip_mom):
+                        old = imb
+                        imb = imbS
+                        slp_avg = slpS if wS > 0 else slp_avg
+                        slp_aligned = np.sign(imb) * max(0.0, np.sign(imb)*slp_avg)
+                        logger.info("[NEXT-1m][SAN][BFLIP] short dominates (|imbS|≥%.2fx|imbL| or |momΔ|≥%.2f) → imb*: %.2f→%.2f",
+                                    flip_ratio, flip_mom, old, imb)
+            except Exception as _e:
+                logger.debug("[NEXT-1m][SAN][BFLIP] skipped: %s", _e)
+
+            # 2) Slope dominates weak, opposing count-imbalance
+            try:
+                smin = _flt(getattr(self.config, 'next_minute_slope_conflict_min', 0.45), 0.45)
+                icap = _flt(getattr(self.config, 'next_minute_imb_conflict_cap', 0.20), 0.20)
+                repl = _flt(getattr(self.config, 'next_minute_imb_conflict_replacement', 0.15), 0.15)
+                slope_strong = (abs(slpL) >= smin and abs(slpS) >= smin and np.sign(slpL) == np.sign(slpS))
+                signs_opp = (np.sign(imb) != 0) and (np.sign(imb) != np.sign(slp_avg))
+                weak_imb = abs(imb) <= icap
+                if slope_strong and signs_opp and weak_imb:
+                    old = imb
+                    imb = np.sign(slp_avg) * min(repl, max(abs(old), 0.12))
+                    slp_aligned = np.sign(imb) * max(0.0, np.sign(imb) * slp_avg)
+                    logger.info("[NEXT-1m][SAN][CONFLICT] slope dominates weak opposing imb → imb*: %.2f→%.2f | slp_avg=%.3f", old, imb, slp_avg)
+            except Exception as _e:
+                logger.debug("[NEXT-1m][SAN][CONFLICT] skipped: %s", _e)
+
+            # 3) Volatility shock visibility
+            vol_ref = (self._nm_std_ref or std_d) if std_d > 0 else 0.0
+            shock_mult = _flt(getattr(self.config, 'next_minute_vol_shock_mult', 1.60), 1.60)
+            vol_shock = (std_d > 0.0 and vol_ref > 0.0 and std_d >= shock_mult * vol_ref)
+            if vol_shock:
+                logger.info("[NEXT-1m][SAN][VSHOCK] stdΔ shock: current=%.5f ref=%.5f (x%.2f)", std_d, vol_ref, (std_d/vol_ref))
+
+            # 4) Significance of imbalance (binomial z)
+            moves_total = int(micro.get('moves_total', 0) or 0)
+            if moves_total <= 0:
+                moves_total = max(10, int(0.8 * nL))
+            z_sig = abs(imb) * (moves_total ** 0.5)
+            z_min_base = _flt(getattr(self.config, 'next_minute_signif_z_min_base', 0.90), 0.90)
+            z_min_trend = _flt(getattr(self.config, 'next_minute_signif_z_min_trend', 0.80), 0.80)
+            z_min = z_min_trend if ctx >= 0.80 else z_min_base
+            logger.info("[NEXT-1m][SAN][SIGNIF] z=%.2f | moves=%d | z_min=%.2f | vol_shock=%s", z_sig, moves_total, z_min, vol_shock)
+
+
+            
+            # --- micro-only model probability (optional) ---
+            p_ml = None
+            x_ml = None
+            try:
+                if self.nm_model is not None:
+                    x_ml = self._build_nm_features(micro, imb, slp_avg, z_sig)
+                    p_ml = float(self.nm_model.predict_proba(x_ml))
+                    logger.info("[NM-ML] p_ml=%.3f | features=%s", p_ml, np.round(x_ml, 3))
+            except Exception as e:
+                logger.debug("[NM-ML] predict skipped: %s", e)
+                p_ml = None
+
+
+            # --- adaptive threshold (sign-aware extremes) ---
+            base_th   = _flt(getattr(self.config, 'micro_imbalance_min', 0.30), 0.30)
+            noise_k   = _flt(getattr(self.config, 'micro_noise_sigma_mult', 2.0), 2.0)
+            need_chk  = int(getattr(self.config, 'micro_persistence_min_checks', 1))
 
             imb_th = base_th
-            try:
-                # Slight relax when 5m momentum magnitude present or 5m context supportive
-                trendish = (abs(macd_closed) >= 0.10) or (ctx >= 0.65)
-                if trendish:
-                    imb_th = max(0.10, imb_th - 0.03)
 
-                # Noise-adaptive threshold using EMA baseline
-                if std_d > 0.0:
-                    if self._nm_std_ref is None:
-                        self._nm_std_ref = std_d
+            # Noise-aware adjust with EMA ref
+            if std_d > 0.0:
+                if self._nm_std_ref is None:
+                    self._nm_std_ref = std_d
+                else:
+                    self._nm_std_ref = 0.9*self._nm_std_ref + 0.1*std_d
+                if std_d <= 0.90 * self._nm_std_ref:
+                    imb_th = max(0.08, imb_th - 0.02)
+                elif std_d >= 1.25 * self._nm_std_ref:
+                    imb_th = min(0.45, imb_th + 0.02)
+
+            # Sign-aware extreme adjustment
+            hi = _flt(getattr(self.config, 'next_minute_mtf_extreme_pos_hi', 0.95), 0.95)
+            lo = _flt(getattr(self.config, 'next_minute_mtf_extreme_pos_lo', 0.05), 0.05)
+            relax_pp  = _flt(getattr(self.config, 'next_minute_extreme_relax_pp', 0.12), 0.12)
+            harden_pp = _flt(getattr(self.config, 'next_minute_extreme_harden_pp', 0.05), 0.05)
+
+            near_top = (bb_pos >= hi)
+            near_bot = (bb_pos <= lo)
+            imb_sign = np.sign(imb) if imb != 0 else np.sign(slp_aligned)
+
+            if near_top or near_bot:
+                old_th = imb_th
+                if near_top and imb_sign < 0:
+                    imb_th = max(0.08, imb_th - relax_pp)
+                    logger.info("[NEXT-1m][SAN][ADAPT] extreme adjust: top→SELL relax %.2f→%.2f", old_th, imb_th)
+                elif near_bot and imb_sign > 0:
+                    imb_th = max(0.08, imb_th - relax_pp)
+                    logger.info("[NEXT-1m][SAN][ADAPT] extreme adjust: bottom→BUY relax %.2f→%.2f", old_th, imb_th)
+                else:
+                    imb_th = max(imb_th, base_th + harden_pp)
+                    logger.info("[NEXT-1m][SAN][ADAPT] extreme adjust: into extreme harden %.2f→%.2f", old_th, imb_th)
+
+            logger.info("[NEXT-1m][SAN][ADAPT] imb_th=%.2f (base=%.2f, stdΔ=%.5f ref=%.5f, ctx=%.2f, bb=%.2f)",
+                        imb_th, base_th, std_d, (self._nm_std_ref or 0.0), ctx, bb_pos)
+
+            # --- forecast-only prior (for probability display) ---
+            prior = 50.0
+            prior += w_macd * _clip(macd_closed / 0.20, -1.0, 1.0)
+            prior += w_rsi  * (rsi5 - 50.0)
+            prior += w_imb  * _clip(imb, -1.0, 1.0)
+            prior += w_slp  * _clip(slp_aligned, -1.0, 1.0)
+
+
+
+            # Short/long disagreement penalty and decel (sign‑preserving, lighter; require both)
+            try:
+                if nS >= minS:
+                    disagree = (np.sign(imbS) != 0 and np.sign(imbL) != 0 and np.sign(imbS) != np.sign(imbL)) \
+                            or (np.sign(slpS) != 0 and np.sign(slpL) != 0 and np.sign(slpS) != np.sign(slpL))
+                    decel = (float(micro.get('momentum_delta', 0.0) or 0.0) < -0.25)
+                    if disagree and decel:
+                        delta = abs(prior - 50.0)
+                        # Lighter, multiplicative trim; no large fixed subtractor
+                        shrink = float(getattr(self.config, 'rev_penalty_shrink_factor', 0.60))  # 60% of delta
+                        mag = delta * shrink
+                        sign = 1.0 if imb >= 0 else -1.0
+                        
+                        # If statistically significant, don't let display collapse to 50. Keep a small floor away from 50.
+                        z_floor_pp = 0.0
+                        try:
+                            if z_sig >= z_min:
+                                z_floor_pp = float(getattr(self.config, 'rev_penalty_min_floor_pp', 2.0))  # keep ≥2 pp off 50
+                        except Exception:
+                            z_floor_pp = 0.0
+                        
+                        old_prior = prior
+                        # Respect the sign; limit to at least the floor if significant
+                        prior = 50.0 + sign * max(mag, z_floor_pp)
+                        
+                        logger.info("[NEXT-1m][SANREV2] disagree&decel → trim Δ=%.1f shrink=%.2f → mag=%.1fpp (floor=%.1fpp) sign=%s old=%.1f new=%.1f",
+                                    delta, shrink, mag, z_floor_pp, ("BUY" if sign>0 else "SELL"), old_prior, prior)
+            except Exception as _e:
+                logger.debug("[NEXT-1m][SANREV2] skip: %s", _e)
+
+            color_prob = _clip(prior, 10.0, 90.0)
+
+
+
+            # Blend: rule prob vs model prob (display only; direction remains micro-led)
+            try:
+                if p_ml is not None and getattr(self.config, 'enable_next_minute_ml', True):
+                    alpha = float(getattr(self.config, 'nm_ml_blend_alpha', 0.70))
+                    p_rule = float(color_prob) / 100.0
+                    p_final = float(alpha * p_rule + (1.0 - alpha) * p_ml)
+                    # Optional assist (disabled by default)
+                    if getattr(self.config, 'nm_ml_assist_enabled', False):
+                        conf = float(getattr(self.config, 'nm_ml_assist_confident', 0.62))
+                        pp = float(getattr(self.config, 'nm_ml_assist_pp', 8.0))
+                        if p_ml >= conf:
+                            color_prob = min(90.0, 100.0 * p_final + pp)
+                        elif p_ml <= 1.0 - conf:
+                            color_prob = max(10.0, 100.0 * p_final - pp)
+                        else:
+                            color_prob = 100.0 * p_final
                     else:
-                        self._nm_std_ref = (0.9 * self._nm_std_ref) + (0.1 * std_d)
-
-                    if std_d <= (0.90 * self._nm_std_ref):
-                        imb_th = max(0.08, imb_th - 0.02)
-                    elif std_d >= (1.25 * self._nm_std_ref):
-                        imb_th = min(0.45, imb_th + 0.02)
-
-                # Very light location pressure at TRUE extremes only
-                hi = _flt(getattr(self.config, 'next_minute_mtf_extreme_pos_hi', 0.98), 0.98)
-                lo = _flt(getattr(self.config, 'next_minute_mtf_extreme_pos_lo', 0.02), 0.02)
-                if bb_pos >= hi or bb_pos <= lo:
-                    imb_th = max(imb_th, base_th + 0.05)
-
-                logger.info("[NEXT-1m][ADAPT] imb_th=%.2f (base=%.2f, 5m_ctx=%.2f, bb_pos=%.2f, stdΔ=%.5f, ref=%.5f)",
-                    imb_th, base_th, ctx, bb_pos, std_d, self._nm_std_ref or 0.0
-                )
+                        color_prob = 100.0 * p_final
+                    logger.info("[NM-ML] blended prob=%.1f%% (rule=%.1f%%, ml=%.1f%%, α=%.2f)", color_prob, p_rule*100.0, (p_ml*100.0), alpha)
             except Exception as e:
-                logger.debug(f"[NEXT-1m][ADAPT] threshold calc skipped: {e}")
+                logger.debug("[NM-ML] blend skipped: %s", e)
 
-            # --- 3) Forecast-only color/probability (independent of trade classifier) ---
-            try:
-                w_macd = _flt(getattr(self.config, 'next_minute_macd_prior_weight', 4.0), 4.0)
-                w_imb  = _flt(getattr(self.config, 'next_minute_imb_weight', 40.0), 40.0)
-                w_slp  = _flt(getattr(self.config, 'next_minute_slope_weight', 14.0), 14.0)
-                w_rsi  = _flt(getattr(self.config, 'next_minute_rsi_prior_weight', 0.10), 0.10)
 
-                prior = 50.0
-                # MACD closed slope (5m) prior (saturate around ±0.20)
-                prior += w_macd * max(-1.0, min(1.0, macd_closed / 0.20))
-                # RSI tilt (5m)
-                prior += w_rsi * (rsi5 - 50.0)
-                # Microstructure (dominant)
-                prior += w_imb * max(-1.0, min(1.0, imb))
-                prior += w_slp * max(-1.0, min(1.0, slope))
+            # Dynamic neutral band: base from config
+            base_nb = _flt(getattr(self.config, 'next_minute_forecast_neutral_band_pp',
+                                getattr(self.config, 'next_minute_forecast_neutral_band', 0.02)), 0.02)
 
-                # Location discount near extremes when 5m context is weak
-                if (bb_pos >= 0.95 or bb_pos <= 0.05) and ctx < 0.65:
-                    prior = 50.0 + 0.75 * (prior - 50.0)
+            # Dynamic band: if z is clearly above threshold, shrink/disable neutral clamp
+            if z_sig >= 1.30 * z_min:
+                nb_pp = 0.00
+            elif z_sig >= 1.10 * z_min:
+                nb_pp = max(0.005, base_nb * 0.5)
+            else:
+                nb_pp = base_nb
 
-                color_prob = float(max(10.0, min(90.0, prior)))
-                forecast_dir = "BUY" if color_prob >= 50.0 else "SELL"
+            forecast_dir = "BUY" if color_prob >= 50.0 else "SELL"
+            if nb_pp > 0.0 and abs(color_prob - 50.0) < (nb_pp * 100.0):
+                logger.info("[NEXT-1m][SAN][FORECAST] within dynamic neutral band ±%.0fpp (z=%.2f, z_min=%.2f) → display NEUTRAL",
+                            nb_pp*100.0, z_sig, z_min)
+                forecast_dir = "NEUTRAL"
 
-                logger.info(
-                    "[NEXT-1m][FORECAST] color=%s prob=%.1f%% | priors: macd_slope=%+.3f (w=%.1f), rsi5=%.1f (w=%.2f), imb=%.2f (w=%.1f), slope=%.3f (w=%.1f), bb_pos=%.2f, 5m_ctx=%.2f",
-                    forecast_dir, color_prob, macd_closed, w_macd, rsi5, w_rsi, imb, w_imb, slope, w_slp, bb_pos, ctx
-                )
+            logger.info("[NEXT-1m][SAN][FORECAST] dir=%s prob=%.1f%% | priors: macd=%+.3f(w=%.1f) rsi=%.1f(w=%.2f) imb=%+.2f(w=%.1f) slp=%+.3f(w=%.1f)",
+                        forecast_dir, color_prob, macd_closed, w_macd, rsi5, w_rsi, imb, w_imb, slp_aligned, w_slp)
 
-                # Neutral band clamp for display correctness
-                nb = _flt(getattr(self.config, 'next_minute_forecast_neutral_band', 0.05), 0.05)
-                if abs(color_prob - 50.0) < (nb * 100.0):
-                    logger.info("[NEXT-1m][FORECAST] within neutral band (±%.0f pp around 50) → display NEUTRAL", nb * 100.0)
-                    forecast_dir = "NEUTRAL"
+            
 
-                # Clamp weak BUY forecasts in hostile 5m contexts (no 15m)
-                try:
-                    hostile = (rsi5 >= 70.0 and macd_closed <= -0.60)
-                    high_zone = (bb_pos >= 0.65)
-                    limited_room = (ctx < 0.65)
-                    weak_micro = (abs(imb) < 0.20 or slope <= 0.0)
-                    if forecast_dir == "BUY" and hostile and (limited_room or high_zone) and weak_micro:
-                        old = float(color_prob)
-                        color_prob = min(color_prob, 48.0)
-                        forecast_dir = "SELL" if color_prob < 50.0 else "BUY"
-                        logger.info(
-                            "[NEXT-1m][CLAMP] Overbought + bearish slope + limited room/high BB → P(up) %.1f→%.1f (imb=%.2f, slope=%.3f, bb=%.2f, 5m_ctx=%.2f)",
-                            old, color_prob, imb, slope, bb_pos, ctx
-                        )
-                except Exception as e:
-                    logger.debug(f"[NEXT-1m][CLAMP] skip: {e}")
-            except Exception as e:
-                forecast_dir, color_prob = "NEUTRAL", 50.0
-                logger.debug(f"[NEXT-1m][FORECAST] calc skipped: {e}")
+            # Drift guard (display-only neutralization of forecast)
+            drift_guard = _flt(getattr(self.config, 'next_minute_drift_guard_pct', 0.01), 0.01)
+            if forecast_dir == "SELL" and drift >= drift_guard and rsi5 >= 50.0:
+                logger.info("[NEXT-1m][SAN][GUARD] Neutralize SELL (up-drift %.3f%%, rsi5=%.1f≥50)", drift, rsi5)
+                return {'composite_signal': 'NEUTRAL', 'confidence': 30.0,
+                        'forecast_color': 'NEUTRAL', 'forecast_prob': color_prob,
+                        'why': "Drift guard neutralized SELL in up-drift"}
+            if forecast_dir == "BUY" and drift <= -drift_guard and rsi5 <= 50.0:
+                logger.info("[NEXT-1m][SAN][GUARD] Neutralize BUY (down-drift %.3f%%, rsi5=%.1f≤50)", drift, rsi5)
+                return {'composite_signal': 'NEUTRAL', 'confidence': 30.0,
+                        'forecast_color': 'NEUTRAL', 'forecast_prob': color_prob,
+                        'why': "Drift guard neutralized BUY in down-drift"}
 
-            # State init (persistence across calls)
-            if not hasattr(self, '_nm_std_ref'): self._nm_std_ref = None
-            if not hasattr(self, '_nm_last_side'): self._nm_last_side = 0
-            if not hasattr(self, '_nm_side_streak'): self._nm_side_streak = 0
+            # --- Gate‑1: persistence with magnitude OR significance; then assists ---
+            self._nm_last_side = 0 if not hasattr(self, '_nm_last_side') else self._nm_last_side
+            self._nm_side_streak = 0 if not hasattr(self, '_nm_side_streak') else self._nm_side_streak
 
-            # Noise guard using EMA baseline
+            side_now = 1 if imb > 0 else (-1 if imb < 0 else 0)
             noise_ok = True
             if std_d > 0.0:
                 noise_ok = std_d <= (noise_k * (self._nm_std_ref or std_d))
 
-            # --- 4) Immediate drift guard ---
-            try:
-                drift_guard = _flt(getattr(self.config, 'next_minute_drift_guard_pct', 0.02), 0.02)
-                if forecast_dir == "SELL" and drift >= drift_guard and rsi5 >= 50.0:
-                    logger.info("[NEXT-1m][GUARD-DRIFT] Neutralize SELL: drift=+%.3f%% ≥ %.3f%% & RSI5=%.1f", drift, drift_guard, rsi5)
-                    return {'composite_signal': 'NEUTRAL', 'confidence': 30.0,
-                            'forecast_color': "NEUTRAL", 'forecast_prob': color_prob,
-                            'why': "Drift guard neutralized SELL in up-drift"}
-                if forecast_dir == "BUY" and drift <= -drift_guard and rsi5 <= 50.0:
-                    logger.info("[NEXT-1m][GUARD-DRIFT] Neutralize BUY: drift=%.3f%% ≤ -%.3f%% & RSI5=%.1f", drift, drift_guard, rsi5)
-                    return {'composite_signal': 'NEUTRAL', 'confidence': 30.0,
-                            'forecast_color': "NEUTRAL", 'forecast_prob': color_prob,
-                            'why': "Drift guard neutralized BUY in down-drift"}
-            except Exception as _e:
-                logger.debug(f"[NEXT-1m][GUARD-DRIFT] skipped: {_e}")
-
-            # --- 5) Gate 1: Persistence (micro-first) ---
-            side_now = 1 if imb > 0 else (-1 if imb < 0 else 0)
-            if noise_ok and abs(imb) >= imb_th and side_now != 0:
-                if self._nm_last_side == side_now:
-                    self._nm_side_streak += 1
-                else:
-                    self._nm_last_side = side_now
-                    self._nm_side_streak = 1
-            else:
-                self._nm_last_side = 0
-                self._nm_side_streak = 0
-
-            if self._nm_side_streak < need_checks:
-                # Allowance: RSI-50 cross + sizable micro slope can satisfy persistence when imb just shy
-                try:
-                    rsi_series = None
-                    try:
-                        rsi_series = indicators_5m.get('rsi', {}).get('rsi_series')
-                    except Exception:
-                        rsi_series = None
-
-                    cross_up = cross_down = False
-                    if rsi_series is not None and len(rsi_series) >= 2:
-                        prev_rsi = _flt(rsi_series.iloc[-2], 50.0)
-                        curr_rsi = _flt(rsi_series.iloc[-1], 50.0)
-                        cross_up = (prev_rsi <= 50.0 and curr_rsi > 50.0)
-                        cross_down = (prev_rsi >= 50.0 and curr_rsi < 50.0)
-
-                    slope_help = abs(slope) >= max(0.25, 2.0 * slope_soft_min)
-                    imb_close = abs(imb) >= max(0.66 * imb_th, 0.10)
-
-                    if noise_ok and slope_help and imb_close and ((imb > 0 and cross_up) or (imb < 0 and cross_down)):
-                        self._nm_last_side = 1 if imb > 0 else -1
-                        self._nm_side_streak = need_checks  # satisfy gate
-                        logger.info("[NEXT-1m][G1] Allow: RSI-50 cross + strong micro slope with near-threshold imb (imb=%.2f, th=%.2f, slope=%.3f)", imb, imb_th, slope)
+            if self._nm_side_streak < need_chk:
+                imb_pass = (abs(imb) >= imb_th and side_now != 0)
+                signif_pass = (z_sig >= z_min and side_now != 0)
+                if noise_ok and (imb_pass or signif_pass):
+                    if signif_pass and not imb_pass:
+                        logger.info("[NEXT-1m][SAN][G1] Passed by significance (z=%.2f ≥ %.2f)", z_sig, z_min)
+                    if self._nm_last_side == side_now:
+                        self._nm_side_streak += 1
                     else:
-                        logger.info("[NEXT-1m][G1] Neutral: micro not persistent (imb=%.2f<th=%.2f or streak=%d<%d, noise_ok=%s)",
-                                    imb, imb_th, self._nm_side_streak, need_checks, noise_ok)
-                        return {'composite_signal': 'NEUTRAL', 'confidence': 30.0,
-                                'forecast_color': forecast_dir, 'forecast_prob': color_prob,
-                                'why': "Next 1m NEUTRAL: micro not persistent"}
-                except Exception as _e:
-                    logger.debug(f"[NEXT-1m][G1] allowance skipped: {_e}")
-                    logger.info("[NEXT-1m][G1] Neutral: micro not persistent (imb=%.2f<th=%.2f or streak=%d<%d, noise_ok=%s)",
-                                imb, imb_th, self._nm_side_streak, need_checks, noise_ok)
-                    return {'composite_signal': 'NEUTRAL', 'confidence': 30.0,
-                            'forecast_color': forecast_dir, 'forecast_prob': color_prob,
-                            'why': "Next 1m NEUTRAL: micro not persistent"}
+                        self._nm_last_side = side_now
+                        self._nm_side_streak = 1
+                else:
+                    self._nm_last_side = 0
+                    self._nm_side_streak = 0
 
-            # --- 6) Gate 2: Cross-timeframe (5m) momentum agreement — soft penalty ---
-            conf_penalty = 0.0
-            disagree = (imb > 0 and macd_closed < 0) or (imb < 0 and macd_closed > 0)
-            weak_slope = abs(macd_closed) < slope_soft_min
-            if disagree and not weak_slope:
-                conf_penalty += 10.0
-                logger.info("[NEXT-1m][G2] Soft penalty: micro vs 5m MACD disagree (macd_closed=%+.3f ≥|%.2f|) → -10.0pp",
-                            macd_closed, slope_soft_min)
+            # Edge override (extreme fade using short window)
+            edge_imb = _flt(getattr(self.config, 'next_minute_edge_override_short_imb', 0.20), 0.20)
+            edge_slp = _flt(getattr(self.config, 'next_minute_edge_override_short_slp', 0.35), 0.35)
+            if self._nm_side_streak < need_chk and nS >= minS:
+                if near_top and (imbS <= -edge_imb) and (slpS <= -edge_slp):
+                    self._nm_last_side = -1
+                    self._nm_side_streak = need_chk
+                    logger.info("[NEXT-1m][SAN][G1] Edge override: TOP fade → SELL (imbS=%.2f slpS=%.3f)", imbS, slpS)
+                elif near_bot and (imbS >= +edge_imb) and (slpS >= +edge_slp):
+                    self._nm_last_side = +1
+                    self._nm_side_streak = need_chk
+                    logger.info("[NEXT-1m][SAN][G1] Edge override: BOTTOM fade → BUY (imbS=%.2f slpS=%.3f)", imbS, slpS)
 
-            # --- 7) Gate 3: SOFT demotion at extremes if 5m context weak; micro override bypass ---
-            near_top = (bb_pos >= _flt(getattr(self.config, 'next_minute_mtf_extreme_pos_hi', 0.98), 0.98))
-            near_bottom = (bb_pos <= _flt(getattr(self.config, 'next_minute_mtf_extreme_pos_lo', 0.02), 0.02))
-            micro_override = (abs(imb) >= _flt(getattr(self.config, 'next_minute_micro_override_imb', 0.45), 0.45)
-                            and abs(slope) >= _flt(getattr(self.config, 'next_minute_micro_override_slope', 0.20), 0.20))
+            # Slope‑assist near threshold
+            if self._nm_side_streak < need_chk:
+                try:
+                    slope_assist_min = _flt(getattr(self.config, 'next_minute_slope_assist_min', 0.35), 0.35)
+                    assist = (
+                        noise_ok and
+                        np.sign(imb) != 0 and
+                        np.sign(imb) == np.sign(slp_aligned) and
+                        abs(slp_aligned) >= slope_assist_min and
+                        abs(imb) >= max(0.60*imb_th, 0.12)
+                    )
+                    if assist:
+                        self._nm_last_side = 1 if imb > 0 else -1
+                        self._nm_side_streak = need_chk
+                        logger.info("[NEXT-1m][SAN][G1] Allowed: slope‑assist (imb=%.2f th=%.2f slp=%.3f)", imb, imb_th, slp_aligned)
+                except Exception as e:
+                    logger.debug("[NEXT-1m][SAN][G1] slope-assist skipped: %s", e)
 
-            if not micro_override and bool(getattr(self.config, 'next_minute_use_soft_mtf', True)):
-                if (near_top and imb > 0 and ctx < 0.65) or (near_bottom and imb < 0 and ctx < 0.65):
-                    penalty_pp = _flt(getattr(self.config, 'next_minute_mtf_conf_penalty_pp', 8.0), 8.0)
-                    conf_penalty += penalty_pp
-                    logger.info("[NEXT-1m][G3] Soft demotion at extreme (5m_ctx=%.2f, bb=%.2f) → -%.1fpp", ctx, bb_pos, penalty_pp)
+            if self._nm_side_streak < need_chk:
+                logger.info("[NEXT-1m][SAN][G1] NEUTRAL: micro not persistent (imb=%.2f<th=%.2f or streak=%d/%d, noise_ok=%s)",
+                            imb, imb_th, self._nm_side_streak, need_chk, noise_ok)
+                return {'composite_signal': 'NEUTRAL', 'confidence': 30.0,
+                        'forecast_color': 'NEUTRAL', 'forecast_prob': color_prob,
+                        'why': "Next 1m NEUTRAL: micro not persistent"}
 
-
-            # Regime-aware SELL attenuation: LIMITED room + overbought + supportive context
-            try:
-                sr_room = str(getattr(self.mtf_analyzer, '_last_sr_room', 'UNKNOWN'))
-                micro_override_strong = (abs(slope) >= 0.90 and abs(imb) >= 0.12)
-                
-                if sr_room == "LIMITED" and rsi5 >= 70.0 and ctx >= 0.65 and not micro_override_strong and imb < 0:
-                    extra_pen = 8.0  # pp demotion
-                    conf_penalty += extra_pen
-                    logger.info("[NEXT-1m][REGIME] SELL soft-demotion in strong uptrend & LIMITED room → -%.1fpp (rsi5=%.1f, ctx=%.2f)", 
-                            extra_pen, rsi5, ctx)
-            except Exception as _e:
-                logger.debug(f"[NEXT-1m][REGIME] attenuation skipped: {_e}")
-
-
-            # --- 8) Classification and Confidence ---
+            # Final classification (direction from micro, probability from prior)
             direction = "BUY" if imb > 0 else "SELL"
-            conf = min(85.0, 40.0 + 30.0 * min(1.0, abs(imb)) + 15.0 * min(1.0, abs(slope)))
+            conf = min(85.0, 40.0 + 30.0 * min(1.0, abs(imb)) + 15.0 * min(1.0, abs(slp_aligned)))
             if not noise_ok:
                 conf = 35.0
-            conf = max(0.0, conf - conf_penalty)
 
-            why = (
-                f"micro: imb={imb:+.2f}, slope={slope:+.3f}, std_dltp={std_d:.5f}, drift={drift:+.2f}%; "
-                f"5m MACD_slope={macd_closed:+.3f}, RSI5={rsi5:.1f}; imb_th={imb_th:.2f}"
-            )
-            logger.info("[NEXT-1m] %s | conf=%.1f%% | %s", direction, conf, why)
+            why = (f"micro: imb={imb:+.2f}, slope={slp_aligned:+.3f}, stdΔ={std_d:.5f}, drift={drift:+.2f}%; "
+                f"gates: imb_th={imb_th:.2f}")
+            logger.info("[NEXT-1m][SAN][OUT] side=%s | conf=%.1f%% | prob=%.1f%% | %s",
+                        direction, conf, color_prob, why)
 
-
-
-            logger.info("[NEXT-1m][GATES] noise_ok=%s | imb_th=%.2f | penalties_applied=%s", 
-                        str(noise_ok), float(imb_th), "yes" if conf < 40.0 else "no")
-            logger.info("[NEXT-1m][EXIT] side=%s | conf=%.1f%% | prob=%.1f%%", 
-                        direction, conf, color_prob)
+      
 
 
             return {
-                "composite_signal": direction,
-                "confidence": conf,
-                "forecast_color": forecast_dir,
-                "forecast_prob": color_prob,
-                "why": why
+                'composite_signal': direction,
+                'confidence': conf,
+                'forecast_color': forecast_dir,
+                'forecast_prob': color_prob,
+                'why': why,
+                'nm_features': x_ml.tolist() if isinstance(x_ml, np.ndarray) else None,
+                'model_p': float(p_ml) if p_ml is not None else None
             }
 
+
         except Exception as e:
-            logger.error(f"analyze_next_minute error: {e}", exc_info=True)
-            return {"composite_signal": "NEUTRAL", "confidence": 0.0, "forecast_color": "NEUTRAL", "forecast_prob": 50.0, "why": "error"}
+            logger.error("[NEXT-1m][SAN] error: %s", e, exc_info=True)
+            return {'composite_signal': 'NEUTRAL', 'confidence': 0.0,
+                    'forecast_color': 'NEUTRAL', 'forecast_prob': 50.0, 'why': 'error'}
 
 
 
-    
-    
-    
+
 
     def _apply_oi_sd_nudges(self, weighted_score: float, indicators: dict, contributions: dict, scalping_signals: list) -> float:
         try:

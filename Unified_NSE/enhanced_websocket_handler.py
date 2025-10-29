@@ -336,66 +336,113 @@ class EnhancedWebSocketHandler:
 
 
 
+
     def get_micro_features(self) -> Dict[str, float]:
-        """ Compute microstructure features over last ~60–120s: imbalance, slope, stdΔ, vwap drift.
-        Returns a dict; NaN/Inf-safe. High-visibility log on each call.
         """
-        out = {'imbalance': 0.0, 'slope': 0.0, 'std_dltp': 0.0, 'vwap_drift_pct': 0.0, 'n': 0}
+        Compute microstructure features over DUAL time-bounded windows (short + long).
+        Returns a dict with both short and long window features; NaN/Inf-safe.
+        """
+        from datetime import datetime, timedelta
+        
+        out = {'imbalance': 0.0, 'slope': 0.0, 'std_dltp': 0.0, 'vwap_drift_pct': 0.0, 'n': 0,
+            'imbalance_short': 0.0, 'slope_short': 0.0, 'std_dltp_short': 0.0, 
+            'n_short': 0, 'momentum_delta': 0.0}
         try:
             if not self._micro_ticks:
                 return out
-            ts, px = zip(*list(self._micro_ticks))
+            
+            # LONG window (existing ~25s logic)
+            win_sec = int(getattr(self.config, 'micro_window_sec_1m', 25))
+            min_ticks = int(getattr(self.config, 'micro_min_ticks_1m', 30))
+            cutoff = datetime.now(IST) - timedelta(seconds=win_sec)
+            recent = [(ts, px) for (ts, px) in list(self._micro_ticks) if ts >= cutoff]
+            
+            # NEW: short window
+            s_sec = int(getattr(self.config, 'micro_short_window_sec_1m', 8))
+            s_min = int(getattr(self.config, 'micro_short_min_ticks_1m', 12))
+            cutoff_s = datetime.now(IST) - timedelta(seconds=s_sec)
+            recent_s = [(ts, px) for (ts, px) in recent if ts >= cutoff_s]
+            
+            if len(recent) < min_ticks:
+                out['n'] = len(recent)
+                out['n_short'] = len(recent_s)
+                return out  # not enough fresh information
+            
+            # LONG WINDOW CALCULATIONS
+            ts, px = zip(*recent)
             n = len(px); out['n'] = n
             px_arr = np.asarray(px, dtype=float)
+            
+            # Diff, ignore zeros (no-trade updates)
             d = np.diff(px_arr)
-            out['std_dltp'] = float(np.nan_to_num(np.std(d))) if len(d) > 0 else 0.0
-            ups = int(np.sum(d > 0)) if len(d) > 0 else 0
-            dns = int(np.sum(d < 0)) if len(d) > 0 else 0
-            total = ups + dns
+            d = d[~np.isclose(d, 0.0)]
+            
+            out['std_dltp'] = float(np.nan_to_num(np.std(d))) if d.size else 0.0
+            ups = int(np.sum(d > 0)); dns = int(np.sum(d < 0)); total = ups + dns
             out['imbalance'] = float((ups - dns) / max(1, total)) if total > 0 else 0.0
-            try:
-                x = np.arange(n, dtype=float)
-                x = (x - x.mean()) / max(1e-9, x.std())
-                y = (px_arr - px_arr.mean()) / max(1e-9, px_arr.std())
-                beta = float(np.dot(x, y) / max(1e-9, np.dot(x, x)))
-                out['slope'] = beta
-            except Exception:
-                out['slope'] = 0.0
-            try:
-                vwap = float(np.mean(px_arr)); last = float(px_arr[-1])
-                out['vwap_drift_pct'] = float(((last - vwap) / max(1e-9, vwap)) * 100.0)
-            except Exception:
-                out['vwap_drift_pct'] = 0.0
-            self._micro_last_snapshot = dict(out)
+            
 
+            out['moves_up'] = int(ups)
+            out['moves_dn'] = int(dns)
+            out['moves_total'] = int(total)
 
-            # Outlier guards (prevent one-off pollution of 1m micro snapshot)
+            
+            # Robust slope with recency weights
+            x = np.arange(n, dtype=float)
+            x = (x - x.mean()) / max(1e-9, x.std())
+            y = (px_arr - px_arr.mean()) / max(1e-9, px_arr.std())
+            w = np.linspace(0.5, 1.0, n)  # emphasize recency
+            beta = float(np.dot(w * x, y) / max(1e-9, np.dot(w * x, x)))
+            out['slope'] = beta
+            
+            vwap = float(np.mean(px_arr)); last = float(px_arr[-1])
+            out['vwap_drift_pct'] = float(((last - vwap) / max(1e-9, vwap)) * 100.0)
+            
+            # SHORT WINDOW CALCULATIONS (if enough ticks)
+            out['n_short'] = len(recent_s)
+            if len(recent_s) >= s_min:
+                ts_s, px_s = zip(*recent_s)
+                pxs = np.asarray(px_s, dtype=float)
+                d_s = np.diff(pxs); d_s = d_s[~np.isclose(d_s, 0.0)]
+                out['std_dltp_short'] = float(np.nan_to_num(np.std(d_s))) if d_s.size else 0.0
+                ups_s = int(np.sum(d_s > 0)); dns_s = int(np.sum(d_s < 0)); tot_s = ups_s + dns_s
+                out['imbalance_short'] = float((ups_s - dns_s) / max(1, tot_s)) if tot_s > 0 else 0.0
+                
+                # Short window slope
+                x_s = np.arange(len(pxs), dtype=float)
+                x_s = (x_s - x_s.mean()) / max(1e-9, x_s.std())
+                y_s = (pxs - pxs.mean()) / max(1e-9, pxs.std())
+                w_s = np.linspace(0.6, 1.0, len(pxs))
+                beta_s = float(np.dot(w_s * x_s, y_s) / max(1e-9, np.dot(w_s * x_s, x_s)))
+                out['slope_short'] = beta_s
+            
+            # Momentum delta (positive = accelerating, negative = decelerating)
+            out['momentum_delta'] = float(out['slope_short'] - out['slope'])
+            
+            # Outlier guards
             if not np.isfinite(out['std_dltp']) or out['std_dltp'] < 0:
                 out['std_dltp'] = 0.0
             if out['std_dltp'] > 50.0:
-                logger.warning("[MICRO-GUARD] stdΔ outlier detected (%.4f) → clamped to 0.0", out['std_dltp'])
+                logger.warning("[MICRO-GUARD] stdΔ outlier detected (%.4f) → clamped", out['std_dltp'])
                 out['std_dltp'] = 0.0
-
+            
             if not np.isfinite(out['vwap_drift_pct']):
                 out['vwap_drift_pct'] = 0.0
-            if abs(out['vwap_drift_pct']) > 2.0:  # ±2.0% over ~120s is implausible for index
-                logger.warning("[MICRO-GUARD] drift%% outlier detected (%.4f%%) → clamped to ±2.0%%", out['vwap_drift_pct'])
+            if abs(out['vwap_drift_pct']) > 2.0:
+                logger.warning("[MICRO-GUARD] drift%% outlier detected (%.4f%%) → clamped", out['vwap_drift_pct'])
                 out['vwap_drift_pct'] = 2.0 if out['vwap_drift_pct'] > 0 else -2.0
+            
 
-            
-            
-            logger.info("[MICRO] n=%d | imb=%.2f | slope=%.3f | stdΔ=%.5f | drift=%.3f%%",
-                        out['n'], out['imbalance'], out['slope'], out['std_dltp'], out['vwap_drift_pct'])
+
+            logger.info("[MICRO] n=%d|%d (long|short) | moves=%d↑/%d↓ | imbL=%.2f imbS=%.2f | slpL=%.3f slpS=%.3f | stdL=%.5f stdS=%.5f | drift=%.3f%%",
+                        out['n'], out['n_short'], out.get('moves_up', 0), out.get('moves_dn', 0),
+                        out['imbalance'], out['imbalance_short'], out['slope'], out['slope_short'],
+                        out['std_dltp'], out['std_dltp_short'], out['vwap_drift_pct'])
+
             
         except Exception as e:
             logger.debug(f"[MICRO] snapshot error: {e}")
         return out
-
-
-
-
-
-
 
 
 
