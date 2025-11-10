@@ -47,6 +47,15 @@ class UnifiedWebSocketHandler:
         self.authenticated = False
         self.running = True
         
+
+        # Timestamp mode: prefer arrival time to avoid vendor LTT ambiguities
+        self.use_arrival_time = bool(getattr(config, "use_arrival_time", True))
+        if self.use_arrival_time:
+            logger.info("Timestamp mode: ARRIVAL (wall-clock IST)")
+        else:
+            logger.info("Timestamp mode: VENDOR (normalized LTT)")
+
+        
         # Core data buffers
         self.tick_buffer = []
         self.candle_data = pd.DataFrame()
@@ -197,16 +206,88 @@ class UnifiedWebSocketHandler:
             return float(tick_timestamp)
 
 
-    def _normalize_tick_ts(self, ltt: int) -> datetime:
-        """Normalize exchange timestamp to IST with latency compensation."""
-        compensated_ts = self._compensate_latency(ltt)
-        now_ist = datetime.now(IST)
-        ts_utc_to_ist = datetime.fromtimestamp(float(compensated_ts), tz=timezone.utc).astimezone(IST)
-        ts_direct_ist = datetime.fromtimestamp(float(compensated_ts), tz=IST)
 
-        if abs((now_ist - ts_utc_to_ist).total_seconds()) <= abs((now_ist - ts_direct_ist).total_seconds()):
-            return ts_utc_to_ist
-        return ts_direct_ist
+
+    def _normalize_tick_ts(self, ltt: int) -> datetime:
+        """
+        Robust normalization of vendor LTT to IST.
+        Tries multiple interpretations and chooses the one closest to wall-clock now,
+        with a sanity bound. Falls back to arrival time if none are plausible.
+        """
+        try:
+            ltt_int = int(ltt)
+        except Exception:
+            ltt_int = 0
+        
+        now_ist = datetime.now(IST)
+        candidates = []
+        
+        # 1) Seconds since IST midnight
+        try:
+            ist_midnight = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+            t1 = ist_midnight + timedelta(seconds=ltt_int)
+            candidates.append(("sod_ist", t1))
+        except Exception:
+            pass
+        
+        # 2) Seconds since UTC midnight → IST
+        try:
+            utc_midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            t2 = (utc_midnight + timedelta(seconds=ltt_int)).astimezone(IST)
+            candidates.append(("sod_utc", t2))
+        except Exception:
+            pass
+        
+        # 3) Unix epoch seconds → IST
+        try:
+            t3 = datetime.fromtimestamp(float(ltt_int), tz=timezone.utc).astimezone(IST)
+            candidates.append(("epoch_s", t3))
+        except Exception:
+            pass
+        
+        # 4) Unix epoch milliseconds → IST
+        try:
+            t4 = datetime.fromtimestamp(float(ltt_int) / 1000.0, tz=timezone.utc).astimezone(IST)
+            candidates.append(("epoch_ms", t4))
+        except Exception:
+            pass
+        
+        if not candidates:
+            return now_ist
+        
+        def abs_delta_minutes(ts):
+            return abs((ts - now_ist).total_seconds()) / 60.0
+        
+        # Choose the interpretation closest to now
+        mode, ts = min(candidates, key=lambda kv: abs_delta_minutes(kv[1]))
+        
+        # Sanity bound: require chosen ts to be reasonably close to now (<= 3 minutes).
+        # If not, prefer arrival time to avoid drifting buckets.
+        if abs_delta_minutes(ts) > 3.0:
+            chosen = now_ist
+            chosen_mode = "arrival"
+        else:
+            chosen = ts
+            chosen_mode = mode
+        
+        # One-time diagnostics for first few ticks
+        try:
+            if not hasattr(self, "_diag_ticks_left"):
+                self._diag_ticks_left = 50
+            if self._diag_ticks_left > 0:
+                self._diag_ticks_left -= 1
+                logger.info(
+                    f"[TS-NORM] raw_ltt={ltt_int} | now={now_ist.strftime('%H:%M:%S')} | "
+                    f"sod_ist={next((t.strftime('%H:%M:%S') for m,t in candidates if m=='sod_ist'), 'na')} | "
+                    f"sod_utc={next((t.strftime('%H:%M:%S') for m,t in candidates if m=='sod_utc'), 'na')} | "
+                    f"epoch_s={next((t.strftime('%H:%M:%S') for m,t in candidates if m=='epoch_s'), 'na')} | "
+                    f"epoch_ms={next((t.strftime('%H:%M:%S') for m,t in candidates if m=='epoch_ms'), 'na')} | "
+                    f"chosen={chosen.strftime('%H:%M:%S')} ({chosen_mode})"
+                )
+        except Exception:
+            pass
+        
+        return chosen
 
 
 
@@ -222,7 +303,7 @@ class UnifiedWebSocketHandler:
             if ltp > 0:
                 # Prevent out-of-order ticks
                 if self._micro_ticks and timestamp <= self._micro_ticks[-1][0]:
-                    logger.debug("[MICRO] Out-of-order tick skipped")
+                    # logger.debug("[MICRO] Out-of-order tick skipped")
                     return
                 self._micro_ticks.append((timestamp, ltp))
             
@@ -431,8 +512,15 @@ class UnifiedWebSocketHandler:
             if not (self.config.price_sanity_min <= ltp <= self.config.price_sanity_max):
                 logger.warning(f"Price sanity check failed: {ltp}")
                 return None
+
+            # Prefer wall-clock arrival time to avoid vendor LTT ambiguities
+            if self.use_arrival_time:
+                timestamp = datetime.now(IST)
+            else:
+                timestamp = self._normalize_tick_ts(ltt)
+
+
             
-            timestamp = self._normalize_tick_ts(ltt)
             self.packet_stats['ticker'] += 1
             self._last_best = ltp
             
@@ -599,6 +687,33 @@ class UnifiedWebSocketHandler:
             except Exception:
                 # If config is missing/invalid, keep going with current frame
                 pass
+
+
+
+
+            # NEW: Candlestick patterns on last closed candles (1–3)
+            try:
+                from feature_pipeline import FeaturePipeline  # local import to avoid cycles
+                # Use up to 5 recent candles for RVOL baseline; detect on last 1–3
+                recent = self.candle_data.tail(5)
+                pat = FeaturePipeline.compute_candlestick_patterns(recent)
+                if isinstance(pat, dict) and pat:
+                    last_idx = self.candle_data.index[-1]
+                    # Write pattern features to the last row
+                    for k, v in pat.items():
+                        try:
+                            self.candle_data.loc[last_idx, k] = float(v)
+                        except Exception:
+                            continue
+                    # Recreate row to include pattern columns for callback
+                    row = self.candle_data.loc[[last_idx]]
+            except Exception as e:
+                logger.debug(f"[PAT] Pattern compute skipped: {e}")
+
+
+
+
+
 
             self._bucket_closed = True
 

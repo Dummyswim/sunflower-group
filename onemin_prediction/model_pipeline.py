@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import logging
-
+import os
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +40,7 @@ class AdaptiveModelPipeline:
     Eliminates separate IndicatorWeightTuner class for better cohesion.
     """
     
+    
     def __init__(
         self, 
         cnn_lstm, 
@@ -50,8 +51,11 @@ class AdaptiveModelPipeline:
         lr: float = 0.05, 
         ema_anchor: float = 0.35, 
         min_w: float = 0.05, 
-        max_w: float = 0.80
+        max_w: float = 0.80,
+        neutral_model: Optional[object] = None  # NEW
     ):
+
+    
         """
         Initialize adaptive model pipeline.
         
@@ -91,9 +95,23 @@ class AdaptiveModelPipeline:
         # Validation
         self._validate_weights()
         
+        
+        
+                
+        # Feature schema tracking
+        self.feature_schema_names = None
+        self.feature_schema_size = None
+
+        
         logger.info("Adaptive model pipeline initialized")
         logger.info(f"Base weights: {self.weights}")
         logger.info(f"Tunable indicators: {self.tunable_keys}")
+
+        # Neutrality model initialization
+        self.neutral_model = neutral_model
+        logger.info(f"Neutrality model: {'present' if self.neutral_model is not None else 'absent'}")
+
+        
         logger.info(f"Learning rate: {self.lr}, EMA anchor: {self.ema_anchor}")
 
     def _validate_weights(self):
@@ -104,120 +122,203 @@ class AdaptiveModelPipeline:
             norm = 1.0 / max(1e-9, total)
             self.weights = {k: v * norm for k, v in self.weights.items()}
 
+
+
+    def set_feature_schema(self, names):
+        """Set feature schema for alignment during inference."""
+        try:
+            self.feature_schema_names = list(names) if names else None
+            self.feature_schema_size = len(self.feature_schema_names) if self.feature_schema_names else None
+            logger.info(f"[SCHEMA] Feature schema set: n={self.feature_schema_size}")
+        except Exception as e:
+            logger.warning(f"[SCHEMA] Failed to set schema: {e}")
+
+    def _align_features_to_schema(self, names, values):
+        """
+        Map (names, values) to the persisted schema order, dropping unknowns and filling missing with 0.0.
+        """
+        import numpy as np
+        try:
+            vals = np.asarray(values, dtype=float).ravel().tolist()
+            if not self.feature_schema_names or not names:
+                x = np.asarray(vals, dtype=float).reshape(1, -1)
+                x[~np.isfinite(x)] = 0.0
+                return x
+            
+            m = {}
+            for n, v in zip(names, vals):
+                try:
+                    fv = float(v)
+                    if np.isfinite(fv):
+                        m[str(n)] = fv
+                except Exception:
+                    continue
+            
+            aligned = [m.get(s, 0.0) for s in self.feature_schema_names]
+            x = np.asarray(aligned, dtype=float).reshape(1, -1)
+            x[~np.isfinite(x)] = 0.0
+            return x
+        except Exception:
+            x = np.asarray(values, dtype=float).reshape(1, -1)
+            x[~np.isfinite(x)] = 0.0
+            return x
+
+
+
+
     def predict(
         self, 
         live_tensor: np.ndarray, 
         engineered_features: list, 
         recent_profit_factor: float,
-        indicator_score: Optional[float] = None
+        indicator_score: Optional[float] = None,
+        pattern_prob_adjustment: Optional[float] = None,
+        engineered_feature_names: Optional[list] = None  # NEW
     ) -> Tuple[np.ndarray, float]:
         """
         Generate ensemble prediction with optional indicator modulation.
         
-        Args:
-            live_tensor: Normalized price tensor (1, seq_len, 1) for CNN-LSTM
-            engineered_features: List of engineered features for XGBoost
-            recent_profit_factor: Recent profit factor for RL adjustment
-            indicator_score: Optional rule-based indicator score for blending
-        
         Returns:
-            Tuple of (signal_probs, adjusted_alpha_buy)
-            - signal_probs: np.array([[p_sell, p_buy]]) from ensemble
+            (signal_probs, adjusted_alpha_buy)
+            - signal_probs: np.array([[p_sell, p_buy]])
             - adjusted_alpha_buy: RL-adjusted confidence threshold
         """
         try:
-            # ========== CNN-LSTM LATENT FEATURES ==========
+            # ========== CNN-LSTM LATENT FEATURES (not used for XGB input) ==========
             try:
                 latent_features = self.cnn_lstm.predict(live_tensor)
                 if not isinstance(latent_features, np.ndarray):
                     latent_features = np.array(latent_features, dtype=float)
                 latent_features = np.atleast_1d(latent_features).ravel()
+                logger.debug(f"[LATENT] shape={getattr(latent_features, 'shape', None)} "
+                        f"first3={latent_features[:3].tolist() if latent_features.size >= 3 else latent_features.tolist()}")
+                
             except Exception as e:
                 logger.warning(f"CNN-LSTM prediction failed: {e}")
-                latent_features = np.zeros(8, dtype=float)  # Default 8 features
+                latent_features = np.zeros(8, dtype=float)  # safe default
 
             # ========== ENGINEERED FEATURES ==========
             try:
-                ef = np.asarray(engineered_features, dtype=float).ravel()
+                ef_vals = np.asarray(engineered_features, dtype=float).ravel().tolist()
             except Exception as e:
                 logger.warning(f"Feature engineering failed: {e}")
-                ef = np.zeros(1, dtype=float)
+                ef_vals = [0.0]
 
-            # ========== XGB INPUT CONSTRUCTION ==========
+            # ========== ALIGN TO SCHEMA & XGB INPUT (NO LATENT CONCAT) ==========
             try:
-                xgb_input = np.concatenate([latent_features, ef])
-                xgb_input = xgb_input.reshape(1, -1)  # (1, n_features)
+                xgb_input = self._align_features_to_schema(engineered_feature_names, ef_vals)
+                logger.debug(f"[SCHEMA] Inference vector shaped to {xgb_input.shape} "
+                            f"(schema_n={self.feature_schema_size})")
             except Exception as e:
-                logger.error(f"XGB input construction failed: {e}")
-                xgb_input = np.zeros((1, len(latent_features) + len(ef)), dtype=float)
+                logger.error(f"Schema alignment failed: {e}", exc_info=True)
+                xgb_input = np.asarray(ef_vals, dtype=float).reshape(1, -1)
 
             # ========== XGB PREDICTION ==========
             try:
                 signal_probs = self.xgb.predict_proba(xgb_input)
-                if signal_probs.shape[1] != 2:
+                if not isinstance(signal_probs, np.ndarray):
+                    signal_probs = np.array(signal_probs, dtype=float)
+                if signal_probs.ndim != 2 or signal_probs.shape[1] != 2:
                     logger.warning(f"Unexpected XGB output shape: {signal_probs.shape}")
                     signal_probs = np.array([[0.5, 0.5]], dtype=float)
             except Exception as e:
                 logger.error(f"XGB prediction failed: {e}")
                 signal_probs = np.array([[0.5, 0.5]], dtype=float)
 
+            # ========== NEUTRALITY MODEL (OPTIONAL) ==========
+            neutral_prob = None
+            try:
+                if self.neutral_model is not None:
+                    if hasattr(self.neutral_model, "predict_proba"):
+                        np.seterr(all='ignore')
+                        p = self.neutral_model.predict_proba(xgb_input)
+                        p = np.asarray(p, dtype=float)
+                        if p.ndim == 2 and p.shape[1] >= 2:
+                            neutral_prob = float(p[0, 1])
+                        else:
+                            neutral_prob = float(p.ravel()[0])
+                    elif hasattr(self.neutral_model, "predict"):
+                        raw = float(self.neutral_model.predict(xgb_input).ravel()[0])
+                        neutral_prob = 1.0 / (1.0 + np.exp(-raw))
+            except Exception as e:
+                logger.debug(f"Neutrality model inference failed: {e}")
+                neutral_prob = None
+
             # ========== INDICATOR MODULATION (OPTIONAL) ==========
             if indicator_score is not None:
                 try:
-                    # Blend model probability with rule-based score
                     buy_prob = float(signal_probs[0][1])
-                    
-                    # Normalize indicator score to [0, 1] via tanh
                     indicator_norm = 0.5 + 0.5 * np.tanh(indicator_score)
-                    
-                    # 50/50 blend (configurable)
                     blended_buy_prob = 0.5 * buy_prob + 0.5 * indicator_norm
-                    
-                    # Update signal_probs
                     signal_probs = np.array([[1.0 - blended_buy_prob, blended_buy_prob]], dtype=float)
-                    
                     logger.debug(f"Indicator blend: model={buy_prob:.3f}, "
-                               f"indicator={indicator_norm:.3f}, "
-                               f"blended={blended_buy_prob:.3f}")
+                                f"indicator={indicator_norm:.3f}, "
+                                f"blended={blended_buy_prob:.3f}")
                 except Exception as e:
                     logger.warning(f"Indicator modulation failed: {e}")
 
-
-                # Fallback: if ensemble is nearly flat AND we have indicator_score,
-                # derive probability deterministically from indicator via logistic.
+                # Deterministic fallback if almost flat
                 try:
-                    # buy_prob from current signal_probs
-                    buy_prob_now = float(signal_probs[0][1])  # p_buy
-                    # If buy_prob is close to 0.5 (no conviction), use indicator_score to create a stable probability
-                    if indicator_score is not None and (not np.isfinite(buy_prob_now) or abs(buy_prob_now - 0.5) < 0.02):
-                        k = 2.0  # logistic slope; tune 1.5–3.0 if needed
+                    buy_prob_now = float(signal_probs[0][1])
+                    if not np.isfinite(buy_prob_now) or abs(buy_prob_now - 0.5) < 0.02:
+                        k = 2.0
                         p = float(1.0 / (1.0 + np.exp(-k * float(indicator_score))))
-                        # Clamp to [0,1] defensively
                         p = 0.0 if not np.isfinite(p) else min(max(p, 0.0), 1.0)
                         signal_probs = np.array([[1.0 - p, p]], dtype=float)
-                        # logger.info(f"[FALLBACK] Indicator→prob: score={float(indicator_score):.4f} → buy_prob={p:.3f}")
                 except Exception as e:
                     logger.debug(f"Fallback mapping failed: {e}")
 
-
-            # ========== RL CONFIDENCE ADJUSTMENT ==========
+            # ========== PATTERN PROBABILITY ADJUSTMENT (OPTIONAL) ==========
             try:
-                adjusted_alpha = self.rl_agent.adjust_confidence(recent_profit_factor)
-                adjusted_alpha = float(adjusted_alpha)
+                if pattern_prob_adjustment is not None:
+                    buy_prob = float(signal_probs[0][1])
+                    adjusted_buy_prob = np.clip(buy_prob + float(pattern_prob_adjustment), 0.0, 1.0)
+                    signal_probs = np.array([[1.0 - adjusted_buy_prob, adjusted_buy_prob]], dtype=float)
+                    logger.debug(f"Pattern adjustment: {float(pattern_prob_adjustment):+.3f} | "
+                                f"buy_prob: {buy_prob:.3f} → {adjusted_buy_prob:.3f}")
+            except Exception as e:
+                logger.warning(f"Pattern adjustment failed: {e}")
+
+            # ========== RL + NEUTRALITY-BASED CONFIDENCE ADJUSTMENT ==========
+            try:
+                adjusted_alpha = float(self.rl_agent.adjust_confidence(recent_profit_factor))
             except Exception as e:
                 logger.warning(f"RL adjustment failed: {e}")
                 adjusted_alpha = self.base_alpha_buy
+            
+            try:
+                if neutral_prob is not None and np.isfinite(neutral_prob):
+                    delta = (neutral_prob - 0.5) * 0.12
+                    pre = adjusted_alpha
+                    adjusted_alpha = float(np.clip(adjusted_alpha + delta, 0.50, 0.80))
+                    logger.info(f"[NEUTRAL] p_neutral={neutral_prob:.3f} | alpha {pre:.3f} → {adjusted_alpha:.3f} (Δ={delta:+.3f})")
+            except Exception as e:
+                logger.debug(f"Neutrality alpha adjust failed: {e}")
 
-            # Inside predict() method, before return statement:
+            # ========== FINAL PREDICTION LOG ==========
             logger.info(f"[PRED] p_buy={float(signal_probs[0][1]):.3f} p_sell={float(signal_probs[0][0]):.3f} "
-                        f"alpha={adjusted_alpha:.3f} recentPF={float(recent_profit_factor):.3f}")
+                        f"alpha={adjusted_alpha:.3f} recentPF={float(recent_profit_factor):.3f} "
+                        f"schema_n={self.feature_schema_size}")
 
             return signal_probs, adjusted_alpha
-
 
         except Exception as e:
             logger.error(f"Prediction pipeline failed: {e}", exc_info=True)
             return np.array([[0.5, 0.5]], dtype=float), self.base_alpha_buy
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     # ========== INTEGRATED WEIGHT TUNING ==========
     async def update_weights_from_file(self, hitrate_path: str) -> Optional[Dict[str, float]]:
@@ -343,6 +444,57 @@ class AdaptiveModelPipeline:
                 f"lr={self.lr}, ema_anchor={self.ema_anchor})")
 
 
+
+    def replace_models(self, xgb=None, neutral=None):
+        """
+        Hot-reload XGB and/or neutrality models without restarting the pipeline.
+        """
+        try:
+            
+
+
+            if xgb is not None:
+                self.xgb = xgb
+                logger.info("XGB model hot-reloaded")
+                
+                # Try to load persisted feature schema and apply via the official setter
+                try:
+                    # Prefer the new feature_schema.json saved by trainer
+                    base_dir = os.path.dirname(os.getenv("XGB_PATH", "models/xgb_model.json")) or "."
+                    schema_candidates = [
+                        os.path.join(base_dir, "feature_schema.json"),                         # new
+                        os.getenv("XGB_PATH", "models/xgb_model.json").replace(".json", "_schema.json")  # legacy
+                    ]
+                    schema = None
+                    for sp in schema_candidates:
+                        if os.path.exists(sp):
+                            # Use module-level json (imported at top) to avoid shadowing in this scope
+                            with open(sp, "r", encoding="utf-8") as f:
+                                schema = json.load(f)
+                            logger.info(f"Loaded feature schema: {sp}")
+                            break
+                    
+                    names = None
+                    if isinstance(schema, dict):
+                        # support both formats {feature_names: [...]} and {features: [...]}
+                        names = schema.get("feature_names") or schema.get("features")
+                    if names:
+                        self.set_feature_schema(names)
+                    else:
+                        logger.warning("Feature schema file found but missing keys; skipping set_feature_schema")
+                except Exception as e:
+                    logger.warning(f"Failed to load/apply feature schema: {e}")
+
+            
+            
+            if neutral is not None:
+                self.neutral_model = neutral
+                logger.info("Neutrality model hot-reloaded")
+        except Exception as e:
+            logger.error(f"Model hot-reload failed: {e}", exc_info=True)
+
+
+
 # ========== BACKGROUND WEIGHT REFRESH TASK ==========
 async def weight_refresh_loop(
     pipeline: AdaptiveModelPipeline, 
@@ -376,7 +528,9 @@ async def weight_refresh_loop(
 
 
 # ========== UTILITY FUNCTIONS ==========
-def create_default_pipeline(cnn_lstm, xgb, rl_agent, **kwargs) -> AdaptiveModelPipeline:
+
+
+def create_default_pipeline(cnn_lstm, xgb, rl_agent, neutral_model=None, **kwargs) -> AdaptiveModelPipeline:
     """
     Factory function to create pipeline with sensible defaults.
     
@@ -384,6 +538,7 @@ def create_default_pipeline(cnn_lstm, xgb, rl_agent, **kwargs) -> AdaptiveModelP
         cnn_lstm: Trained CNN-LSTM model
         xgb: Trained XGBoost model
         rl_agent: RL agent
+        neutral_model: Optional neutrality classifier
         **kwargs: Override default parameters
     
     Returns:
@@ -404,7 +559,9 @@ def create_default_pipeline(cnn_lstm, xgb, rl_agent, **kwargs) -> AdaptiveModelP
     }
     defaults.update(kwargs)
     
-    return AdaptiveModelPipeline(cnn_lstm, xgb, rl_agent, **defaults)
+    return AdaptiveModelPipeline(cnn_lstm, xgb, rl_agent, neutral_model=neutral_model, **defaults)
+
+
 
 
 def validate_hitrate_log(hitrate_path: str) -> bool:

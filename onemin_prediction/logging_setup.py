@@ -84,6 +84,7 @@ def setup_logging(
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(console_level)
         
+
         if enable_colors:
             console_formatter = ColoredFormatter(
                 '%(asctime)s | %(levelname)-8s | %(name)s | [%(funcName)s:%(lineno)d] | %(message)s',
@@ -94,6 +95,8 @@ def setup_logging(
                 '%(asctime)s | %(levelname)-8s | %(name)s | [%(funcName)s:%(lineno)d] | %(message)s',
                 datefmt='%Y-%m-%d %H:%M:%S'
             )
+
+
         
         console_handler.setFormatter(console_formatter)
         root_logger.addHandler(console_handler)
@@ -120,6 +123,14 @@ def setup_logging(
         logging.getLogger('urllib3.connectionpool').setLevel(logging.INFO)
         logging.getLogger('matplotlib').setLevel(logging.WARNING)
         logging.getLogger('asyncio').setLevel(logging.INFO)
+        
+        
+
+        # ========== ENABLE DEBUG FOR NEW MODULES (OPTIONAL) ==========
+        logging.getLogger('online_trainer').setLevel(logging.DEBUG)
+        logging.getLogger('feature_pipeline').setLevel(logging.DEBUG)
+        logging.getLogger('model_pipeline').setLevel(logging.INFO)
+
         
         # ========== LOG INITIALIZATION ==========
         logging.info("=" * 60)

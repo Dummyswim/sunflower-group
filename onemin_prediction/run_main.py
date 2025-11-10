@@ -7,8 +7,14 @@ import base64
 import numpy as np
 import logging, os
 from main_event_loop import main_loop
-import random
 
+
+
+try:
+    import joblib
+except ImportError:
+    joblib = None
+    logging.warning("joblib not available; neutrality model loading will be skipped")
 
 
 # Dummy model stubs (replace with your trained models)
@@ -17,15 +23,20 @@ class DummyCNNLSTM:
         return np.zeros((8,), dtype=float)
 
 
+
 class DummyXGB:
+    is_dummy = True
+    name = "DummyXGB"
+    
     def predict_proba(self, X):
         """
         Generate random predictions for testing.
         Replace with trained model for production.
         """
+        import numpy as np
+        import random
         buy_prob = random.uniform(0.3, 0.7)  # Random between 30-70%
         return np.array([[1.0 - buy_prob, buy_prob]], dtype=float)
-
 
 class DummyRL:
     threshold = 0.6  # Base confidence threshold
@@ -60,7 +71,9 @@ DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "") 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "") 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
- 
+REQUIRE_TRAINED_MODELS = os.getenv("REQUIRE_TRAINED_MODELS", "0") in ("1", "true", "True")
+logging.info(f"REQUIRE_TRAINED_MODELS={REQUIRE_TRAINED_MODELS} (env)")
+
 
 config = SimpleNamespace(
     # Required for EnhancedWebSocketHandler
@@ -69,6 +82,10 @@ config = SimpleNamespace(
     nifty_security_id=13,
     nifty_exchange_segment="IDX_I",
     candle_interval_seconds=60,
+
+    # Timestamp mode: True = use arrival time (wall-clock IST), False = use vendor LTT
+    use_arrival_time=True,  # Set to False to use vendor timestamps with auto-detection
+    
     max_buffer_size=5000,
     max_reconnect_attempts=5,
     reconnect_delay_base=2,
@@ -104,6 +121,31 @@ config = SimpleNamespace(
     # Pre-close options
     preclose_lead_seconds=10,
     preclose_completion_buffer_sec=1,
+    
+
+    # Pattern detection parameters
+    pattern_rvol_window=5,           # Window for RVOL baseline
+    pattern_rvol_threshold=1.2,      # RVOL confirmation threshold
+    pattern_min_winrate=0.55,        # Minimum winrate to use pattern
+        
+        
+    # Dynamic alpha tuning
+    target_hold_ratio=0.30,
+    alpha_tune_step=0.02,
+    alpha_min=0.52,
+    alpha_max=0.72,
+    deadband_eps=0.05,
+    consensus_threshold=0.66,
+    indicator_bias_threshold=0.20,
+    
+    # Pattern timeframes for MTF
+    pattern_timeframes=["1T", "3T", "5T"],
+
+    # Online trainer configuration
+    trainer_interval_sec=600,  # Train every 10 minutes
+    trainer_min_rows=300,      # Minimum rows before training
+
+        
 )
 
 
@@ -120,60 +162,111 @@ train_features = {
     'last_price': np.random.normal(size=500).tolist()
 }
 
-
 def _load_or_dummy_models():
     cnn = None
     xgb_model = None
+    neutral_model = None  # NEW
     
-    # Lazy import to avoid hard dependency when using dummies
-    try:
-        from tensorflow import keras
-    except Exception:
-        keras = None
+    cnn_path = os.getenv("CNN_LSTM_PATH", "").strip()
+    xgb_path = os.getenv("XGB_PATH", "").strip()
     
-    try:
-        import xgboost as xgb
-    except Exception:
-        xgb = None
-    
-    try:
-        cnn_path = os.getenv("CNN_LSTM_PATH", "").strip()
-        if keras and cnn_path:
+    # Load CNN-LSTM only if a path is provided
+    if cnn_path:
+        try:
+            # Suppress TF INFO logs (including oneDNN/CUDA notices)
+            os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+            from tensorflow import keras
             cnn = keras.models.load_model(cnn_path)
             logging.info(f"Loaded CNN-LSTM: {cnn_path}")
-    except Exception as e:
-        logging.warning(f"Failed to load CNN-LSTM, using dummy: {e}")
+        except Exception as e:
+            logging.warning(f"Failed to load CNN-LSTM, using dummy: {e}")
+    else:
+        logging.info("CNN_LSTM_PATH not set; using dummy CNN-LSTM")
     
-    try:
-        xgb_path = os.getenv("XGB_PATH", "").strip()
-        if xgb and xgb_path:
+    # Load XGBoost only if a path is provided
+    if xgb_path:
+        try:
+            import xgboost as xgb
             booster = xgb.Booster()
             booster.load_model(xgb_path)
-            
+
+
             class _BoosterWrapper:
                 def __init__(self, booster):
                     self.booster = booster
+                    self.is_dummy = False
+                    self.name = "XGBBooster"
                 
                 def predict_proba(self, X):
                     import numpy as np
                     dm = xgb.DMatrix(X)
                     p = self.booster.predict(dm)
                     if p.ndim == 1:
-                        p = np.clip(p, 1e-9, 1-1e-9)
-                        return np.stack([1-p, p], axis=1)
+                        p = np.clip(p, 1e-9, 1 - 1e-9)
+                        return np.stack([1 - p, p], axis=1)
                     return p
+
             
             xgb_model = _BoosterWrapper(booster)
             logging.info(f"Loaded XGB: {xgb_path}")
-    except Exception as e:
-        logging.warning(f"Failed to load XGB, using dummy: {e}")
+        except Exception as e:
+            logging.warning(f"Failed to load XGB, using dummy: {e}")
+
+    else:
+        logging.info("XGB_PATH not set; using dummy XGB")
     
+
+    
+    # Load Neutrality Model if provided
+    neutral_path = os.getenv("NEUTRAL_PATH", "").strip()
+
+    if neutral_path and joblib is not None:
+        try:
+            neutral_model = joblib.load(neutral_path)
+            logging.info(f"Loaded Neutrality model: {neutral_path}")
+        except Exception as e:
+            logging.warning(f"Failed to load Neutrality model, continuing without: {e}")
+    else:
+        if neutral_path and joblib is None:
+            logging.warning("NEUTRAL_PATH set but joblib not available")
+        else:
+            logging.info("NEUTRAL_PATH not set; running without neutral model")
+    
+    # Enforce trained models in production if requested
+    if REQUIRE_TRAINED_MODELS:
+        if xgb_model is None:
+            logging.critical("REQUIRE_TRAINED_MODELS=1 but XGB_PATH is not set or failed to load")
+            raise SystemExit(2)
+        if neutral_model is None:
+            logging.critical("REQUIRE_TRAINED_MODELS=1 but NEUTRAL_PATH is not set or failed to load")
+            raise SystemExit(3)
+            
     return (cnn if cnn is not None else DummyCNNLSTM(),
-            xgb_model if xgb_model is not None else DummyXGB())
+            xgb_model if xgb_model is not None else DummyXGB(),
+            neutral_model)
 
 
 
-cnn_model, xgb_model = _load_or_dummy_models()
+# Make globals visible to main()
+global cnn_model, xgb_model, neutral_model
+
+cnn_model, xgb_model, neutral_model = _load_or_dummy_models()
+
+
+
+
+logging.info(
+    f"Backends: cnn={getattr(cnn_model, 'name', type(cnn_model).__name__)}, "
+    f"xgb={getattr(xgb_model, 'name', type(xgb_model).__name__)} "
+    f"(is_dummy={getattr(xgb_model, 'is_dummy', 'unknown')}), "
+    f"neutral={'present' if neutral_model is not None else 'absent'}, "
+    f"XGB_PATH={os.getenv('XGB_PATH','') or '(not set)'} "
+    f"NEUTRAL_PATH={os.getenv('NEUTRAL_PATH','') or '(not set)'}"
+)
+
+
+
+
 async def main():
     await main_loop(
         config=config,
@@ -183,6 +276,7 @@ async def main():
         train_features=train_features,
         token_b64=base64.b64encode(TELEGRAM_BOT_TOKEN.encode()).decode(),
         chat_id=TELEGRAM_CHAT_ID,
+        neutral_model=neutral_model,  # NEW
     )
 
 
