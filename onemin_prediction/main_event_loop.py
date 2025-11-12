@@ -21,7 +21,6 @@ To get live ticks:
 import json 
 import asyncio
 import base64
-import json
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -35,7 +34,6 @@ import pandas as pd
 from core_handler import UnifiedWebSocketHandler as WSHandler
 from feature_pipeline import FeaturePipeline
 from model_pipeline import create_default_pipeline, weight_refresh_loop
-from telegram_bot import TelegramBot
 
 import os
 from pathlib import Path
@@ -441,20 +439,19 @@ async def _ws_connect_and_stream(
 
 # ------------------------- Per-Connection Processing ------------------------- #
 
-
 async def _connection_processing_loop(
     name: str,
     ws_handler: WSHandler,
     feat_pipe: FeaturePipeline,
     model_pipe,
-    telegram: TelegramBot,
     config: Any,
     tick_queue: "asyncio.Queue[Dict[str, Any]]",
     ob_ring: deque,
     pending_preds: Dict[datetime, Dict[str, float]],
-    feature_log_path: str,
-    pending_train_rows: Dict[datetime, Dict[str, Any]]  
+    pending_train_rows: Dict[datetime, Dict[str, Any]]
 ):
+
+
     """
     Consume ticks from tick_queue for this connection, compute features,
     run predictions, and make execution decisions. Emits periodic summaries.
@@ -472,6 +469,25 @@ async def _connection_processing_loop(
     current_bucket_start: Optional[datetime] = None
     last_minute_prediction = None
 
+    prev_directional_decision = None
+    prev_margin = 0.0
+
+
+
+    # Track previous side probability for advantage-based hysteresis
+    prev_side_prob = 0.50
+
+
+    # Hysteresis flip telemetry
+    flips_allowed = 0
+    flips_suppressed = 0
+    delta_sum = 0.0
+    delta_count = 0
+    last_telem_ts = datetime.now(IST)
+    telemetry_enable = bool(getattr(config, "hysteresis_telemetry_enable", True))
+    telemetry_interval = int(getattr(config, "hysteresis_telemetry_interval_sec", 3600)) or 3600
+
+
     # Per-bucket prediction flag (prevents multiple predictions per candle)
     did_predict_for_bucket = False
 
@@ -487,17 +503,40 @@ async def _connection_processing_loop(
             return "SELL"
         return "HOLD"
 
+
     logger.info(f"[{name}] Processing loop started")
 
-    # Dynamic alpha tuning and ensemble override configuration
-    recent_decisions = deque(maxlen=60)  # last 60 candles
-    target_hold_ratio = float(getattr(config, "target_hold_ratio", 0.30))
-    alpha_tune_step = float(getattr(config, "alpha_tune_step", 0.02))
+    # Drift alert rate limiting
+    import time as _time_mod
+    drift_last_log_ts = 0.0
+    drift_log_cooldown = float(getattr(config, "drift_log_cooldown_sec", 180.0))  # 3 minutes default
+
+
+    # Ensemble override configuration
     alpha_min = float(getattr(config, "alpha_min", 0.52))
     alpha_max = float(getattr(config, "alpha_max", 0.72))
     deadband_eps = float(getattr(config, "deadband_eps", 0.05))
-    consensus_threshold = float(getattr(config, "consensus_threshold", 0.66))
-    indicator_bias_threshold = float(getattr(config, "indicator_bias_threshold", 0.20))
+
+
+    # Hysteresis toggles (validated)
+    hyst_enable = bool(getattr(config, "hysteresis_enable", True))
+    hyst_respect_alpha = bool(getattr(config, "hysteresis_respect_alpha", True))
+    try:
+        hyst_flip_buffer = float(getattr(config, "hysteresis_flip_buffer", 0.01))
+        if not np.isfinite(hyst_flip_buffer) or hyst_flip_buffer < 0.0 or hyst_flip_buffer > 0.10:
+            hyst_flip_buffer = 0.01
+    except Exception:
+        hyst_flip_buffer = 0.01
+
+    try:
+        hyst_advantage = float(getattr(config, "hysteresis_advantage", 0.02))
+        if not np.isfinite(hyst_advantage) or hyst_advantage < 0.0 or hyst_advantage > 0.20:
+            hyst_advantage = 0.02
+    except Exception:
+        hyst_advantage = 0.02
+
+    decision_log_verbose = bool(getattr(config, "decision_log_verbose", True))
+
 
     try:
         while True:
@@ -523,14 +562,17 @@ async def _connection_processing_loop(
                         next_candle_start = current_bucket_start + timedelta(minutes=interval_min)
                         
                         # Log prediction summary
+
                         logger.info(
                             f"[{name}] Predicted next {interval_min}m candle: start={next_candle_start.isoformat()}, "
-                            f"decision={last_minute_prediction['decision']}, "
+                            f"decision={last_minute_prediction['decision']} (raw={last_minute_prediction.get('raw_decision','na')}, "
+                            f"hyst_suppressed={last_minute_prediction.get('hysteresis_suppressed', False)}), "
                             f"buy_prob={last_minute_prediction['buy_prob']:.3f}, "
                             f"sell_prob={1.0 - last_minute_prediction['buy_prob']:.3f}, "
                             f"alpha={last_minute_prediction['alpha']:.3f}, "
                             f"last_ltp={float(last_minute_prediction['ltp']):.4f}"
                         )
+
                         
                         # Percentage-format probabilities
                         bp = float(last_minute_prediction["buy_prob"])
@@ -613,6 +655,24 @@ async def _connection_processing_loop(
                 continue
 
             # ========== FEATURE ENGINEERING ==========
+            
+            
+
+            # Compute stationary last_zscore feature (Phase 1)
+            try:
+                px_arr64 = np.array(prices[-64:], dtype=float)
+                if px_arr64.size >= 2:
+                    px_last = float(px_arr64[-1])
+                    px_mean32 = float(np.mean(px_arr64[-32:])) if px_arr64.size >= 32 else float(np.mean(px_arr64))
+                    px_std32 = float(np.std(px_arr64[-32:])) if px_arr64.size >= 32 else float(np.std(px_arr64))
+                    last_zscore = (px_last - px_mean32) / max(1e-9, px_std32)
+                else:
+                    last_zscore = 0.0
+            except Exception:
+                last_zscore = 0.0
+            logger.debug(f"[{name}] last_zscore={last_zscore:.4f}")
+
+            
             ema_feats = FeaturePipeline.compute_emas(prices)
             
             # TA indicators (RSI, MACD, BB)
@@ -624,27 +684,32 @@ async def _connection_processing_loop(
                 logger.debug(f"[{name}] TA compute skipped: {e}")
                 ta = {}
 
-            # MTF pattern consensus
+
+            
+            # MTF pattern consensus (always include keys; defaults when history is empty)
             mtf = {}
             mtf_adj = 0.0
             mtf_consensus = 0.0
             try:
                 hist_df = getattr(ws_handler, 'candle_data', None)
-                if isinstance(hist_df, pd.DataFrame) and not hist_df.empty:
-                    tf_list = getattr(config, "pattern_timeframes", ["1T","3T","5T"])
-                    mtf = FeaturePipeline.compute_mtf_pattern_consensus(
-                        candle_df=hist_df.tail(500),
-                        timeframes=tf_list,
-                        rvol_window=int(getattr(config, 'pattern_rvol_window', 5)),
-                        rvol_thresh=float(getattr(config, 'pattern_rvol_threshold', 1.2)),
-                        min_winrate=float(getattr(config, 'pattern_min_winrate', 0.55))
-                    ) or {}
-                    mtf_adj = float(mtf.get("mtf_adj", 0.0))
-                    mtf_consensus = float(mtf.get("mtf_consensus", 0.0))
+                tf_list = getattr(config, "pattern_timeframes", ["1T", "3T", "5T"])
+                safe_df = hist_df.tail(500) if (isinstance(hist_df, pd.DataFrame) and not hist_df.empty) else pd.DataFrame()
+                mtf = FeaturePipeline.compute_mtf_pattern_consensus(
+                    candle_df=safe_df,
+                    timeframes=tf_list,
+                    rvol_window=int(getattr(config, 'pattern_rvol_window', 5)),
+                    rvol_thresh=float(getattr(config, 'pattern_rvol_threshold', 1.2)),
+                    min_winrate=float(getattr(config, 'pattern_min_winrate', 0.55))
+                ) or {}
+                mtf_adj = float(mtf.get("mtf_adj", 0.0))
+                mtf_consensus = float(mtf.get("mtf_consensus", 0.0))
             except Exception as e:
                 logger.debug(f"[{name}] MTF compute skipped: {e}")
                 mtf = {}
                 mtf_adj, mtf_consensus = 0.0, 0.0
+                        
+                        
+
             
             # Order flow dynamics
             try:
@@ -661,37 +726,73 @@ async def _connection_processing_loop(
             # Microstructure features
             try:
                 micro_ctx = ws_handler.get_micro_features()
+
+                # NEW: normalize micro_slope by short-term realized volatility to avoid false momentum in flat markets
+                try:
+                    micro_slope_raw = float(micro_ctx.get('slope', 0.0))
+                    vol_short = float(micro_ctx.get('std_dltp_short', 0.0))
+                    denom = max(1e-6, vol_short)
+                    micro_slope_normed = micro_slope_raw / denom
+                except Exception:
+                    micro_slope_normed = float(micro_ctx.get('slope', 0.0))
+
+                
             except Exception:
                 micro_ctx = {}
 
-            # Candlestick patterns from last closed candles
+
+            # Candlestick patterns from last closed candles (defaults when insufficient history)
             pattern_features = {}
             pattern_prob_adj = 0.0
             try:
                 hist_df = getattr(ws_handler, 'candle_data', None)
+                rvol_window = int(getattr(config, 'pattern_rvol_window', 5))
+                rvol_thresh = float(getattr(config, 'pattern_rvol_threshold', 1.2))
+                min_wr = float(getattr(config, 'pattern_min_winrate', 0.55))
                 if isinstance(hist_df, pd.DataFrame) and not hist_df.empty:
-                    rvol_window = int(getattr(config, 'pattern_rvol_window', 5))
-                    rvol_thresh = float(getattr(config, 'pattern_rvol_threshold', 1.2))
-                    min_wr = float(getattr(config, 'pattern_min_winrate', 0.55))
                     recent_closed = hist_df.tail(max(3, rvol_window))
-                    pattern_features = FeaturePipeline.compute_candlestick_patterns(
-                        candles=recent_closed,
-                        rvol_window=rvol_window,
-                        rvol_thresh=rvol_thresh,
-                        min_winrate=min_wr
-                    ) or {}
-                    pattern_prob_adj = float(pattern_features.get('probability_adjustment', 0.0))
+                else:
+                    # empty DataFrame triggers defaults from compute_candlestick_patterns
+                    recent_closed = pd.DataFrame()
+                pattern_features = FeaturePipeline.compute_candlestick_patterns(
+                    candles=recent_closed,
+                    rvol_window=rvol_window,
+                    rvol_thresh=rvol_thresh,
+                    min_winrate=min_wr
+                ) or {}
+                pattern_prob_adj = float(pattern_features.get('probability_adjustment', 0.0))
             except Exception as e:
                 logger.debug(f"[{name}] Pattern features skipped: {e}")
                 pattern_features = {}
                 pattern_prob_adj = 0.0
 
-            # Blend pattern adjustment with MTF adjustment
+
+
+            # Blend pattern adjustment with MTF only if same sign; RVOL gating and cap ±0.08
             try:
-                if mtf:
-                    pattern_prob_adj = float(np.clip(pattern_prob_adj + 0.7 * mtf_adj, -0.20, 0.20))
-            except Exception:
-                pass
+                pat_adj = float(pattern_prob_adj)
+                mtf_adj_val = float(mtf_adj)
+                pat_sign = np.sign(pat_adj)
+                mtf_sign = np.sign(mtf_adj_val)
+                
+                # Enforce RVOL confirmation for >0.03 on the 1T pattern
+                pat_confirmed = float(pattern_features.get('pat_confirmed_by_rvol', 0.0)) >= 0.5
+                if not pat_confirmed and abs(pat_adj) > 0.03:
+                    pat_adj = 0.03 * (1.0 if pat_sign >= 0 else -1.0)
+                
+                if pat_sign != 0 and mtf_sign != 0 and pat_sign == mtf_sign:
+                    combo = pat_adj + (0.7 * mtf_adj_val)
+                else:
+                    # If disagreement, keep the smaller magnitude (more conservative)
+                    combo = pat_adj if abs(pat_adj) <= abs(mtf_adj_val) else mtf_adj_val
+                
+                pattern_prob_adj = float(np.clip(combo, -0.08, 0.08))
+                logger.info(f"[{name}] Pattern/MTF combo: pat={pat_adj:+.3f} (confirmed={pat_confirmed}) "
+                            f"mtf={mtf_adj_val:+.3f} → combo={pattern_prob_adj:+.3f}")
+            except Exception as e:
+                logger.debug(f"[{name}] Pattern/MTF blend skipped: {e}")
+
+
 
             # ========== NO-TRADE GATE ==========
             n_short = int(micro_ctx.get('n_short', 0))
@@ -703,7 +804,15 @@ async def _connection_processing_loop(
                 s_min = int(getattr(config, 'micro_short_min_ticks_1m', 12))
                 std_eps = float(getattr(config, 'gate_std_short_epsilon', 1e-6))
                 tight_thr = float(getattr(config, 'gate_tightness_threshold', 0.995))
+                
+                # Baseline gate
                 gate_no_trade = (n_short < s_min) or ((std_short <= std_eps) and (tightness >= tight_thr))
+                
+                # NEW: Loosen under strong consensus
+                strong_cons = abs(float(mtf_consensus)) >= float(getattr(config, "consensus_threshold", 0.66))
+                if strong_cons:
+                    s_min_eff = max(1, int(0.5 * s_min))
+                    gate_no_trade = (n_short < s_min_eff) and gate_no_trade is True and (std_short <= std_eps)
             except Exception:
                 pass
 
@@ -712,12 +821,13 @@ async def _connection_processing_loop(
                 f"tight={tightness:.3f} → no_trade={gate_no_trade}"
             )
 
+
+
             # ========== INDICATOR SCORE COMPUTATION ==========
             ema_fast = float(ema_feats.get('ema_8', 0.0))
             ema_slow = float(ema_feats.get('ema_21', 0.0))
             ema_trend = 1.0 if ema_fast > ema_slow else (-1.0 if ema_fast < ema_slow else 0.0)
 
-            micro_slope = float(micro_ctx.get('slope', 0.0))
             imbalance = float(micro_ctx.get('imbalance', 0.0))
             mean_drift_pct = float(micro_ctx.get('vwap_drift_pct', micro_ctx.get('mean_drift_pct', 0.0)))
             mean_drift = mean_drift_pct / 100.0
@@ -727,15 +837,20 @@ async def _connection_processing_loop(
             if enable_rule_blend:
                 indicator_features = {
                     'ema_trend': ema_trend,
-                    'micro_slope': micro_slope,
+                    'micro_slope': micro_slope_normed,  # NEW: normalized
                     'imbalance': imbalance,
                     'mean_drift': mean_drift,
+                    # Pass context keys used by compute_indicator_score for volatility-aware weighting
+                    'std_dltp_short': float(micro_ctx.get('std_dltp_short', 0.0)),
+                    'price_range_tightness': float(micro_ctx.get('price_range_tightness', 0.0)),
                 }
                 try:
                     indicator_score = model_pipe.compute_indicator_score(indicator_features)
                     logger.debug(f"[{name}] Indicator score: {indicator_score:.3f}")
                 except Exception as e:
                     logger.debug(f"[{name}] Indicator score computation failed: {e}")
+
+
 
             # ========== FEATURE NORMALIZATION ==========
             try:
@@ -752,30 +867,34 @@ async def _connection_processing_loop(
             features_raw = {
                 **ema_feats,
                 **ofd,
-                'micro_slope': micro_slope,
+                'micro_slope': micro_slope_normed,  # NEW
                 'micro_imbalance': imbalance,
                 'mean_drift_pct': mean_drift_pct,
-                'last_price': tick.get('ltp', 0.0),
+                'last_price': float(prices[-1]) if prices else 0.0,  # NEW: match schema
+                'last_zscore': float(last_zscore),
+                'std_dltp_short': float(micro_ctx.get('std_dltp_short', 0.0)),  # NEW
+                'price_range_tightness': float(micro_ctx.get('price_range_tightness', 0.0)),  # NEW
                 **ta,
             }
 
+
+
             features = FeaturePipeline.normalize_features(features_raw, scale=scale)
 
-            # Add pattern features UN-NORMALIZED
-            if pattern_features:
-                try:
-                    for k, v in pattern_features.items():
-                        features[k] = float(v)
-                except Exception:
-                    pass
+            # Add pattern features UN-NORMALIZED (always)
+            try:
+                for k, v in (pattern_features or {}).items():
+                    features[k] = float(v)
+            except Exception:
+                pass
 
-            # Keep MTF features un-normalized
-            if mtf:
-                for k, v in mtf.items():
-                    try:
-                        features[k] = float(v)
-                    except Exception:
-                        continue
+            # Keep MTF features un-normalized (always)
+            try:
+                for k, v in (mtf or {}).items():
+                    features[k] = float(v)
+            except Exception:
+                pass
+
 
             # ========== LIVE TENSOR CONSTRUCTION ==========
             try:
@@ -798,6 +917,10 @@ async def _connection_processing_loop(
                 features_for_log = {}
                 latent_for_log = None
 
+
+
+
+
             # ========== MODEL PREDICTION ==========
             try:
                 recent_pf = (ws_handler.get_recent_profit_factor() if hasattr(ws_handler, "get_recent_profit_factor") 
@@ -805,21 +928,48 @@ async def _connection_processing_loop(
             except Exception:
                 recent_pf = 1.0
 
+            neutral_prob = None  # ✅ Initialize before try block
+
             try:
                 # Use stable lexicographic order for features
                 feat_keys_sorted = sorted(features.keys())
                 engineered_features = [features[k] for k in feat_keys_sorted]
 
-                signal_probs, alpha_buy = model_pipe.predict(
+
+                # Phase 2: schema guard — skip inference when missing or mismatched
+                schema_n = getattr(model_pipe, "feature_schema_size", None)
+                live_n = len(feat_keys_sorted)
+                if schema_n is None:
+                    logger.critical(f"[{name}] [SCHEMA] Missing feature schema; skipping inference this bucket (live_n={live_n})")
+                    await asyncio.sleep(0)
+                    continue
+
+                if int(schema_n) != int(live_n):
+                    logger.warning(f"[{name}] [SCHEMA] Live features ({live_n}) != schema ({schema_n}); proceeding with name-based alignment and zero-fill")
+                    try:
+                        schema_names = set(getattr(model_pipe, "feature_schema_names", []) or [])
+                        live_names = set(feat_keys_sorted or [])
+                        missing = sorted(list(schema_names - live_names))[:10]
+                        extra = sorted(list(live_names - schema_names))[:10]
+                        logger.info(f"[{name}] [SCHEMA] Missing (up to 10): {missing}")
+                        logger.info(f"[{name}] [SCHEMA] Extra (up to 10): {extra}")
+                    except Exception as e:
+                        logger.debug(f"[{name}] [SCHEMA] Diff report failed: {e}")
+
+
+
+                signal_probs, alpha_buy, neutral_prob = model_pipe.predict(
                     live_tensor=live_tensor,
                     engineered_features=engineered_features,
                     recent_profit_factor=recent_pf,
                     indicator_score=indicator_score if enable_rule_blend else None,
                     pattern_prob_adjustment=pattern_prob_adj,
-                    engineered_feature_names=feat_keys_sorted
+                    engineered_feature_names=feat_keys_sorted,
+                    mtf_consensus=mtf_consensus  # NEW
                 )
 
                 buy_prob = float(signal_probs[0][1])
+
                 logger.debug(f"[{name}] Prediction: buy_prob={buy_prob:.3f}, alpha={float(alpha_buy):.3f}")
 
                 # Log schema alignment status periodically
@@ -831,56 +981,236 @@ async def _connection_processing_loop(
                 logger.error(f"[{name}] Model inference error: {e}", exc_info=True)
                 signal_probs, alpha_buy = (np.array([[0.5, 0.5]]), 0.6)
                 buy_prob = 0.5
+                neutral_prob = None  # ✅ Explicitly set in exception path
 
-            # ========== DYNAMIC ALPHA TUNING ==========
+
+
+            # ========== DYNAMIC REGIME-BASED ALPHA NUDGE ==========
             try:
-                hold_ratio = (sum(1 for d in recent_decisions if d == "HOLD") / max(1, len(recent_decisions))) if recent_decisions else 0.0
-                delta_alpha = 0.0
-                if hold_ratio > target_hold_ratio + 0.10:
-                    delta_alpha = -alpha_tune_step
-                elif hold_ratio < target_hold_ratio - 0.10:
-                    delta_alpha = +alpha_tune_step
-                alpha_buy = float(np.clip(alpha_buy + delta_alpha, alpha_min, alpha_max))
-                if abs(delta_alpha) > 1e-9:
-                    logger.info(f"[{name}] Alpha tuned via hold_ratio={hold_ratio:.2f} → {alpha_buy:.3f} (Δ={delta_alpha:+.3f})")
+                consensus_threshold = float(getattr(config, "consensus_threshold", 0.66))
+                rvol_threshold = float(getattr(config, "pattern_rvol_threshold", 1.2))
+                
+                strong_cons = abs(float(mtf_consensus)) >= consensus_threshold
+                pat_rvol = float(pattern_features.get('pat_rvol', 0.0)) if pattern_features else 0.0
+                
+                # Strong trend/high RVOL → reduce alpha slightly (more aggressive)
+                if strong_cons:
+                    alpha_buy = max(alpha_min, float(alpha_buy) - (0.04 if pat_rvol >= rvol_threshold else 0.03))
+                    logger.info(f"[{name}] Alpha trend-nudge (strong_cons={strong_cons}, rvol={pat_rvol:.2f}) → {alpha_buy:.3f}")
+                
+                # Choppy/low-consensus → raise alpha slightly (more conservative)
+                elif abs(float(mtf_consensus)) < 0.33:
+                    alpha_buy = min(alpha_max, float(alpha_buy) + 0.01)
+                    logger.info(f"[{name}] Alpha choppy-nudge (weak_consensus) → {alpha_buy:.3f}")
             except Exception as e:
-                logger.debug(f"[{name}] Alpha tuning skipped: {e}")
+                logger.debug(f"[{name}] Regime alpha nudge skipped: {e}")
 
-            # ========== ENSEMBLE OVERRIDE NEAR DEADBAND ==========
+
+
+            # ========== ENSEMBLE OVERRIDE (LOOSENED POLICY) ==========
             override = None
             try:
                 buy_prob_now = float(buy_prob)
-                indecisive = abs(buy_prob_now - 0.5) <= deadband_eps
-                bias = 0.0
+                sell_prob_now = 1.0 - buy_prob_now
+                margin = abs(buy_prob_now - 0.5)
+                
+                # Directional score favors MTF heavier than indicator
+                mtf_weight = 0.8
+                dir_score = 0.0
                 if indicator_score is not None:
-                    bias += float(indicator_score)
-                bias += 0.8 * float(mtf_consensus)
-                if indecisive and abs(bias) >= indicator_bias_threshold:
-                    override = "BUY" if bias > 0 else "SELL"
-                    logger.info(f"[{name}] Override indecision near 0.5 using consensus bias={bias:+.3f} → {override}")
+                    dir_score += float(indicator_score)
+                dir_score += mtf_weight * float(mtf_consensus)
+                
+                bias_threshold = float(getattr(config, "indicator_bias_threshold", 0.20))
+                
+                # Neutral window widened
+                neutral_ok = (neutral_prob is None) or (0.25 <= float(neutral_prob) <= 0.75)
+                
+                # Primary rule: shallow margin but strong directional_score → force direction
+                if (margin <= 0.07) and (dir_score is not None) and (abs(dir_score) >= bias_threshold) and neutral_ok:
+                    override = "BUY" if dir_score > 0 else "SELL"
+                    logger.info(f"[{name}] Override (loose): margin={margin:.3f} dir_score={dir_score:+.3f} "
+                                f"neutral={neutral_prob if neutral_prob is not None else 'na'} → {override}")
+                else:
+                    # Fallback rule: indecisive near deadband and both sides under alpha, aligned bias
+                    indecisive = margin <= deadband_eps
+                    both_within = (buy_prob_now < (alpha_buy - 0.03)) and (sell_prob_now < (alpha_buy - 0.03))
+                    same_sign = np.sign(buy_prob_now - 0.5) == np.sign(dir_score)
+                    if indecisive and both_within and same_sign and (abs(dir_score) >= 0.25) and neutral_ok:
+                        override = "BUY" if dir_score > 0 else "SELL"
+                        logger.info(f"[{name}] Override (strict): indecisive={indecisive} both_within={both_within} "
+                                    f"same_sign={same_sign} | dir_score={dir_score:+.3f} → {override}")
+                    else:
+                        logger.info(f"[{name}] No override: margin={margin:.3f} dir_score={dir_score:+.3f} "
+                                    f"neutral={neutral_prob if neutral_prob is not None else 'na'}")
             except Exception as e:
                 logger.debug(f"[{name}] Override check failed: {e}")
+
+
 
             # ========== DECISION CACHING ==========
             try:
                 decision = _make_decision(buy_prob, float(alpha_buy))
                 if decision == "HOLD" and override is not None:
                     decision = override
-                last_minute_prediction = {
-                    "buy_prob": buy_prob,
-                    "alpha": float(alpha_buy),
-                    "decision": decision,
-                    "ltp": float(tick.get('ltp', 0.0)),
-                    "no_trade": bool(gate_no_trade)
-                }
+                # (Removed redundant early cache; final cache happens after hysteresis/gates)
             except Exception:
                 pass
 
-            # Track decision for alpha tuning
+
+
+            # Log raw (pre-hysteresis) decision with probabilities
             try:
-                recent_decisions.append(decision)
+                p_buy = float(buy_prob)
+                if not np.isfinite(p_buy):
+                    p_buy = 0.50
+                p_sell = 1.0 - p_buy
+                raw_decision = decision  # snapshot before hysteresis
+                if decision_log_verbose:
+                    logger.info(
+                        f"[{name}] Decision (raw): base={raw_decision} p_buy={p_buy:.3f} p_sell={p_sell:.3f} "
+                        f"alpha={float(alpha_buy):.3f} prev={prev_directional_decision}"
+                    )
             except Exception:
-                pass
+                raw_decision = decision
+
+
+
+            # ========== HYSTERESIS: respect alpha crossings + advantage-based flip ==========
+            hysteresis_suppressed = False
+            hysteresis_reason = ""
+            flip_marker = None  # 'allowed_alpha' | 'allowed_adv' | 'suppressed'
+
+            try:
+                p_buy = float(buy_prob)
+                if not np.isfinite(p_buy):
+                    p_buy = 0.50
+                p_sell = 1.0 - p_buy
+                p_prev = 0.50
+                if prev_directional_decision == "BUY":
+                    p_prev = p_buy if np.isfinite(p_buy) else 0.50
+                elif prev_directional_decision == "SELL":
+                    p_prev = p_sell if np.isfinite(p_sell) else 0.50
+
+                # Proposed new side's probability
+                if decision == "BUY":
+                    p_new = p_buy
+                elif decision == "SELL":
+                    p_new = p_sell
+                else:
+                    p_new = 0.50
+
+                if (
+                    hyst_enable
+                    and decision in ("BUY", "SELL")
+                    and prev_directional_decision in ("BUY", "SELL")
+                    and decision != prev_directional_decision
+                ):
+                    # compute advantage once for telemetry
+                    advantage = float(p_new - p_prev)
+
+                    # 1) Respect alpha crossings with small safety buffer
+                    if hyst_respect_alpha and (p_new >= (float(alpha_buy) + hyst_flip_buffer)):
+                        hysteresis_suppressed = False
+                        hysteresis_reason = f"flip allowed (crossed alpha+{hyst_flip_buffer:.3f})"
+                        flip_marker = "allowed_alpha"
+                    else:
+                        # 2) Require the new side to beat the previous side by a small advantage
+                        if advantage < hyst_advantage:
+                            hysteresis_suppressed = True
+                            hysteresis_reason = (
+                                f"suppress flip {prev_directional_decision}->{decision} "
+                                f"(p_new={p_new:.3f}, p_prev={p_prev:.3f}, Δ={advantage:+.3f} < adv={hyst_advantage:.3f})"
+                            )
+                            flip_marker = "suppressed"
+                            decision = prev_directional_decision
+                        else:
+                            flip_marker = "allowed_adv"
+
+                # Update prev state using final (possibly suppressed) decision
+                if decision in ("BUY", "SELL"):
+                    prev_directional_decision = decision
+                    prev_margin = abs(p_buy - 0.5)  # legacy metric (kept for diagnostics)
+                    prev_side_prob = p_buy if decision == "BUY" else p_sell
+
+                # Telemetry counters
+                try:
+                    if flip_marker == "suppressed":
+                        flips_suppressed += 1
+                        delta_sum += advantage
+                        delta_count += 1
+                    elif flip_marker in ("allowed_alpha", "allowed_adv"):
+                        flips_allowed += 1
+                        delta_sum += advantage
+                        delta_count += 1
+                except Exception:
+                    pass
+
+                # Emit hourly summary
+                try:
+                    if telemetry_enable:
+                        elapsed = (timestamp - last_telem_ts).total_seconds()
+                        if elapsed >= max(60, telemetry_interval):  # guard: min 60s
+                            avg_delta = (delta_sum / delta_count) if delta_count > 0 else 0.0
+                            logger.info(
+                                f"[{name}] Hysteresis hourly: allowed={flips_allowed} suppressed={flips_suppressed} "
+                                f"avg_Δ={avg_delta:+.3f} over {int(elapsed)}s"
+                            )
+                            flips_allowed = flips_suppressed = 0
+                            delta_sum = 0.0
+                            delta_count = 0
+                            last_telem_ts = timestamp
+                except Exception:
+                    pass
+
+                if hysteresis_suppressed and decision_log_verbose:
+                    logger.info(f"[{name}] Hysteresis: {hysteresis_reason}")
+                elif decision_log_verbose and hysteresis_reason:
+                    logger.info(f"[{name}] Hysteresis: {hysteresis_reason}")
+            except Exception as e:
+                logger.debug(f"[{name}] Hysteresis block skipped: {e}")
+
+
+
+
+            # ========== HARD GATES: NO-TRADE AND HIGH-NEUTRALITY ==========
+            try:
+                high_neutral = (neutral_prob is not None) and (float(neutral_prob) >= 0.75) and (abs(float(mtf_consensus)) < 0.33)
+            except Exception:
+                high_neutral = False
+
+            if gate_no_trade or high_neutral:
+                decision = "HOLD"
+                override = None
+                logger.info(f"[{name}] Gate forced HOLD: no_trade={gate_no_trade} high_neutral={high_neutral} "
+                            f"(p_neutral={neutral_prob if neutral_prob is not None else 'na'}, mtf={mtf_consensus:+.2f})")
+
+
+
+            # Cache last_minute_prediction with final decision (after gates/override)
+  
+            last_minute_prediction = {
+                "buy_prob": float(buy_prob),
+                "alpha": float(alpha_buy),
+                "decision": decision if (decision != "HOLD" or override is None) else "HOLD",
+                "ltp": float(tick.get('ltp', 0.0)),
+                "no_trade": bool(gate_no_trade or high_neutral),
+                "raw_decision": str(raw_decision),
+                "hysteresis_suppressed": bool(hysteresis_suppressed),
+                "hysteresis_reason": hysteresis_reason,
+            }
+
+            # High-visibility immediate final decision log
+            if decision_log_verbose:
+                logger.info(
+                    f"[{name}] Decision (final): {last_minute_prediction['decision']} "
+                    f"(raw={last_minute_prediction['raw_decision']}, "
+                    f"hyst_suppressed={last_minute_prediction['hysteresis_suppressed']}, "
+                    f"no_trade={gate_no_trade}, high_neutral={high_neutral})"
+                )
+
+
+
 
             # ========== FREEZE PREDICTION FOR NEXT CANDLE ==========
             try:
@@ -895,17 +1225,22 @@ async def _connection_processing_loop(
                 logger.debug(f"[{name}] [EVAL] Failed to freeze prediction: {e}")
 
             # ========== STAGE TRAINING ROW ==========
+
+
             staged_row_current_bucket = {
                 "features": features_for_log,
                 "latent": latent_for_log,
                 "indicator_score": float(indicator_score) if indicator_score is not None else None,
-                "pattern_prob_adjustment": float(pattern_prob_adj),
+                "pattern_prob_adj": float(pattern_prob_adj),  # renamed for consistency
                 "decision": decision,
                 "buy_prob": float(buy_prob),
                 "alpha": float(alpha_buy),
-                "no_trade": bool(gate_no_trade),
+                "no_trade": bool(gate_no_trade or (neutral_prob is not None and float(neutral_prob) >= 0.70)),
+                "neutral_prob": float(neutral_prob) if neutral_prob is not None else None,  # helps offline analysis
                 "ltp": float(tick.get('ltp', 0.0)),
             }
+
+
 
             # Mark prediction as completed for this bucket
             did_predict_for_bucket = True
@@ -939,14 +1274,21 @@ async def _connection_processing_loop(
             except Exception as e:
                 logger.debug(f"[{name}] Order placement skipped: {e}")
 
-            # ========== DRIFT DETECTION (OPTIONAL) ==========
+            # ========== DRIFT DETECTION (OPTIONAL) with cooldown ==========
             try:
                 drift_stats = feat_pipe.detect_drift(features)
                 alert_needed = any(stat.get('ks_stat', 0.0) > 0.2 for stat in drift_stats.values())
                 if alert_needed:
-                    logger.info(f"[{name}] Drift detected (ks>0.2) on one or more features")
+                    now = _time_mod.time()
+                    if (now - drift_last_log_ts) >= drift_log_cooldown:
+                        logger.info(f"[{name}] Drift detected (ks>0.2) on one or more features")
+                        drift_last_log_ts = now
+                    else:
+                        logger.debug(f"[{name}] Drift detected (suppressed by cooldown)")
             except Exception as e:
                 logger.debug(f"[{name}] Drift detection skipped: {e}")
+
+
 
             await asyncio.sleep(0)
 
@@ -965,23 +1307,73 @@ async def _connection_processing_loop(
 
 
 
+async def _maybe_refresh_drift_baseline(cfg, feat_pipe: FeaturePipeline, feature_log_path: str):
+    """
+    Build a real KS baseline from recent feature_log.csv rows for a few stable features.
+    Called once at startup and then periodically (idempotent).
+    """
+    try:
+        path = Path(feature_log_path)
+        if not path.exists():
+            return
+        df = pd.read_csv(path, header=None, names=["ts","decision","label","buy_prob","alpha","tradeable","is_flat","ticks","rest"], on_bad_lines='skip')
+        # Fast parse: split packed "rest" into tokens and pick a subset of known features
+        
+        keep = ["ema_8","ema_21","spread","micro_slope","micro_imbalance","mean_drift_pct","last_zscore","last_price"]  # last_price kept for backfill
 
+        baselines = {k: [] for k in keep}
+        sample_n = 600  # recent rows
+        for row in df.tail(sample_n).itertuples(index=False):
+            try:
+                toks = str(row.rest).split(",")
+                for t in toks:
+                    if "=" not in t:
+                        continue
+                    k,v = t.split("=",1)
+                    if k in baselines:
+                        baselines[k].append(float(v))
+            except Exception:
+                continue
+        # Filter only non-empty lists
+        baselines = {k: v for k, v in baselines.items() if v}
+        if baselines:
+            feat_pipe.train_features = baselines
+            logger.info(f"[DRIFT] Baseline refreshed from feature_log: keys={list(baselines.keys())} "
+                       f"samples~{min(len(next(iter(baselines.values()))), sample_n)}")
+    except Exception as e:
+        logger.debug(f"[DRIFT] Baseline refresh failed (ignored): {e}")
+
+
+
+
+async def drift_baseline_refresh_loop(cfg, feat_pipe: FeaturePipeline, feature_log_path: str, interval_sec: int = 600):
+    """
+    Periodically refresh drift baseline from feature_log (idempotent and safe).
+    """
+    logger.info(f"[DRIFT] Baseline refresh loop started (every {interval_sec}s)")
+    while True:
+        try:
+            await _maybe_refresh_drift_baseline(cfg, feat_pipe, feature_log_path)
+        except asyncio.CancelledError:
+            logger.info("[DRIFT] Baseline refresh loop cancelled")
+            break
+        except Exception as e:
+            logger.debug(f"[DRIFT] Periodic refresh failed (ignored): {e}")
+        await asyncio.sleep(interval_sec)
 
 
 
 
 # ------------------------- Main Orchestrator ------------------------- #
 
-
 async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, chat_id, neutral_model=None):
-    
     """
     Orchestrates:
     - Multiple WS connections (each: connector + heartbeat + processing tasks).
     - Global feature/model pipeline and weight refresh loop.
     - Graceful shutdown of all tasks.
-    - NEW: Feature logging, PF tracking, fair HOLD/FLAT scoring, no-trade gate
-
+    - Feature logging, PF tracking, fair HOLD/FLAT scoring with dynamic flat tolerance, no-trade gate.
+    
     Accepts a single config or config.connections (list/dict) for multiple feeds.
     """
     logger.info("=" * 60)
@@ -993,29 +1385,49 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
 
     # Shared components
     try:
-
         feat_pipe = FeaturePipeline(train_features=train_features, rl_agent=rl_agent)
         model_pipe = create_default_pipeline(cnn_lstm, xgb, rl_agent, neutral_model=neutral_model)
-        telegram = TelegramBot(token_b64, chat_id)
         logger.info("Global components initialized successfully")
 
 
+        # Initialize real drift baseline from feature log (optional, visible)
+        try:
+            await _maybe_refresh_drift_baseline(config, feat_pipe, feature_log_path=getattr(config, 'feature_log_path', 'feature_log.csv'))
+            
+        except Exception as e:
+            logger.debug(f"[DRIFT] Startup baseline not set: {e}")
 
-        # NEW: Load feature schema if available (supports new and legacy formats)
+
+
+
+        # Periodic refresh loop to replace random baselines with empirical distributions
+        try:
+            baseline_task = asyncio.create_task(
+                drift_baseline_refresh_loop(
+                    config, feat_pipe, feature_log_path=getattr(config, 'feature_log_path', 'feature_log.csv'),
+                    interval_sec=600
+                )
+            )
+            logger.info("[DRIFT] Baseline refresh task started")
+        except Exception as e:
+            logger.debug(f"[DRIFT] Failed to start refresh task: {e}")
+
+
+
+
+        # Load feature schema if available (supports new and legacy formats)
         try:
             xgb_path = os.getenv("XGB_PATH", "models/xgb_model.json")
             base_dir = os.path.dirname(xgb_path) or "."
             schema_candidates = [
-                os.path.join(base_dir, "feature_schema.json"),             # new
-                xgb_path.replace(".json", "_schema.json")                  # legacy
+                os.path.join(base_dir, "feature_schema.json"),          # new
+                xgb_path.replace(".json", "_schema.json")               # legacy
             ]
             names = None
             for sp in schema_candidates:
                 if os.path.exists(sp):
-                    # Use module-level json (imported at top) to avoid shadowing in this scope
                     with open(sp, "r", encoding="utf-8") as f:
                         schema = json.load(f)
-                    # both supported: {"feature_names":[...]} or {"features":[...]}
                     names = schema.get("feature_names") or schema.get("features")
                     if names:
                         model_pipe.set_feature_schema(names)
@@ -1025,9 +1437,6 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
                 logger.info("No feature schema found at startup (will be created after first training)")
         except Exception as e:
             logger.warning(f"Failed to load feature schema at startup: {e}")
-
-
-
     except Exception as e:
         logger.error(f"Failed to initialize global components: {e}", exc_info=True)
         raise
@@ -1038,18 +1447,14 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
     weight_task = asyncio.create_task(weight_refresh_loop(model_pipe, hitrate_path, weight_refresh_seconds))
     logger.info(f"Weight refresh task started (interval: {weight_refresh_seconds}s)")
 
-    # NEW: Feature log path (define before trainer uses it)
+    # Feature log path (define before trainer uses it)
     feature_log_path = getattr(config, 'feature_log_path', 'feature_log.csv')
     logger.info(f"Feature log path: {feature_log_path}")
-
 
     # Background online trainer (optional)
     trainer_task = None
     try:
         from online_trainer import background_trainer_loop
-        
-        
-        
         xgb_out = os.getenv("XGB_PATH", "models/xgb_model.json")
         neutral_out = os.getenv("NEUTRAL_PATH", "models/neutral_model.pkl")
 
@@ -1062,19 +1467,16 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
             logger.warning(f"Failed to create model output dirs: {e}")
 
         trainer_task = asyncio.create_task(background_trainer_loop(
-            feature_log_path=feature_log_path,  # ADD THIS LINE
+            feature_log_path=feature_log_path,
             xgb_out_path=xgb_out,
             neutral_out_path=neutral_out,
             pipeline_ref=model_pipe,
             interval_sec=int(getattr(config, "trainer_interval_sec", 600)),
             min_rows=int(getattr(config, "trainer_min_rows", 300))
         ))
-
-        
         logger.info("Online trainer task started")
     except Exception as e:
         logger.warning(f"Online trainer not started: {e}")
-
 
     # Per-connection tasks
     stop_events: Dict[str, asyncio.Event] = {}
@@ -1097,6 +1499,7 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
             def _write_hitrate_records(candle_ts: datetime, hit: int):
                 """
                 Write one JSONL record per tunable indicator so weight tuner can adapt.
+                Called only for directional outcomes (see EVAL gating).
                 """
                 try:
                     indicators = ['micro_slope', 'imbalance', 'mean_drift']
@@ -1126,7 +1529,7 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
                 except Exception as e:
                     logger.debug(f"[{name}] on_tick callback error (ignored): {e}")
 
-            # NEW: Enhanced candle callback with fair HOLD/FLAT scoring and feature logging
+            # Candle callback with dynamic flat scoring (Option B), label alignment, and directional-only hitrate logging
             async def _on_candle_cb(candle_df, full_df):
                 try:
                     idx_ts = candle_df.index[-1] if not candle_df.empty else None
@@ -1141,53 +1544,72 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
                             f"Vol:{int(row.get('volume', 0)):,} "
                             f"Ticks:{int(row.get('tick_count', 0))}"
                         )
-                        
-                        # EVAL: score the just-closed candle if we had a registered prediction
+
                         try:
-                            # Access pending_train_rows from processing loop context
                             pred = pending_preds.pop(idx_ts, None)
                             staged = getattr(_on_candle_cb, '_pending_train_rows', {}).pop(idx_ts, None)
-                            
+
                             if pred is not None:
                                 o = float(row.get('open', 0.0))
                                 c = float(row.get('close', 0.0))
                                 move = c - o
                                 direction = "UP" if c > o else ("DOWN" if c < o else "FLAT")
 
-                                expected = pred.get("decision") 
+                                # Use executed decision if present; fall back to threshold rule
+                                expected = pred.get("decision")
                                 if expected not in ("BUY", "SELL", "HOLD"):
-                                    expected = "BUY" if pred["buy_prob"] >= pred["alpha"] else ("SELL" if (1.0 - pred["buy_prob"]) >= pred["alpha"] else "HOLD")
-                                    
-                                                           
+                                    expected = "BUY" if pred["buy_prob"] >= pred["alpha"] else (
+                                        "SELL" if (1.0 - pred["buy_prob"]) >= pred["alpha"] else "HOLD"
+                                    )
 
-                                # Option B: dynamic flat tolerance in [0.5×base, base]
-                                base_tol = float(getattr(cfg, 'flat_tolerance_pct', 0.0002))  # 0.02% default
+                                # Dynamic flat tolerance (Option B), bounded
+                                base_tol = float(getattr(cfg, 'flat_tolerance_pct', 0.0002))  # 0.02%
                                 price_denom = max(1e-6, o)
-                                rng = float(row.get('high', o)) - float(row.get('low', o))
-                                rng_pct = rng / price_denom
+                                rng_points = float(row.get('high', o)) - float(row.get('low', o))
+                                rng_pct = rng_points / price_denom
 
-                                # Optional short-term volatility from recent closes (safe if full_df is present)
+                                # short-term volatility from recent closes (safe fallback)
                                 try:
                                     closes = full_df['close'].astype(float).tail(20).values if hasattr(full_df, 'columns') else []
                                     vol_pct = (np.std(np.diff(closes)) / price_denom) if len(closes) >= 3 else 0.0
                                 except Exception:
                                     vol_pct = 0.0
 
-                                dyn_raw = 0.25 * rng_pct + 0.50 * vol_pct
+                                k_range = float(getattr(cfg, 'flat_dyn_k_range', 0.20))
+                                min_pts = float(getattr(cfg, 'flat_min_points', 0.20))
+                                base_points = base_tol * price_denom
+                                dyn_raw = (k_range * rng_pct) + (0.50 * vol_pct)
                                 dyn_tol = max(0.5 * base_tol, min(base_tol, dyn_raw))
-                                is_flat = abs(move) <= (dyn_tol * price_denom)
+                                tol_pts = max(min_pts, dyn_tol * price_denom)
 
-                                logger.info(f"[{name}] [EVAL] flat check: |C-O|={abs(move):.4f} "
-                                            f"rng={rng:.4f} rng%={rng_pct*100:.3f}% vol%={vol_pct*100:.3f}% "
-                                            f"base={base_tol*100:.3f}% dyn={dyn_tol*100:.3f}% → is_flat={is_flat}")
+                                # Optional absolute cap in points (log only; dyn_tol already capped by base)
+
+                                tol_cap_pts = float(getattr(cfg, 'flat_tolerance_max_pts', 1.00))
+                                if not np.isfinite(tol_cap_pts) or tol_cap_pts < 0:
+                                    tol_cap_pts = 1.00
+                                    logger.warning(f"[{name}] Invalid flat_tolerance_max_pts; using default 1.00")
+
+                                                                
+                                if tol_cap_pts > 0.0:
+                                    tol_pts = min(tol_pts, tol_cap_pts)
+                                    logger.info(f"[{name}] [EVAL] tol_cap_pts applied: {tol_cap_pts:.4f} → tol_pts={tol_pts:.4f}")
+                                else:
+                                    logger.info(f"[{name}] [EVAL] tol_cap disabled (0.0) → tol_pts={tol_pts:.4f}")
 
 
-                                
+
+                                is_flat = abs(move) <= tol_pts
                                 skip_eval = bool(pred.get("no_trade", False))
-                                
+
+                                logger.info(
+                                    f"[{name}] [EVAL] flat math: |C-O|={abs(move):.4f} "
+                                    f"rng={rng_points:.4f} rng%={rng_pct*100:.3f}% vol%={vol_pct*100:.3f}% "
+                                    f"base={base_tol*100:.3f}% dyn={dyn_tol*100:.3f}% tol_pts={tol_pts:.4f} → is_flat={is_flat}"
+                                )
+
                                 if skip_eval:
-                                    logger.info(f"[{name}] [EVAL] {idx_ts.strftime('%H:%M:%S')} pred={expected} (bp={pred['buy_prob']:.3f}, thr={pred['alpha']:.3f}) "
-                                                f"actual={direction} → SKIPPED (no-trade gate)")
+                                    logger.info(f"[{name}] [EVAL] {idx_ts.strftime('%H:%M:%S')} pred={expected} "
+                                                f"(bp={pred['buy_prob']:.3f}, thr={pred['alpha']:.3f}) actual={direction} → SKIPPED (no-trade gate)")
                                     hit = None
                                 else:
                                     if expected == "HOLD" and is_flat:
@@ -1198,67 +1620,72 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
                                         hit = 1
                                     else:
                                         hit = 0
-                                    
+
                                     logger.info(
-                                        f"[{name}] [EVAL] {idx_ts.strftime('%H:%M:%S')} pred={expected} (bp={pred['buy_prob']:.3f}, thr={pred['alpha']:.3f}) "
+                                        f"[{name}] [EVAL] {idx_ts.strftime('%H:%M:%S')} pred={expected} "
+                                        f"(bp={pred['buy_prob']:.3f}, thr={pred['alpha']:.3f}) "
                                         f"actual={direction} (O={o:.2f}→C={c:.2f}, is_flat={is_flat}) → {'HIT' if hit == 1 else 'MISS'}"
                                     )
-                                    
-                                    # Hit-rate logging only when scored
-                                    if hit is not None:
+
+                                    # Hitrate learning only for directional outcomes
+                                    if hit is not None and expected in ("BUY", "SELL"):
                                         _write_hitrate_records(idx_ts, hit)
-                                    
-                                    # PF update (only for directional trades)
+                                    else:
+                                        logger.debug(f"[{name}] [EVAL] Hitrate not updated for expected={expected}")
+
+                                    # PF update for directionals
                                     if expected in ("BUY", "SELL"):
                                         pnl = (c - o) if expected == "BUY" else (o - c)
                                         try:
                                             ws_handler.record_pnl(pnl)
-                                            logger.info(f"[{name}] [PF] Recorded PnL={pnl:.2f} after {expected}")
+                                            
+                                            logger.info(f"[{name}] [PF] Recorded PnL={pnl:.2f} after {expected} (direction={direction})")
+
                                         except Exception:
                                             pass
-                                
-                                # Training row: write features + label
+
+                                # Training row: features + label aligned with evaluation's flat rule
                                 try:
-                                    # Use staged row if available; otherwise minimal row
                                     feat_map = (staged or {}).get("features", {})
                                     latent = (staged or {}).get("latent", None)
                                     dec = (staged or pred).get("decision", expected)
                                     bp = float((staged or pred).get("buy_prob", 0.5))
                                     alpha = float((staged or pred).get("alpha", 0.6))
                                     no_trade = bool((staged or pred).get("no_trade", False))
-                                    
                                     label = "FLAT" if is_flat else ("BUY" if c > o else "SELL")
-
                                     tradeable = not no_trade
-                                    
-                                    # Append CSV
+
                                     cols = [
                                         idx_ts.isoformat(), dec, label, f"{bp:.6f}", f"{alpha:.6f}",
                                         str(tradeable), str(is_flat), str(int(row.get('tick_count', 0)))
                                     ]
 
-                                    # features (name=value) — stable lexicographic order
                                     for k in sorted(feat_map.keys()):
                                         try:
                                             cols.append(f"{k}={float(feat_map[k]):.8f}")
                                         except Exception:
                                             continue
 
-                                                                            
-                                    # latent
                                     if latent is not None:
                                         cols.append("latent=" + "|".join(f"{float(x):.8f}" for x in latent))
+
                                     with open(feature_log_path, "a", encoding="utf-8") as f:
                                         f.write(",".join(cols) + "\n")
-                                    logger.info(f"[{name}] [TRAIN] Logged features for {idx_ts.strftime('%H:%M:%S')} label={label} tradeable={tradeable}")
+
+                                    logger.info(
+                                        f"[{name}] [TRAIN] Logged features for {idx_ts.strftime('%H:%M:%S')} "
+                                        f"label={label} tradeable={tradeable}"
+                                    )
                                 except Exception as e:
                                     logger.warning(f"[{name}] [TRAIN] Failed to log training row: {e}")
                         except Exception as e:
                             logger.warning(f"[{name}] [EVAL] Evaluation error: {e}")
-                except Exception:
-                    pass
 
-            # Initialize pending_train_rows as callback attribute for cross-function access
+                except Exception as e:
+                    logger.error(f"[{name}] on_candle callback error: {e}", exc_info=True)
+
+
+            # Initialize staging map for training rows shared across callbacks
             _on_candle_cb._pending_train_rows = {}
 
             async def _on_preclose_cb(preview_df, hist_df):
@@ -1277,7 +1704,7 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
                 except Exception:
                     pass
 
-            # Attach callbacks on handler
+            # Attach callbacks
             try:
                 ws_handler.on_tick = _on_tick_cb
                 ws_handler.on_candle = _on_candle_cb
@@ -1294,25 +1721,25 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
             hb_tasks.append((name, hb_task))
             logger.info(f"[{name}] Connector and heartbeat started")
 
-            # Start processing loop with feature_log_path
+
+            # Start processing loop
             proc_task = asyncio.create_task(
                 _connection_processing_loop(
                     name=name,
                     ws_handler=ws_handler,
                     feat_pipe=feat_pipe,
                     model_pipe=model_pipe,
-                    telegram=telegram,
                     config=cfg,
                     tick_queue=tick_queue,
                     ob_ring=ob_ring,
                     pending_preds=pending_preds,
-                    feature_log_path=feature_log_path,
-                    pending_train_rows=_on_candle_cb._pending_train_rows  # Pass reference
+                    pending_train_rows=_on_candle_cb._pending_train_rows
                 )
             )
+
+
             proc_tasks.append((name, proc_task))
             logger.info(f"[{name}] Processing task started")
-
         except Exception as e:
             logger.error(f"[{name}] Failed to initialize connection: {e}", exc_info=True)
 
@@ -1383,7 +1810,6 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
         except Exception as e:
             logger.error(f"Error cancelling weight task: {e}")
 
-
         # Cancel trainer task
         if trainer_task is not None:
             try:
@@ -1393,6 +1819,17 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
                 pass
             except Exception as e:
                 logger.error(f"Error cancelling trainer task: {e}")
+
+        # Cancel drift baseline refresh task
+        try:
+            if 'baseline_task' in locals() and baseline_task is not None:
+                baseline_task.cancel()
+                await asyncio.wait_for(baseline_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception as e:
+            logger.error(f"Error cancelling drift baseline task: {e}")
+
 
 
         logger.info("=" * 60)

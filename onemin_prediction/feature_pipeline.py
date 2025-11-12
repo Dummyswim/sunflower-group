@@ -253,8 +253,7 @@ class FeaturePipeline:
         return price + fraction * (mid_price - price)
 
 
-
-
+            
     @staticmethod
     def compute_candlestick_patterns(
         candles, 
@@ -267,17 +266,36 @@ class FeaturePipeline:
     ) -> Dict[str, float]:
         """
         Detects classic candlestick patterns using the last 1–3 closed candles.
-        Works with:
-        - pandas.DataFrame (index=timestamp) with columns: open, high, low, close, tick_count(optional)
-        - List[Dict] with same keys
-        
-        Returns a numeric-only dict suitable for model features/logging:
-        - pat_is_* flags: 1.0 if detected else 0.0
-        - pat_winrate_* values for each pattern (0.0 if not applicable)
-        - pat_rvol (relative tick-count vs SMA)
-        - probability_adjustment: signed float in [-0.15, 0.15]
+        Returns numeric-only dict; keys always present with zero defaults when history is insufficient.
         """
         try:
+            # Pre-initialize defaults to keep schema stable on early returns
+            flags = {
+                'pat_is_hammer': 0.0, 'pat_is_inverted_hammer': 0.0, 'pat_is_shooting_star': 0.0,
+                'pat_is_bullish_engulfing': 0.0, 'pat_is_bearish_engulfing': 0.0,
+                'pat_is_doji': 0.0, 'pat_is_inside_bar': 0.0, 'pat_is_outside_bar': 0.0,
+                'pat_is_morning_star': 0.0, 'pat_is_evening_star': 0.0,
+                'pat_is_harami_bullish': 0.0, 'pat_is_harami_bearish': 0.0,
+                'pat_is_piercing_line': 0.0, 'pat_is_dark_cloud': 0.0,
+                'pat_is_three_white_soldiers': 0.0, 'pat_is_three_black_crows': 0.0,
+                'pat_is_thestrat_2u2u_cont': 0.0, 'pat_is_thestrat_2d2d_cont': 0.0,
+                'pat_is_thestrat_2d_1_2u_rev': 0.0, 'pat_is_thestrat_2u_1_2d_rev': 0.0,
+            }
+            # Pre-init winrates to 0.0; trainer/backtests may fill actuals later
+            winrate_out = {f'pat_winrate_{k}': 0.0 for k in [
+                'hammer','inverted_hammer','shooting_star','bullish_engulfing','bearish_engulfing',
+                'doji','inside_bar','outside_bar','morning_star','evening_star',
+                'harami_bullish','harami_bearish','piercing_line','dark_cloud',
+                'three_white_soldiers','three_black_crows',
+                'thestrat_2u2u_cont','thestrat_2d2d_cont','thestrat_2d_1_2u_rev','thestrat_2u_1_2d_rev'
+            ]}
+            out = {}
+            out.update(flags)
+            out.update(winrate_out)
+            out['pat_rvol'] = 0.0
+            out['probability_adjustment'] = 0.0
+            out['pat_confirmed_by_rvol'] = 0.0
+
             # Normalize input to DataFrame
             if hasattr(candles, "iloc"):
                 df = candles.copy()
@@ -287,17 +305,18 @@ class FeaturePipeline:
                     if 'timestamp' in df.columns:
                         df = df.set_index('timestamp')
                 except Exception:
-                    return {}
+                    return out
             
             cols = {'open', 'high', 'low', 'close'}
             if not cols.issubset(set(df.columns)):
-                return {}
-            
+                return out
+
             # Use last up to 5 rows to compute RVOL on tick_count
             tail = df.tail(max(3, rvol_window)).copy()
             if tail.empty or len(tail) < 1:
-                return {}
-            
+                return out
+        
+
             # Safe tick_count (activity proxy)
             if 'tick_count' not in tail.columns:
                 tail['tick_count'] = 0
@@ -554,11 +573,12 @@ class FeaturePipeline:
                 if is_inside(h1, l1, h2, l2) and is_2_down(h0, l0, h1, l1):
                     if uptrend() or (dir_(o2, c2c) > 0):
                         flags['pat_is_thestrat_2u_1_2d_rev'] = 1.0
-            
+
+
             # Volume confirmation via tick_count RVOL
             confirmed = (rvol >= rvol_thresh)
-            
-            # Probability adjustment logic
+
+            # Probability adjustment logic (reduced caps)
             base_adj = {
                 # existing
                 'pat_is_hammer': 0.08,
@@ -566,7 +586,7 @@ class FeaturePipeline:
                 'pat_is_shooting_star': 0.06,
                 'pat_is_bullish_engulfing': 0.10,
                 'pat_is_bearish_engulfing': 0.10,
-                'pat_is_inside_bar': 0.05,   # breakout potential
+                'pat_is_inside_bar': 0.05,
                 'pat_is_outside_bar': 0.06,
                 'pat_is_morning_star': 0.12,
                 'pat_is_evening_star': 0.12,
@@ -585,7 +605,7 @@ class FeaturePipeline:
                 'pat_is_thestrat_2d_1_2u_rev': 0.08,
                 'pat_is_thestrat_2u_1_2d_rev': 0.08,
             }
-            
+
             # Identify bullish vs bearish effects
             bullish_keys = [
                 'pat_is_hammer', 'pat_is_inverted_hammer',
@@ -601,7 +621,7 @@ class FeaturePipeline:
                 'pat_is_thestrat_2u_1_2d_rev', 'pat_is_harami_bearish'
             ]
             neutral_keys = ['pat_is_inside_bar', 'pat_is_outside_bar', 'pat_is_doji']
-            
+
             def adj_for(flag_key: str) -> float:
                 # Apply winrate threshold screen
                 map_key = flag_key.replace('pat_is_', '')
@@ -610,21 +630,31 @@ class FeaturePipeline:
                 if wr_val < min_winrate:
                     return 0.0
                 return float(base_adj.get(flag_key, 0.0))
-            
+
             bullish_adj = sum(adj_for(k) for k in bullish_keys if flags.get(k, 0.0) > 0.5)
             bearish_adj = sum(adj_for(k) for k in bearish_keys if flags.get(k, 0.0) > 0.5)
             neutral_adj = 0.5 * sum(adj_for(k) for k in neutral_keys if flags.get(k, 0.0) > 0.5)
-            
+
             raw_adj = (bullish_adj - bearish_adj) + neutral_adj
-            strength = 1.0 if confirmed else 0.5
-            probability_adjustment = float(np.clip(raw_adj * strength, -0.15, 0.15))
-            
+
+            # Require RVOL confirmation for adjustments > 0.03
+            if not confirmed and abs(raw_adj) > 0.03:
+                raw_adj = 0.03 * np.sign(raw_adj)
+
+            probability_adjustment = float(np.clip(raw_adj, -0.08, 0.08))
+
             out = {}
             out.update(flags)
             out.update(winrate_out)
             out['pat_rvol'] = float(rvol)
             out['probability_adjustment'] = probability_adjustment
             out['pat_confirmed_by_rvol'] = 1.0 if confirmed else 0.0
+
+
+            
+            
+            
+            
             
             # Only numeric values (safe for logging/normalization)
             numeric_out = {}
@@ -636,7 +666,7 @@ class FeaturePipeline:
             return numeric_out
         except Exception as e:
             logger.debug(f"Pattern detection error: {e}")
-            return {}
+            return out
 
 
     @staticmethod
@@ -649,23 +679,35 @@ class FeaturePipeline:
     ) -> Dict[str, float]:
         """
         Compute 1m/3m/5m pattern signals and a signed consensus in [-1,+1].
-        
+
         Returns:
             {
-              'mtf_consensus': signed float [-1,+1],
-              'mtf_adj': probability adjustment in [-0.15, 0.15],
-              'mtf_tf_1T': signed vote [-1,0,1], ... for each TF,
-              'mtf_tf_1T_adj': adj in [-0.15,0.15], ... for each TF
+            'mtf_consensus': signed float [-1,+1],
+            'mtf_adj': probability adjustment in [-0.08, 0.08],
+            'mtf_tf_1T': signed vote [-1,0,1], ... for each TF,
+            'mtf_tf_1T_adj': adj in [-0.08,0.08], ... for each TF
             }
         """
         out = {}
         try:
-            if not isinstance(candle_df, pd.DataFrame) or candle_df.empty:
-                return out
             if timeframes is None:
                 timeframes = ["1T", "3T", "5T"]
             
-                
+            # Pre-initialize defaults before any early return
+            out_defaults = {
+                "mtf_consensus": 0.0,
+                "mtf_adj": 0.0,
+            }
+            for tf0 in (timeframes or []):
+                key_tf = tf0.replace("min", "T") if tf0.endswith("min") else tf0
+                out_defaults[f"mtf_tf_{key_tf}"] = 0.0
+                out_defaults[f"mtf_tf_{key_tf}_adj"] = 0.0
+            out = dict(out_defaults)
+
+            if not isinstance(candle_df, pd.DataFrame) or candle_df.empty:
+                return out
+            # continue with existing logic...
+            
             votes = []
             adjs = []
             for tf in timeframes:
@@ -713,8 +755,6 @@ class FeaturePipeline:
                 except Exception:
                     continue
 
-                
-            
             if not votes:
                 return out
             
@@ -730,7 +770,9 @@ class FeaturePipeline:
             if ordered and weights:
                 w = np.asarray(weights, dtype=float)
                 a = np.asarray(ordered, dtype=float)
-                mtf_adj = float(np.clip(np.dot(w, a) / max(1e-9, np.sum(w)), -0.15, 0.15))
+                
+                mtf_adj = float(np.clip(np.dot(w, a) / max(1e-9, np.sum(w)), -0.08, 0.08))
+
             else:
                 mtf_adj = 0.0
             

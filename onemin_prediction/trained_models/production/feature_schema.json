@@ -4,6 +4,7 @@
     "ema_50",
     "ema_8",
     "last_price",
+    "last_zscore",
     "mean_drift_pct",
     "micro_imbalance",
     "micro_slope",
@@ -57,8 +58,10 @@
     "pat_winrate_thestrat_2u_1_2d_rev",
     "pat_winrate_three_black_crows",
     "pat_winrate_three_white_soldiers",
+    "price_range_tightness",
     "probability_adjustment",
     "spread",
+    "std_dltp_short",
     "ta_bb_bw",
     "ta_bb_lower",
     "ta_bb_mid",
@@ -69,5 +72,5 @@
     "ta_macd_signal",
     "ta_rsi14"
   ],
-  "num_features": 68
+  "num_features": 71
 }

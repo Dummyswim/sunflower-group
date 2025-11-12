@@ -24,20 +24,6 @@ class DummyCNNLSTM:
 
 
 
-class DummyXGB:
-    is_dummy = True
-    name = "DummyXGB"
-    
-    def predict_proba(self, X):
-        """
-        Generate random predictions for testing.
-        Replace with trained model for production.
-        """
-        import numpy as np
-        import random
-        buy_prob = random.uniform(0.3, 0.7)  # Random between 30-70%
-        return np.array([[1.0 - buy_prob, buy_prob]], dtype=float)
-
 class DummyRL:
     threshold = 0.6  # Base confidence threshold
     
@@ -72,7 +58,6 @@ DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "") 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 REQUIRE_TRAINED_MODELS = os.getenv("REQUIRE_TRAINED_MODELS", "0") in ("1", "true", "True")
-logging.info(f"REQUIRE_TRAINED_MODELS={REQUIRE_TRAINED_MODELS} (env)")
 
 
 config = SimpleNamespace(
@@ -106,16 +91,27 @@ config = SimpleNamespace(
     
     # Microstructure windows
     micro_tick_window=400,
-    micro_window_sec_1m=25,
-    micro_min_ticks_1m=30,
-    micro_short_window_sec_1m=8,
-    micro_short_min_ticks_1m=12,
+    micro_window_sec_1m=45,
+    micro_min_ticks_1m=24,
+    micro_short_window_sec_1m=12,
+    micro_short_min_ticks_1m=8,
     micro_last3s_window_sec_1m=3,
     
     # Gate, tolerance, and feature logging
     gate_std_short_epsilon=1e-6,
     gate_tightness_threshold=0.995,
     flat_tolerance_pct=0.0002,  # 0.02%
+    
+    # Flat evaluation tunables (Option B)
+    flat_dyn_k_range=0.20,        # 20% of (high-low) range contributes to tolerance
+    flat_min_points=0.20,         # absolute floor in points
+    flat_tolerance_max_pts=1.0,  # enable cap at 1.0 points by default (tunable)
+
+
+    # Optional probability calibration file for XGB (Platt: p' = sigmoid(a*p + b))
+    calib_path=os.getenv("CALIB_PATH", "").strip(),
+
+    
     feature_log_path="feature_log.csv",
     
     # Pre-close options
@@ -131,7 +127,7 @@ config = SimpleNamespace(
         
     # Dynamic alpha tuning
     target_hold_ratio=0.30,
-    alpha_tune_step=0.02,
+    alpha_tune_step=0.01,  # gentler hold-ratio tuning
     alpha_min=0.52,
     alpha_max=0.72,
     deadband_eps=0.05,
@@ -145,6 +141,17 @@ config = SimpleNamespace(
     trainer_interval_sec=600,  # Train every 10 minutes
     trainer_min_rows=300,      # Minimum rows before training
 
+    # Hysteresis controls and decision logging verbosity
+    hysteresis_enable=True,
+    hysteresis_respect_alpha=True,
+    hysteresis_flip_buffer=0.01,  # unconditional flip buffer over alpha
+    hysteresis_advantage=0.02,    # p_new - p_prev advantage to flip (if not unconditional)
+    decision_log_verbose=True,    # log raw vs final decision at prediction time
+
+    # Hysteresis telemetry
+    hysteresis_telemetry_enable=True,
+    hysteresis_telemetry_interval_sec=3600,  # hourly summary by default
+
         
 )
 
@@ -152,6 +159,7 @@ config = SimpleNamespace(
 
 
 # Minimal train_features for DriftDetector
+
 train_features = {
     'ema_8': np.random.normal(size=500).tolist(),
     'ema_21': np.random.normal(size=500).tolist(),
@@ -159,21 +167,24 @@ train_features = {
     'micro_slope': np.random.normal(size=500).tolist(),
     'micro_imbalance': np.random.normal(size=500).tolist(),
     'mean_drift_pct': np.random.normal(size=500).tolist(),
-    'last_price': np.random.normal(size=500).tolist()
+    'last_price': np.random.normal(size=500).tolist(),
+    'last_zscore': np.random.normal(size=500).tolist()
 }
+
+
 
 def _load_or_dummy_models():
     cnn = None
     xgb_model = None
-    neutral_model = None  # NEW
+    neutral_model = None
     
     cnn_path = os.getenv("CNN_LSTM_PATH", "").strip()
     xgb_path = os.getenv("XGB_PATH", "").strip()
+    neutral_path = os.getenv("NEUTRAL_PATH", "").strip()
     
-    # Load CNN-LSTM only if a path is provided
+    # CNN-LSTM optional
     if cnn_path:
         try:
-            # Suppress TF INFO logs (including oneDNN/CUDA notices)
             os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
             from tensorflow import keras
             cnn = keras.models.load_model(cnn_path)
@@ -183,67 +194,55 @@ def _load_or_dummy_models():
     else:
         logging.info("CNN_LSTM_PATH not set; using dummy CNN-LSTM")
     
-    # Load XGBoost only if a path is provided
-    if xgb_path:
-        try:
-            import xgboost as xgb
-            booster = xgb.Booster()
-            booster.load_model(xgb_path)
-
-
-            class _BoosterWrapper:
-                def __init__(self, booster):
-                    self.booster = booster
-                    self.is_dummy = False
-                    self.name = "XGBBooster"
-                
-                def predict_proba(self, X):
-                    import numpy as np
-                    dm = xgb.DMatrix(X)
-                    p = self.booster.predict(dm)
-                    if p.ndim == 1:
-                        p = np.clip(p, 1e-9, 1 - 1e-9)
-                        return np.stack([1 - p, p], axis=1)
-                    return p
-
-            
-            xgb_model = _BoosterWrapper(booster)
-            logging.info(f"Loaded XGB: {xgb_path}")
-        except Exception as e:
-            logging.warning(f"Failed to load XGB, using dummy: {e}")
-
-    else:
-        logging.info("XGB_PATH not set; using dummy XGB")
+    # XGB required
+    if not xgb_path or not os.path.exists(xgb_path):
+        logging.critical("XGB_PATH is required and must exist. Set XGB_PATH to a valid model file.")
+        raise SystemExit(2)
     
-
+    try:
+        import xgboost as xgb
+        booster = xgb.Booster()
+        booster.load_model(xgb_path)
+        
+        class _BoosterWrapper:
+            def __init__(self, booster):
+                self.booster = booster
+                self.is_dummy = False
+                self.name = "XGBBooster"
+            def predict_proba(self, X):
+                dm = xgb.DMatrix(X)
+                p = self.booster.predict(dm)
+                import numpy as np
+                if p.ndim == 1:
+                    p = np.clip(p, 1e-9, 1 - 1e-9)
+                    return np.stack([1 - p, p], axis=1)
+                return p
+        
+        xgb_model = _BoosterWrapper(booster)
+        logging.info(f"Loaded XGB: {xgb_path}")
+    except Exception as e:
+        logging.critical(f"Failed to load XGB model at {xgb_path}: {e}")
+        raise SystemExit(2)
     
-    # Load Neutrality Model if provided
-    neutral_path = os.getenv("NEUTRAL_PATH", "").strip()
-
-    if neutral_path and joblib is not None:
-        try:
-            neutral_model = joblib.load(neutral_path)
-            logging.info(f"Loaded Neutrality model: {neutral_path}")
-        except Exception as e:
-            logging.warning(f"Failed to load Neutrality model, continuing without: {e}")
-    else:
-        if neutral_path and joblib is None:
-            logging.warning("NEUTRAL_PATH set but joblib not available")
-        else:
-            logging.info("NEUTRAL_PATH not set; running without neutral model")
+    # Neutrality required
+    if not neutral_path or not os.path.exists(neutral_path):
+        logging.critical("NEUTRAL_PATH is required and must exist. Set NEUTRAL_PATH to a valid model file.")
+        raise SystemExit(3)
     
-    # Enforce trained models in production if requested
-    if REQUIRE_TRAINED_MODELS:
-        if xgb_model is None:
-            logging.critical("REQUIRE_TRAINED_MODELS=1 but XGB_PATH is not set or failed to load")
-            raise SystemExit(2)
-        if neutral_model is None:
-            logging.critical("REQUIRE_TRAINED_MODELS=1 but NEUTRAL_PATH is not set or failed to load")
-            raise SystemExit(3)
-            
+    if joblib is None:
+        logging.critical("joblib is required to load NEUTRAL_PATH")
+        raise SystemExit(3)
+    try:
+        neutral_model = joblib.load(neutral_path)
+        logging.info(f"Loaded Neutrality model: {neutral_path}")
+    except Exception as e:
+        logging.critical(f"Failed to load Neutrality model at {neutral_path}: {e}")
+        raise SystemExit(3)
+    
     return (cnn if cnn is not None else DummyCNNLSTM(),
-            xgb_model if xgb_model is not None else DummyXGB(),
+            xgb_model,
             neutral_model)
+
 
 
 
@@ -252,17 +251,6 @@ global cnn_model, xgb_model, neutral_model
 
 cnn_model, xgb_model, neutral_model = _load_or_dummy_models()
 
-
-
-
-logging.info(
-    f"Backends: cnn={getattr(cnn_model, 'name', type(cnn_model).__name__)}, "
-    f"xgb={getattr(xgb_model, 'name', type(xgb_model).__name__)} "
-    f"(is_dummy={getattr(xgb_model, 'is_dummy', 'unknown')}), "
-    f"neutral={'present' if neutral_model is not None else 'absent'}, "
-    f"XGB_PATH={os.getenv('XGB_PATH','') or '(not set)'} "
-    f"NEUTRAL_PATH={os.getenv('NEUTRAL_PATH','') or '(not set)'}"
-)
 
 
 
@@ -288,17 +276,53 @@ if __name__ == "__main__":
     # )
 
     # Import the enhanced logging setup with IST timezone
-    from logging_setup import setup_logging
+    from logging_setup import setup_logging2 as setup_logging
     
-    # Configure logging with IST timezone
+        
+    # Configure logging (console colored, file UTF-8 without ANSI)
+    # Keep high verbosity in early stage via LOG_HIGH_VERBOSITY=1 (default)
+    _high_verbose = os.getenv("LOG_HIGH_VERBOSITY", "1") in ("1", "true", "True")
+    _console_level = logging.DEBUG if _high_verbose else logging.INFO
+    _file_level = logging.DEBUG if _high_verbose else logging.INFO
+
     setup_logging(
         logfile="logs/unified_trading.log",
-        console_level=logging.DEBUG,  # Increased verbosity for debugging
-        file_level=logging.DEBUG,
-        enable_colors=True,
-        max_bytes=10485760,  # 10MB
-        backup_count=5
+        console_level=_console_level,
+        file_level=_file_level,
+        enable_colors_console=True,
+        enable_colors_file=False,         # avoid ANSI in file
+        max_bytes=10485760,               # 10MB
+        backup_count=5,
+        heartbeat_cooldown_sec=0.0        # you can set 30 to dedupe heartbeats in file
     )
+
+    
+    logging.info(f"REQUIRE_TRAINED_MODELS={REQUIRE_TRAINED_MODELS} (env)")
+    logging.info(f"XGB_PATH={os.getenv('XGB_PATH','') or '(not set)'} | NEUTRAL_PATH={os.getenv('NEUTRAL_PATH','') or '(not set)'}")
+    
+    logging.info(f"CALIB_PATH={os.getenv('CALIB_PATH','') or '(not set)'} (env -- model_pipeline will auto-load if present)")
+
+
+    # Visibility: log selected decision/hysteresis toggles
+    try:
+
+        logging.info(
+            "Hysteresis/telemetry: enable=%s respect_alpha=%s flip_buffer=%.3f advantage=%.3f "
+            "| decision_log_verbose=%s | telem_enable=%s telem_interval=%ss",
+            getattr(config, "hysteresis_enable", True),
+            getattr(config, "hysteresis_respect_alpha", True),
+            float(getattr(config, "hysteresis_flip_buffer", 0.01) or 0.01),
+            float(getattr(config, "hysteresis_advantage", 0.02) or 0.02),
+            getattr(config, "decision_log_verbose", True),
+            getattr(config, "hysteresis_telemetry_enable", True),
+            int(getattr(config, "hysteresis_telemetry_interval_sec", 3600) or 3600),
+        )
+
+
+    except Exception:
+        pass
+
+
     
     # Reduce third-party chatter
     logging.getLogger("websockets").setLevel(logging.INFO)

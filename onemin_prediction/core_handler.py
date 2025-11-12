@@ -293,6 +293,9 @@ class UnifiedWebSocketHandler:
 
 
     # ========== INTEGRATED MICROSTRUCTURE ANALYSIS ==========
+
+
+
     def _update_microstructure(self, tick: Dict, order_book: Dict, timestamp: datetime):
         """
         Update microstructure buffers (replaces MicrostructureExtractor.update).
@@ -315,8 +318,36 @@ class UnifiedWebSocketHandler:
                     lifespan = (timestamp - self._last_quote_times[quote_id]).total_seconds()
                     self._quote_lifespans.append(lifespan)
                     del self._last_quote_times[quote_id]
+                    
+                                
+            # Prune stale quote timestamps by age (> 5 minutes) and by size (> 10000)
+            try:
+                now_ts = timestamp
+                
+                # Age-based prune
+                cutoff_age = timedelta(minutes=5)
+                stale_keys = [k for k, ts0 in self._last_quote_times.items() 
+                            if (now_ts - ts0) > cutoff_age]
+                for k in stale_keys:
+                    self._last_quote_times.pop(k, None)
+                
+                # Size-based prune
+                max_qt = 10000
+                if len(self._last_quote_times) > max_qt:
+                    # Drop oldest keys by age
+                    by_age = sorted(self._last_quote_times.items(), key=lambda kv: kv[1])
+                    for k, _ in by_age[:len(self._last_quote_times) - max_qt]:
+                        self._last_quote_times.pop(k, None)
+            except Exception:
+                pass
+    
+                    
         except Exception as e:
             logger.debug(f"[MICRO] Update error: {e}")
+
+
+
+
 
     def get_micro_features(self) -> Dict[str, float]:
         """
@@ -396,10 +427,15 @@ class UnifiedWebSocketHandler:
                 except Exception:
                     p_up, p_down = 0.0, 0.0
 
+
+
             entropy = 0.0
             for p in (p_up, p_down):
                 if isinstance(p, (int, float)) and p > 0.0:
-                    entropy -= p * np.log2(p)
+                    p_safe = max(1e-12, float(p))
+                    entropy_part = -p_safe * np.log2(p_safe)
+                    if np.isfinite(entropy_part) and entropy_part >= 0.0:
+                        entropy += entropy_part
             if not np.isfinite(entropy) or entropy < 0.0:
                 entropy = 0.0
             out['market_entropy'] = float(entropy)
