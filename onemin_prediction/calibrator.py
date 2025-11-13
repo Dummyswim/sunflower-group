@@ -15,9 +15,6 @@ def _atomic_write_json(path: str, obj: dict) -> None:
         json.dump(obj, f, indent=2)
     os.replace(tmp, p)
 
-def _logit_clip(p: np.ndarray) -> np.ndarray:
-    p = np.clip(p, 1e-9, 1 - 1e-9)
-    return np.log(p / (1.0 - p))
 
 async def background_calibrator_loop(
     feature_log_path: str,
@@ -28,11 +25,32 @@ async def background_calibrator_loop(
 ):
     """
     Periodically fit Platt calibration on recent logs and write a,b to calib_out_path.
-    Prefers p_xgb_raw from feature logs; falls back to buy_prob if missing.
+    STRICT: trains only on meta_p_xgb_raw; skips cycle if missing.
+    Validates monotonicity and Brier score improvement before writing.
     Auto hot-reloads into pipeline via pipeline_ref.reload_calibration().
     """
     logger.info(f"[CALIB] Calibrator started (every {interval_sec}s) → {calib_out_path}")
     last_mtime = None
+    
+    def _sigmoid(z: np.ndarray) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-z))
+    
+    def _logit_clip_arr(p: np.ndarray) -> np.ndarray:
+        p = np.clip(p, 1e-9, 1 - 1e-9)
+        return np.log(p / (1.0 - p))
+    
+    def _brier(y_true: np.ndarray, p_hat: np.ndarray) -> float:
+        p_hat = np.clip(p_hat, 1e-9, 1 - 1e-9)
+        return float(np.mean((p_hat - y_true) ** 2))
+    
+    def _monotonic_grid_ok(a: float, b: float) -> bool:
+        # a must be positive and grid mapping must be strictly increasing
+        if not np.isfinite(a) or not np.isfinite(b) or a <= 0.0:
+            return False
+        grid = np.linspace(0.05, 0.95, 19)
+        lg = _logit_clip_arr(grid)
+        q = _sigmoid(a * lg + b)
+        return bool(np.all(np.diff(q) > 0.0))
     
     while True:
         try:
@@ -49,7 +67,6 @@ async def background_calibrator_loop(
             last_mtime = mtime
             
             try:
-                # Reuse trainer's robust parser
                 from online_trainer import _parse_feature_csv
                 df = _parse_feature_csv(feature_log_path, min_rows=min_dir_rows)
             except Exception as e:
@@ -60,26 +77,23 @@ async def background_calibrator_loop(
                 logger.info(f"[CALIB] Not enough rows yet for calibration (min_dir_rows={min_dir_rows})")
                 continue
             
-            # Filter to directional, tradeable rows
+            # directional, tradeable only
             m = (df["label"].isin(["BUY", "SELL"])) & (df["tradeable"] == True)
             dfd = df[m].copy()
             if dfd.empty or len(dfd) < min_dir_rows:
                 logger.info(f"[CALIB] directional/tradeable rows insufficient: {len(dfd)}/{min_dir_rows}")
                 continue
             
-
-            # Prefer raw XGB p from logs (if provided by pipeline); else fallback to buy_prob
-            p_col = "meta_p_xgb_raw" if "meta_p_xgb_raw" in dfd.columns else "buy_prob"
-
-
+            # STRICT: use only meta_p_xgb_raw; do not fallback to buy_prob
+            if "meta_p_xgb_raw" not in dfd.columns:
+                logger.info("[CALIB] meta_p_xgb_raw not found in logs; skipping this cycle to avoid corrupt calibration")
+                continue
             
-            p = np.asarray(dfd[p_col].values, dtype=float)
+            p = np.asarray(dfd["meta_p_xgb_raw"].values, dtype=float)
             y = np.asarray((dfd["label"] == "BUY").astype(int).values, dtype=int)
+            x = _logit_clip_arr(p).reshape(-1, 1)
             
-            # Guarded logit
-            x = _logit_clip(p).reshape(-1, 1)
-            
-            # Fit logistic regression on logit(p) → y
+            # Fit logistic on logit(p) -> y
             a = b = None
             try:
                 from sklearn.linear_model import LogisticRegression
@@ -92,17 +106,30 @@ async def background_calibrator_loop(
                 continue
             
             if not np.isfinite(a) or not np.isfinite(b):
-                logger.warning("[CALIB] invalid coefficients; skipping write")
+                logger.info("[CALIB] invalid coefficients; skipping write")
                 continue
             
-            meta = {
-                "a": a,
-                "b": b,
-                "n": int(len(dfd)),
-                "source": p_col,
-            }
+            # Holdout validation: last 200 rows (or 20% if smaller)
+            n = len(dfd)
+            n_val = max(50, min(200, n // 5))
+            y_val = y[-n_val:]
+            p_raw_val = np.clip(p[-n_val:], 1e-9, 1 - 1e-9)
+            z_val = a * _logit_clip_arr(p_raw_val) + b
+            p_cal_val = _sigmoid(z_val)
+            brier_raw = _brier(y_val, p_raw_val)
+            brier_cal = _brier(y_val, p_cal_val)
+            
+            # Sanity checks: monotonicity and no major degradation
+            if not _monotonic_grid_ok(a, b):
+                logger.info(f"[CALIB] rejected (non-monotonic or non-positive slope): a={a:.6f}, b={b:.6f}")
+                continue
+            if brier_cal > (brier_raw + 0.002):
+                logger.info(f"[CALIB] rejected (Brier worsened): raw={brier_raw:.5f} calib={brier_cal:.5f}")
+                continue
+            
+            meta = {"a": a, "b": b, "n": int(n), "source": "meta_p_xgb_raw"}
             _atomic_write_json(calib_out_path, meta)
-            logger.info(f"[CALIB] wrote: a={a:.6f} b={b:.6f} (n={len(dfd)}, src={p_col}) → {calib_out_path}")
+            logger.info(f"[CALIB] wrote: a={a:.6f} b={b:.6f} (n={n}, src=meta_p_xgb_raw) → {calib_out_path}")
             
             # Live hot-reload into pipeline
             try:
@@ -116,3 +143,5 @@ async def background_calibrator_loop(
             break
         except Exception as e:
             logger.error(f"[CALIB] loop error: {e}", exc_info=True)
+
+

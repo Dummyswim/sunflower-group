@@ -13,19 +13,6 @@ import os
 logger = logging.getLogger(__name__)
 
 
-def _sign(x: float) -> int:
-    """Helper for sign extraction with safe type handling."""
-    try:
-        x = float(x)
-        if x > 0:
-            return 1
-        elif x < 0:
-            return -1
-        return 0
-    except (TypeError, ValueError):
-        return 0
-
-
 class AdaptiveModelPipeline:
     """
     Unified hybrid model with integrated adaptive weight tuning.
@@ -78,12 +65,14 @@ class AdaptiveModelPipeline:
         
         # Initialize weights with defaults if not provided
         if base_weights is None:
+
             base_weights = {
                 'ema_trend': 0.35,
-                'micro_slope': 0.35,
-                'imbalance': 0.15,
-                'mean_drift': 0.15
+                'micro_slope': 0.25,  # reduced default
+                'imbalance': 0.20,
+                'mean_drift': 0.20
             }
+
         
         # Integrated weight tuning parameters
         self.weights = dict(base_weights)
@@ -121,44 +110,69 @@ class AdaptiveModelPipeline:
         self.last_p_xgb_calib = None  # NEW: last calibrated p (pre-blend)
 
                 
+
         try:
             calib_path = os.getenv("CALIB_PATH", "").strip()
             if calib_path and os.path.exists(calib_path):
-                with open(calib_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self._calib_a = float(data.get("a", None)) if "a" in data else None
-                self._calib_b = float(data.get("b", None)) if "b" in data else None
-                logger.info(f"[CALIB] Loaded Platt calibration from {calib_path}: a={self._calib_a} b={self._calib_b}")
+                self.reload_calibration(calib_path)
             else:
                 logger.info("[CALIB] No calibration file; raw XGB probabilities will be used")
         except Exception as e:
             logger.warning(f"[CALIB] Failed to load calibration: {e}")
 
-        
         logger.info(f"Learning rate: {self.lr}, EMA anchor: {self.ema_anchor}")
 
 
 
 
+
     def _apply_calibration(self, p: float) -> float:
-        """Apply optional Platt calibration in logit space: q = sigmoid(a*logit(p) + b)."""
+        """
+        Apply optional Platt calibration in logit space: q = sigmoid(a*logit(p)+b).
+        Guardrails:
+        - Reject invalid/negative slope
+        - Reject large side-flipping inversions across 0.5
+        - Clamp excessive same-side deltas, strongest near 0.5
+        """
         try:
             if self._calib_a is None or self._calib_b is None:
                 return float(p)
+            a = float(self._calib_a)
+            b = float(self._calib_b)
+            if not np.isfinite(a) or not np.isfinite(b) or a <= 0.0:
+                logger.info(f"[CALIB-GUARD] invalid coefficients a={a} b={b} → using raw")
+                return float(p)
+
             p = float(np.clip(p, 1e-9, 1.0 - 1e-9))
             logit = float(np.log(p / (1.0 - p)))
-            z = (self._calib_a * logit) + self._calib_b
+            z = (a * logit) + b
             q = 1.0 / (1.0 + np.exp(-z))
             q = float(np.clip(q, 1e-6, 1.0 - 1e-6))
+
+            # Guard 1: large inversion across 0.5
+            if (p - 0.5) * (q - 0.5) < 0 and abs(q - p) > 0.20:
+                logger.info(f"[CALIB-GUARD] large inversion Δ={q - p:+.3f} (p={p:.3f} → q={q:.3f}) → using raw")
+                return float(p)
+
+            # Guard 2: clamp excessive same-side delta (stop 0.405→0.074 type collapses)
+            # 0.12 max delta at center, increasing slightly towards edges
+            max_delta = 0.12 + 0.25 * abs(p - 0.5)  # in [0.12, 0.245]
+            delta = q - p
+            if abs(delta) > max_delta:
+                q_clamped = float(p + np.clip(delta, -max_delta, max_delta))
+                logger.info(f"[CALIB-GUARD] clamp Δ={delta:+.3f}→{(q_clamped - p):+.3f} (p={p:.3f} → q={q:.3f})")
+                return q_clamped
+
             return q
         except Exception:
             return float(p)
 
 
+
     def reload_calibration(self, path: Optional[str] = None) -> bool:
         """
         Reload Platt calibration coefficients from JSON file and apply live.
-        Returns True if loaded, False otherwise.
+        Rejects non-positive slope or non-monotonic mappings.
         """
         try:
             if not path:
@@ -166,20 +180,43 @@ class AdaptiveModelPipeline:
             if not path or not os.path.exists(path):
                 logger.info(f"[CALIB] reload skipped; file missing: {path or '(empty)'}")
                 return False
-            
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            
             a = float(data.get("a"))
             b = float(data.get("b"))
             n = int(data.get("n", 0))
             
+            # simple monotonic grid test
+            def _mono_ok(a_: float, b_: float) -> bool:
+                if not np.isfinite(a_) or not np.isfinite(b_) or a_ <= 0.0:
+                    return False
+                grid = np.linspace(0.05, 0.95, 19)
+                lg = np.log(np.clip(grid, 1e-9, 1-1e-9) / (1-np.clip(grid, 1e-9, 1-1e-9)))
+                q = 1.0 / (1.0 + np.exp(-(a_ * lg + b_)))
+                return bool(np.all(np.diff(q) > 0.0))
+            
+            if not _mono_ok(a, b):
+                logger.info(f"[CALIB] reload rejected: non-monotonic or invalid a={a:.6f} b={b:.6f} (n={n})")
+                return False
             self._calib_a, self._calib_b = a, b
             logger.info(f"[CALIB] reloaded: a={a:.6f} b={b:.6f} (n={n})")
             return True
         except Exception as e:
             logger.warning(f"[CALIB] reload failed: {e}")
             return False
+
+
+
+    def disable_neutrality(self, reason: str = "") -> None:
+        """Disable neutrality gating for this session with a visible reason."""
+        try:
+            self.neutral_model = None
+            if reason:
+                logger.info(f"[NEUTRAL] gating disabled: {reason}")
+            else:
+                logger.info("[NEUTRAL] gating disabled")
+        except Exception:
+            pass
 
 
 
@@ -354,8 +391,13 @@ class AdaptiveModelPipeline:
                         raw = float(self.neutral_model.predict(xgb_input).ravel()[0])
                         neutral_prob = 1.0 / (1.0 + np.exp(-raw))
             except Exception as e:
-                logger.debug(f"Neutrality model inference failed: {e}")
+                # Detect common schema mismatches and disable permanently to cut noise
+                if "expecting" in str(e).lower() or "features" in str(e).lower():
+                    self.disable_neutrality(f"schema mismatch detected ({e})")
+                else:
+                    logger.debug(f"Neutrality model inference failed: {e}")
                 neutral_prob = None
+
 
 
 
@@ -394,14 +436,34 @@ class AdaptiveModelPipeline:
             p_after_pattern = float(signal_probs[0][1])
             try:
                 if pattern_prob_adjustment is not None:
-                    adj = float(np.clip(pattern_prob_adjustment, -0.08, 0.08))
+                    adj_in = float(pattern_prob_adjustment)
+                    adj = float(np.clip(adj_in, -0.08, 0.08))
                     p_cur = float(signal_probs[0][1])
+
+                    # Context: consensus strength and indicator magnitude
+                    strong_cons = (mtf_consensus is not None) and (abs(float(mtf_consensus)) >= 0.66)
+                    ind_abs = abs(float(indicator_score)) if indicator_score is not None else 0.0
+
+                    # Weak-context cap (indicator weak and no strong consensus)
+                    cap = 0.02 if (ind_abs < 0.25 and not strong_cons) else 0.08
+                    if abs(adj) > cap:
+                        logger.info(f"[PATTERN] weak-indicator cap applied: {adj:+.3f} → {np.sign(adj)*cap:+.3f} "
+                                    f"(ind={ind_abs:.3f}, strong_cons={strong_cons})")
+                        adj = float(np.sign(adj) * cap)
+
+                    # Flip-prevent near 0.5 in weak context
+                    would_flip = ((p_cur - 0.5) * ((p_cur + adj) - 0.5)) < 0
+                    if would_flip and (ind_abs < 0.30) and (not strong_cons):
+                        room = max(1e-3, abs(p_cur - 0.5) - 1e-3)
+                        adj = float(np.sign(adj) * min(abs(adj), room))
+                        logger.info(f"[PATTERN] flip-prevent near 0.5 (weak ctx): adj→{adj:+.3f} (p_cur={p_cur:.3f})")
+
                     p_after_pattern = float(np.clip(p_cur + adj, 0.0, 1.0))
                     signal_probs = np.array([[1.0 - p_after_pattern, p_after_pattern]], dtype=float)
-                    logger.info(f"[PATTERN] adj_in={float(pattern_prob_adjustment):+.3f} → adj={adj:+.3f} "
-                            f"| p: {p_cur:.3f} → {p_after_pattern:.3f}")
+                    logger.info(f"[PATTERN] adj_in={adj_in:+.3f} → adj={adj:+.3f} | p: {p_cur:.3f} → {p_after_pattern:.3f}")
             except Exception as e:
                 logger.warning(f"Pattern adjustment failed: {e}")
+
 
 
 
@@ -562,12 +624,19 @@ class AdaptiveModelPipeline:
             
             # Heuristic factors (kept minimal and bounded)
             # If market is active (looser range and some realized vol), boost micro; else suppress
+            
+
+                        
             if (vol_short > 0.0) and (tight < 0.98):
                 micro_factor = 1.25
             elif (vol_short <= 0.0) or (tight >= 0.995):
-                micro_factor = 0.85
+                micro_factor = 0.60  # tighter suppression in tight regimes
             else:
                 micro_factor = 1.0
+
+
+            
+            
             
             for key, base_weight in self.weights.items():
                 val = float(features.get(key, 0.0))
@@ -727,9 +796,9 @@ def create_default_pipeline(cnn_lstm, xgb, rl_agent, neutral_model=None, **kwarg
     defaults = {
         'base_weights': {
             'ema_trend': 0.35,
-            'micro_slope': 0.35,
-            'imbalance': 0.15,
-            'mean_drift': 0.15
+            'micro_slope': 0.25,  # reduced default
+            'imbalance': 0.20,
+            'mean_drift': 0.20
         },
         'base_alpha_buy': 0.6,
         'lr': 0.05,

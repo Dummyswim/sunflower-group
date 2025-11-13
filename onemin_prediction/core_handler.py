@@ -7,7 +7,6 @@ import struct
 import json
 import logging
 from typing import Dict, Optional, Any, List, Tuple
-import websockets
 import pandas as pd
 import numpy as np
 import base64

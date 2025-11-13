@@ -27,22 +27,30 @@ class DummyCNNLSTM:
 class DummyRL:
     threshold = 0.6  # Base confidence threshold
     
+
     def adjust_confidence(self, pf):
         """
-        Adjust confidence based on recent profit factor.
-        pf > 1.0: increase confidence (lower threshold)
-        pf < 1.0: decrease confidence (higher threshold)
+        Adjust confidence based on recent profit factor (PF).
+        - PF > 1.2: lower threshold (more aggressive)
+        - 1.0 ≤ PF < 1.2: mildly raise threshold (+0.02)
+        - 0.9 ≤ PF < 1.0: raise threshold (+0.05)
+        - PF < 0.8: raise threshold (+0.10)
         """
         try:
             pf = float(pf)
             if pf > 1.2:
-                return max(0.55, self.threshold - 0.05)  # More aggressive
+                return max(0.55, self.threshold - 0.05)
+            elif 1.0 <= pf < 1.2:
+                return min(0.68, self.threshold + 0.02)
+            elif 0.9 <= pf < 1.0:
+                return min(0.70, self.threshold + 0.05)
             elif pf < 0.8:
-                return min(0.70, self.threshold + 0.10)  # More conservative
+                return min(0.72, self.threshold + 0.10)
             else:
-                return self.threshold  # Neutral
+                return self.threshold
         except Exception:
             return self.threshold
+
 
 
 
@@ -299,10 +307,6 @@ if __name__ == "__main__":
                 os.getenv("NEUTRAL_PATH","") or "(not set)")
     logging.info("CALIB_PATH=%s (env -- model_pipeline will auto-load if present)", 
                 os.getenv("CALIB_PATH","") or "(not set)")
-
-    # Reduce third‑party chatter (you can raise these later if needed)
-    logging.getLogger("websockets").setLevel(logging.INFO)
-    logging.getLogger("asyncio").setLevel(logging.INFO)
 
 
     # Visibility: log selected decision/hysteresis toggles

@@ -479,10 +479,6 @@ async def _connection_processing_loop(
 
 
 
-    # Track previous side probability for advantage-based hysteresis
-    prev_side_prob = 0.50
-
-
     # Hysteresis flip telemetry
     flips_allowed = 0
     flips_suppressed = 0
@@ -729,6 +725,9 @@ async def _connection_processing_loop(
             ofd = FeaturePipeline.order_flow_dynamics(order_books)
 
             # Microstructure features
+            # Ensure a safe default for micro_slope_normed in case micro feature extraction fails
+            micro_slope_normed = 0.0
+
             try:
                 micro_ctx = ws_handler.get_micro_features()
 
@@ -891,6 +890,35 @@ async def _connection_processing_loop(
 
 
 
+                # Enforce conservative pattern/MTF adj in disagreement with indicator (post-indicator computation)
+                try:
+                    combo_before = float(pattern_prob_adj)
+                    ind = float(indicator_score) if indicator_score is not None else 0.0
+                    disagree = (np.sign(combo_before) != 0) and (np.sign(ind) != 0) and (np.sign(combo_before) != np.sign(ind))
+                    
+                    # Count TF agreements with combo sign
+                    tf_votes = 0
+                    try:
+                        if isinstance(mtf, dict):
+                            sign_combo = np.sign(combo_before)
+                            votes = [mtf.get("mtf_tf_1T", 0.0), mtf.get("mtf_tf_3T", 0.0), mtf.get("mtf_tf_5T", 0.0)]
+                            tf_votes = int(sum(1 for v in votes if np.sign(float(v)) == sign_combo and abs(float(v)) > 0.0))
+                    except Exception:
+                        tf_votes = 0
+                    
+                    pat_confirmed = bool((pattern_features or {}).get("pat_confirmed_by_rvol", 0.0) >= 0.5)
+                    
+                    if disagree and (not pat_confirmed) and (tf_votes < 2):
+                        capped = float(np.clip(combo_before, -0.02, 0.02))
+                        if abs(capped - combo_before) > 1e-9:
+                            pattern_prob_adj = capped
+                            logger.info(f"[{name}] [PATTERN] disagreement with indicator (ind={ind:+.3f}, tf_votes={tf_votes}, confirmed={pat_confirmed}) "
+                                    f"→ capped adj to {pattern_prob_adj:+.3f} (was {combo_before:+.3f})")
+                except Exception as e:
+                    logger.debug(f"[{name}] [PATTERN] disagreement cap skipped: {e}")
+
+
+
             # ========== FEATURE NORMALIZATION ==========
             try:
                 px = np.array(prices[-64:], dtype=float)
@@ -985,7 +1013,7 @@ async def _connection_processing_loop(
                     logger.warning(f"[{name}] [SCHEMA] Missing feature schema; creating from live features (n={live_n})")
                     # Build and persist schema from current live keys
                     try:
-                        import os, json
+                        # use top-level imports json, os
                         xgb_path = os.getenv("XGB_PATH", "models/xgb_model.json")
                         base_dir = os.path.dirname(xgb_path) or "."
                         schema_path = os.path.join(base_dir, "feature_schema.json")
@@ -1013,13 +1041,13 @@ async def _connection_processing_loop(
                     missing = sorted(list(schema_names - live_names))[:10]
                     extra = sorted(list(live_names - schema_names))[:10]
 
-                    # Recreate schema from live keys when the only "missing" are downstream outputs
-                    allowed_missing = {"p_xgb_raw", "p_xgb_calib"}
+                    # removed unused allowed_missing set
                     try:
-                        import os, json
+                        # use top-level imports json, os
                         xgb_path = os.getenv("XGB_PATH", "models/xgb_model.json")
                         base_dir = os.path.dirname(xgb_path) or "."
                         schema_path = os.path.join(base_dir, "feature_schema.json")
+
 
                         # Always rebuild from current live keys to eliminate downstream keys
                         payload = {
@@ -1092,6 +1120,30 @@ async def _connection_processing_loop(
 
 
 
+
+            # ========== MICRO TIGHT-GATE PREP (range% over recent window) ==========
+            try:
+                # Approx recent 1m range% using last ~60 samples (or available)
+                px_recent = np.asarray(prices[-64:], dtype=float)
+                last_px = float(px_recent[-1]) if px_recent.size else 0.0
+                rng_recent = float(px_recent.max() - px_recent.min()) if px_recent.size else 0.0
+                rng_pct_recent = (rng_recent / max(1e-6, last_px)) if last_px > 0.0 else 1.0
+            except Exception:
+                rng_pct_recent = 1.0
+
+            # Flag ultra-tight micro regime: very tightness and tiny recent range%
+            micro_choppy_hold = False
+            try:
+                tight_thr_ultra = 0.998
+                flat_tol_pct = float(getattr(config, 'flat_tolerance_pct', 0.0002))  # 0.02%
+                tiny_rng_pct = 1.5 * flat_tol_pct  # allow small slack
+                if float(micro_ctx.get('price_range_tightness', 0.0)) >= tight_thr_ultra and rng_pct_recent <= tiny_rng_pct:
+                    micro_choppy_hold = True
+            except Exception:
+                micro_choppy_hold = False
+
+
+                        
             # ========== DYNAMIC REGIME-BASED ALPHA NUDGE ==========
             try:
                 consensus_threshold = float(getattr(config, "consensus_threshold", 0.66))
@@ -1099,13 +1151,17 @@ async def _connection_processing_loop(
                 
                 strong_cons = abs(float(mtf_consensus)) >= consensus_threshold
                 pat_rvol = float(pattern_features.get('pat_rvol', 0.0)) if pattern_features else 0.0
+                pat_confirmed = bool((pattern_features or {}).get('pat_confirmed_by_rvol', 0.0) >= 0.5)
                 
-                # Strong trend/high RVOL → reduce alpha slightly (more aggressive)
-                if strong_cons:
+                # Ultra-tight micro regime: raise alpha or HOLD unless strong consensus + RVOL
+                if micro_choppy_hold and not (strong_cons and pat_confirmed and pat_rvol >= rvol_threshold):
+                    alpha_buy = min(alpha_max, float(alpha_buy) + 0.02)
+                    logger.info(f"[{name}] Alpha micro-tight nudge (+0.02) (tight micro, rng% tiny) → {alpha_buy:.3f}")
+                # Strong trend/high RVOL → reduce alpha slightly
+                elif strong_cons:
                     alpha_buy = max(alpha_min, float(alpha_buy) - (0.04 if pat_rvol >= rvol_threshold else 0.03))
                     logger.info(f"[{name}] Alpha trend-nudge (strong_cons={strong_cons}, rvol={pat_rvol:.2f}) → {alpha_buy:.3f}")
-                
-                # Choppy/low-consensus → raise alpha slightly (more conservative)
+                # Weak consensus → mild increase
                 elif abs(float(mtf_consensus)) < 0.33:
                     alpha_buy = min(alpha_max, float(alpha_buy) + 0.01)
                     logger.info(f"[{name}] Alpha choppy-nudge (weak_consensus) → {alpha_buy:.3f}")
@@ -1183,6 +1239,7 @@ async def _connection_processing_loop(
 
 
 
+
             # ========== HYSTERESIS: respect alpha crossings + advantage-based flip ==========
             hysteresis_suppressed = False
             hysteresis_reason = ""
@@ -1198,7 +1255,7 @@ async def _connection_processing_loop(
                     p_prev = p_buy if np.isfinite(p_buy) else 0.50
                 elif prev_directional_decision == "SELL":
                     p_prev = p_sell if np.isfinite(p_sell) else 0.50
-
+                
                 # Proposed new side's probability
                 if decision == "BUY":
                     p_new = p_buy
@@ -1206,59 +1263,68 @@ async def _connection_processing_loop(
                     p_new = p_sell
                 else:
                     p_new = 0.50
-
+                
                 if (
                     hyst_enable
                     and decision in ("BUY", "SELL")
                     and prev_directional_decision in ("BUY", "SELL")
                     and decision != prev_directional_decision
                 ):
-                    # compute advantage once for telemetry
                     advantage = float(p_new - p_prev)
-
-                    # 1) Respect alpha crossings with small safety buffer
-
+                    
+                    # Alpha crossing with buffer wins outright
                     if hyst_respect_alpha and (p_new >= (float(alpha_buy) + hyst_flip_buffer_eff)):
-    
                         hysteresis_suppressed = False
                         hysteresis_reason = f"flip allowed (crossed alpha+{hyst_flip_buffer_eff:.3f})"
                         flip_marker = "allowed_alpha"
                     else:
-                        # 2) Require the new side to beat the previous side by a small advantage
-
-                        if advantage < hyst_advantage_eff:
-
-                            hysteresis_suppressed = True
-                            hysteresis_reason = (
-                                f"suppress flip {prev_directional_decision}->{decision} "
-                                f"(p_new={p_new:.3f}, p_prev={p_prev:.3f}, Δ={advantage:+.3f} < adv={hyst_advantage_eff:.3f})"
-                            )
-                            flip_marker = "suppressed"
-                            decision = prev_directional_decision
-                        else:
+                        # Override-trumps condition near threshold
+                        try:
+                            strong_cons = abs(float(mtf_consensus)) >= float(getattr(config, "consensus_threshold", 0.66))
+                            aligned = False
+                            if indicator_score is not None:
+                                if decision == "BUY":
+                                    aligned = float(indicator_score) >= 0.0
+                                elif decision == "SELL":
+                                    aligned = float(indicator_score) <= 0.0
+                            near_alpha = abs(float(buy_prob) - float(alpha_buy)) <= 0.02
+                            override_trumps = (override is not None) and strong_cons and aligned and near_alpha
+                        except Exception:
+                            override_trumps = False
+                        
+                        if override_trumps:
+                            hysteresis_suppressed = False
+                            hysteresis_reason = "flip allowed (override+strong_consensus near alpha)"
                             flip_marker = "allowed_adv"
-
-                # Update prev state using final (possibly suppressed) decision
+                        else:
+                            if advantage < hyst_advantage_eff:
+                                hysteresis_suppressed = True
+                                hysteresis_reason = (
+                                    f"suppress flip {prev_directional_decision}->{decision} "
+                                    f"(p_new={p_new:.3f}, p_prev={p_prev:.3f}, Δ={advantage:+.3f} < adv={hyst_advantage_eff:.3f})"
+                                )
+                                flip_marker = "suppressed"
+                                decision = prev_directional_decision
+                            else:
+                                flip_marker = "allowed_adv"
+                
+                # Update prev state using final decision
                 if decision in ("BUY", "SELL"):
                     prev_directional_decision = decision
-                    prev_margin = abs(p_buy - 0.5)  # legacy metric (kept for diagnostics)
-                    prev_side_prob = p_buy if decision == "BUY" else p_sell
-
-                # Telemetry counters
+                    prev_margin = abs(p_buy - 0.5)
+                    # prev_side_prob = p_buy if decision == "BUY" else p_sell
+                
+                # Telemetry counters and logging
                 try:
                     if flip_marker == "suppressed":
                         flips_suppressed += 1
-                        delta_sum += advantage
+                        delta_sum += (p_new - p_prev)
                         delta_count += 1
                     elif flip_marker in ("allowed_alpha", "allowed_adv"):
                         flips_allowed += 1
-                        delta_sum += advantage
+                        delta_sum += (p_new - p_prev)
                         delta_count += 1
-                except Exception:
-                    pass
-
-                # Emit hourly summary
-                try:
+                    
                     if telemetry_enable:
                         elapsed = (timestamp - last_telem_ts).total_seconds()
                         if elapsed >= max(60, telemetry_interval):  # guard: min 60s
@@ -1273,7 +1339,7 @@ async def _connection_processing_loop(
                             last_telem_ts = timestamp
                 except Exception:
                     pass
-
+                
                 if hysteresis_suppressed and decision_log_verbose:
                     logger.info(f"[{name}] Hysteresis: {hysteresis_reason}")
                 elif decision_log_verbose and hysteresis_reason:
@@ -1281,7 +1347,7 @@ async def _connection_processing_loop(
             except Exception as e:
                 logger.debug(f"[{name}] Hysteresis block skipped: {e}")
 
-
+            
 
             # ========== HARD GATES: AND-based neutrality + low-vol/tight with MTF+RVOL override ==========
 
@@ -1309,8 +1375,11 @@ async def _connection_processing_loop(
                 # Separate insufficient ticks gate (kept as no-trade failsafe)
                 insufficient_ticks = (n_short < int(getattr(config, 'micro_short_min_ticks_1m', 12)))
                 
-                # Final HOLD gate: insufficient ticks OR (high_neutral AND low_vol_tight) unless overridden
-                gate_hold = insufficient_ticks or ((high_neutral and low_vol_tight) and (not override_hold))
+
+                # Final HOLD gate: insufficient ticks OR micro-tight OR (high_neutral AND low_vol_tight) unless overridden
+                gate_hold = (insufficient_ticks or micro_choppy_hold) or ((high_neutral and low_vol_tight) and (not override_hold))
+                        
+                
             except Exception as e:
                 gate_hold = gate_no_trade  # fallback to earlier gate if any exception
                 logger.debug(f"[{name}] Gate compute fallback: {e}")
@@ -1321,14 +1390,13 @@ async def _connection_processing_loop(
             if gate_hold:
                 decision = "HOLD"
                 override = None
+
                 logger.info(
-                    f"[{name}] [GATE] HOLD enforced: insufficient_ticks={insufficient_ticks} "
+                    f"[{name}] [GATE] HOLD enforced: insufficient_ticks={insufficient_ticks} micro_tight={micro_choppy_hold} "
                     f"high_neutral={high_neutral} low_vol_tight={low_vol_tight} override_hold={override_hold} "
                     f"(p_neutral={neutral_prob if neutral_prob is not None else 'na'}, mtf={mtf_consensus:+.2f}, pat_conf={pat_confirmed})"
                 )
 
-            
-            
     
             # Cache last_minute_prediction with final decision (after gates/override)
   
