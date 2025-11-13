@@ -270,37 +270,39 @@ async def main():
 
 if __name__ == "__main__":
 
-    # logging.basicConfig(
-    #     level=logging.INFO,
-    #     format="%(asctime)s | %(levelname)s | %(name)s | [%(funcName)s:%(lineno)d] | %(message)s"
-    # )
 
     # Import the enhanced logging setup with IST timezone
     from logging_setup import setup_logging2 as setup_logging
-    
-        
-    # Configure logging (console colored, file UTF-8 without ANSI)
-    # Keep high verbosity in early stage via LOG_HIGH_VERBOSITY=1 (default)
-    _high_verbose = os.getenv("LOG_HIGH_VERBOSITY", "1") in ("1", "true", "True")
+
+    # High verbosity during stabilization (LOG_HIGH_VERBOSITY=1 is default)
+    _high_verbose = os.getenv("LOG_HIGH_VERBOSITY", "1").lower() in ("1", "true", "yes")
     _console_level = logging.DEBUG if _high_verbose else logging.INFO
     _file_level = logging.DEBUG if _high_verbose else logging.INFO
 
+    # Apply rate-limit only to file (keep console very visible)
     setup_logging(
         logfile="logs/unified_trading.log",
         console_level=_console_level,
         file_level=_file_level,
         enable_colors_console=True,
-        enable_colors_file=False,         # avoid ANSI in file
-        max_bytes=10485760,               # 10MB
+        enable_colors_file=False,
+        max_bytes=10_485_760,
         backup_count=5,
-        heartbeat_cooldown_sec=0.0        # you can set 30 to dedupe heartbeats in file
+        heartbeat_cooldown_sec=30.0,  # dedupe in file
+        heartbeat_cooldown_console_sec=0.0  # console remains verbose
     )
 
-    
-    logging.info(f"REQUIRE_TRAINED_MODELS={REQUIRE_TRAINED_MODELS} (env)")
-    logging.info(f"XGB_PATH={os.getenv('XGB_PATH','') or '(not set)'} | NEUTRAL_PATH={os.getenv('NEUTRAL_PATH','') or '(not set)'}")
-    
-    logging.info(f"CALIB_PATH={os.getenv('CALIB_PATH','') or '(not set)'} (env -- model_pipeline will auto-load if present)")
+    # Minimal env/config visibility
+    logging.info("REQUIRE_TRAINED_MODELS=%s (env)", REQUIRE_TRAINED_MODELS)
+    logging.info("XGB_PATH=%s | NEUTRAL_PATH=%s", 
+                os.getenv("XGB_PATH","") or "(not set)", 
+                os.getenv("NEUTRAL_PATH","") or "(not set)")
+    logging.info("CALIB_PATH=%s (env -- model_pipeline will auto-load if present)", 
+                os.getenv("CALIB_PATH","") or "(not set)")
+
+    # Reduce third‑party chatter (you can raise these later if needed)
+    logging.getLogger("websockets").setLevel(logging.INFO)
+    logging.getLogger("asyncio").setLevel(logging.INFO)
 
 
     # Visibility: log selected decision/hysteresis toggles
@@ -323,7 +325,6 @@ if __name__ == "__main__":
         pass
 
 
-    
     # Reduce third-party chatter
     logging.getLogger("websockets").setLevel(logging.INFO)
     logging.getLogger("asyncio").setLevel(logging.INFO)

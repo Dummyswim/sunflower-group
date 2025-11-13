@@ -32,6 +32,7 @@ class RateLimitFilter(logging.Filter):
             return True
 
 
+
 def setup_logging2(
     logfile: str,
     console_level: int = logging.INFO,
@@ -41,24 +42,26 @@ def setup_logging2(
     max_bytes: int = 10_485_760,  # 10MB
     backup_count: int = 5,
     debug_sample_n: int = 1,
-    heartbeat_cooldown_sec: float = 0.0  # set >0 to de-duplicate heartbeats
+    heartbeat_cooldown_sec: float = 0.0,  # file rate-limit heartbeat
+    heartbeat_cooldown_console_sec: float = 0.0  # NEW: console rate-limit (optional)
 ):
     """
-    Install console and rotating file handlers with independent color toggles
-    and UTF-8 file encoding. Keeps console colors; removes ANSI in files.
+    Install console and rotating file handlers with independent color toggles.
+    - Root logger is forced to DEBUG to always pass logs; handler levels control visibility.
+    - Optional RateLimitFilter can be applied to file and/or console to dedupe repeating messages.
     """
     logger = logging.getLogger()
-    logger.setLevel(min(console_level, file_level))
+    # Always allow DEBUG; handlers decide what shows
+    logger.setLevel(logging.DEBUG)
 
     # Remove existing handlers to avoid duplicates on reload
     for h in list(logger.handlers):
         logger.removeHandler(h)
 
-    # Console handler (optional colors)
+    # Console handler (colors optional)
     try:
         if enable_colors_console:
             try:
-                # Use colorlog if present for pretty console output
                 import colorlog  # type: ignore
                 ch = logging.StreamHandler()
                 ch.setLevel(console_level)
@@ -76,7 +79,6 @@ def setup_logging2(
                     },
                 ))
             except Exception:
-                # Fallback: plain console
                 ch = logging.StreamHandler()
                 ch.setLevel(console_level)
                 ch.setFormatter(logging.Formatter(
@@ -88,6 +90,10 @@ def setup_logging2(
             ch.setFormatter(logging.Formatter(
                 "%(asctime)s | %(levelname)s | %(name)s | [%(funcName)s:%(lineno)d] | %(message)s"
             ))
+
+        if heartbeat_cooldown_console_sec and heartbeat_cooldown_console_sec > 0:
+            ch.addFilter(RateLimitFilter(cooldown_seconds=float(heartbeat_cooldown_console_sec)))
+
         logger.addHandler(ch)
     except Exception:
         pass
@@ -110,15 +116,27 @@ def setup_logging2(
     fh.setFormatter(logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | [%(funcName)s:%(lineno)d] | %(message)s"
     ))
-
-    # Optional: rate-limit heartbeats globally in file to keep files tidy
     if heartbeat_cooldown_sec and heartbeat_cooldown_sec > 0:
         fh.addFilter(RateLimitFilter(cooldown_seconds=float(heartbeat_cooldown_sec)))
-
     logger.addHandler(fh)
 
-    # Reduce third-party verbosity defaults (you can still override later)
+    # Reduce third-party verbosity defaults (overridable later)
     logging.getLogger("websockets").setLevel(logging.INFO)
     logging.getLogger("asyncio").setLevel(logging.INFO)
 
     return logger
+
+
+def update_global_verbosity(high: bool = True) -> None:
+    """
+    Dynamically raise/lower handler levels across all handlers.
+    high=True -> DEBUG, high=False -> INFO
+    """
+    root = logging.getLogger()
+    new = logging.DEBUG if high else logging.INFO
+    for h in root.handlers:
+        try:
+            h.setLevel(new)
+        except Exception:
+            continue
+    root.info("Global verbosity updated → %s", logging.getLevelName(new))

@@ -53,6 +53,7 @@ class AdaptiveModelPipeline:
         min_w: float = 0.05, 
         max_w: float = 0.80,
         neutral_model: Optional[object] = None  # NEW
+
     ):
 
     
@@ -116,6 +117,10 @@ class AdaptiveModelPipeline:
         # Optional probability calibration (Platt)
         self._calib_a = None
         self._calib_b = None
+        self.last_p_xgb_raw = None  # NEW: last raw XGB p (pre-calibration)
+        self.last_p_xgb_calib = None  # NEW: last calibrated p (pre-blend)
+
+                
         try:
             calib_path = os.getenv("CALIB_PATH", "").strip()
             if calib_path and os.path.exists(calib_path):
@@ -134,16 +139,48 @@ class AdaptiveModelPipeline:
 
 
 
+
     def _apply_calibration(self, p: float) -> float:
-        """Apply optional Platt calibration to model probability."""
+        """Apply optional Platt calibration in logit space: q = sigmoid(a*logit(p) + b)."""
         try:
             if self._calib_a is None or self._calib_b is None:
                 return float(p)
-            z = self._calib_a * float(p) + self._calib_b
+            p = float(np.clip(p, 1e-9, 1.0 - 1e-9))
+            logit = float(np.log(p / (1.0 - p)))
+            z = (self._calib_a * logit) + self._calib_b
             q = 1.0 / (1.0 + np.exp(-z))
-            return float(np.clip(q, 1e-6, 1.0 - 1e-6))
+            q = float(np.clip(q, 1e-6, 1.0 - 1e-6))
+            return q
         except Exception:
             return float(p)
+
+
+    def reload_calibration(self, path: Optional[str] = None) -> bool:
+        """
+        Reload Platt calibration coefficients from JSON file and apply live.
+        Returns True if loaded, False otherwise.
+        """
+        try:
+            if not path:
+                path = os.getenv("CALIB_PATH", "").strip()
+            if not path or not os.path.exists(path):
+                logger.info(f"[CALIB] reload skipped; file missing: {path or '(empty)'}")
+                return False
+            
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            a = float(data.get("a"))
+            b = float(data.get("b"))
+            n = int(data.get("n", 0))
+            
+            self._calib_a, self._calib_b = a, b
+            logger.info(f"[CALIB] reloaded: a={a:.6f} b={b:.6f} (n={n})")
+            return True
+        except Exception as e:
+            logger.warning(f"[CALIB] reload failed: {e}")
+            return False
+
 
 
     def _validate_weights(self):
@@ -270,19 +307,36 @@ class AdaptiveModelPipeline:
                     logger.warning(f"Unexpected XGB output shape: {signal_probs.shape}")
                     signal_probs = np.array([[0.5, 0.5]], dtype=float)
                 
-                # ========== OPTIONAL PROBABILITY CALIBRATION ==========
+                # Capture raw p before calibration
                 try:
                     raw_buy = float(signal_probs[0][1])
-                    cal_buy = self._apply_calibration(raw_buy)
-                    if abs(cal_buy - raw_buy) > 1e-9:
-                        signal_probs = np.array([[1.0 - cal_buy, cal_buy]], dtype=float)
-                        logger.info(f"[CALIB] p_buy raw={raw_buy:.3f} → calib={cal_buy:.3f}")
+                    self.last_p_xgb_raw = float(np.clip(raw_buy, 1e-9, 1 - 1e-9))
+                except Exception:
+                    self.last_p_xgb_raw = None
+                
+                # ========== OPTIONAL PROBABILITY CALIBRATION ==========
+                try:
+                    if self.last_p_xgb_raw is not None:
+                        cal_buy = self._apply_calibration(self.last_p_xgb_raw)
+                        self.last_p_xgb_calib = float(np.clip(cal_buy, 1e-6, 1.0 - 1e-6))
+                        if abs(self.last_p_xgb_calib - self.last_p_xgb_raw) > 1e-12:
+                            signal_probs = np.array([[1.0 - self.last_p_xgb_calib, self.last_p_xgb_calib]], dtype=float)
+                            logger.info(f"[CALIB] p_buy raw={self.last_p_xgb_raw:.3f} → calib={self.last_p_xgb_calib:.3f}")
+                    else:
+                        self.last_p_xgb_calib = None
                 except Exception as e:
                     logger.debug(f"[CALIB] Skipped: {e}")
-                                
+                    self.last_p_xgb_calib = None
+                    
             except Exception as e:
                 logger.error(f"XGB prediction failed: {e}")
                 signal_probs = np.array([[0.5, 0.5]], dtype=float)
+                self.last_p_xgb_raw = None
+                self.last_p_xgb_calib = None
+
+            
+        
+
 
             # ========== NEUTRALITY MODEL (OPTIONAL) ==========
             neutral_prob = None

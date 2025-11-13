@@ -72,5 +72,5 @@
     "ta_macd_signal",
     "ta_rsi14"
   ],
-  "num_features": 71
+  "version": 1
 }

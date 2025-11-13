@@ -107,11 +107,16 @@ async def _websocket_heartbeat(name: str, ws_handler: WSHandler, interval_sec: i
         try:
             ticks = getattr(ws_handler, "tick_count", 0)
             last_ts = getattr(ws_handler, "last_packet_time", None)
+            
+            
+                    
             if last_ts and hasattr(last_ts, "timestamp"):
                 age = max(0.0, time.time() - last_ts.timestamp())
-                logger.info(f"[{name}] Websocket is active. ticks={ticks}, last_packet_age={age:.1f}s")
+                logger.info("[%s] Websocket is active. ticks=%d, last_packet_age=%.1fs", name, ticks, age)
             else:
-                logger.info(f"[{name}] Websocket is active. ticks={ticks}, awaiting first packet...")
+                logger.info("[%s] Websocket is active. ticks=%d, awaiting first packet...", name, ticks)
+
+
         except asyncio.CancelledError:
             logger.info(f"[{name}] Heartbeat cancelled")
             break
@@ -727,6 +732,12 @@ async def _connection_processing_loop(
             try:
                 micro_ctx = ws_handler.get_micro_features()
 
+                # Initialize microstructure context variables with safe defaults
+                std_short = float(micro_ctx.get('std_dltp_short', 0.0))
+                tightness = float(micro_ctx.get('price_range_tightness', 0.0))
+                n_short = int(micro_ctx.get('n_short', 0))
+
+
                 # NEW: normalize micro_slope by short-term realized volatility to avoid false momentum in flat markets
                 try:
                     micro_slope_raw = float(micro_ctx.get('slope', 0.0))
@@ -820,6 +831,34 @@ async def _connection_processing_loop(
                 f"[{name}] Gate: n_short={n_short} std_short={std_short:.6f} "
                 f"tight={tightness:.3f} → no_trade={gate_no_trade}"
             )
+
+
+            # ========== REGIME DETECTOR (per-minute) ==========
+            try:
+                # Basic regime from volatility and tightness
+                std_eps = float(getattr(config, 'gate_std_short_epsilon', 1e-6))
+                tight_thr = float(getattr(config, 'gate_tightness_threshold', 0.995))
+                
+                if (std_short <= 3 * std_eps) and (tightness >= tight_thr):
+                    regime = "tight"
+                    hyst_flip_buffer_eff = max(0.0, hyst_flip_buffer + 0.005)
+                    hyst_advantage_eff = max(0.0, hyst_advantage + 0.01)
+                elif (std_short > 10 * std_eps) and (tightness < 0.985):
+                    regime = "active"
+                    hyst_flip_buffer_eff = max(0.0, hyst_flip_buffer - 0.005)
+                    hyst_advantage_eff = max(0.0, hyst_advantage - 0.005)
+                else:
+                    regime = "normal"
+                    hyst_flip_buffer_eff = hyst_flip_buffer
+                    hyst_advantage_eff = hyst_advantage
+                
+                logger.info(f"[{name}] [REGIME] regime={regime} | std_short={std_short:.6g} tight={tightness:.3f} "
+                            f"| hyst_flip_buffer={hyst_flip_buffer_eff:.3f} hyst_advantage={hyst_advantage_eff:.3f}")
+            except Exception as e:
+                regime = "unknown"
+                hyst_flip_buffer_eff = hyst_flip_buffer
+                hyst_advantage_eff = hyst_advantage
+                logger.debug(f"[{name}] [REGIME] detector skipped: {e}")
 
 
 
@@ -936,25 +975,73 @@ async def _connection_processing_loop(
                 engineered_features = [features[k] for k in feat_keys_sorted]
 
 
-                # Phase 2: schema guard — skip inference when missing or mismatched
+
+
+                # Phase 2: schema guard — build on mismatch
                 schema_n = getattr(model_pipe, "feature_schema_size", None)
                 live_n = len(feat_keys_sorted)
+
                 if schema_n is None:
-                    logger.critical(f"[{name}] [SCHEMA] Missing feature schema; skipping inference this bucket (live_n={live_n})")
-                    await asyncio.sleep(0)
-                    continue
+                    logger.warning(f"[{name}] [SCHEMA] Missing feature schema; creating from live features (n={live_n})")
+                    # Build and persist schema from current live keys
+                    try:
+                        import os, json
+                        xgb_path = os.getenv("XGB_PATH", "models/xgb_model.json")
+                        base_dir = os.path.dirname(xgb_path) or "."
+                        schema_path = os.path.join(base_dir, "feature_schema.json")
+                        payload = {
+                            "feature_names": feat_keys_sorted,
+                            "version": 1,
+                        }
+                        tmp = schema_path + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(payload, f, indent=2)
+                        os.replace(tmp, schema_path)
+                        model_pipe.set_feature_schema(feat_keys_sorted)
+                        logger.info(f"[{name}] [SCHEMA] Created and applied: {schema_path} (n={len(feat_keys_sorted)})")
+                    except Exception as e:
+                        logger.critical(f"[{name}] [SCHEMA] Failed to create schema: {e}")
+                        await asyncio.sleep(0)
+                        continue
+
+
+
 
                 if int(schema_n) != int(live_n):
-                    logger.warning(f"[{name}] [SCHEMA] Live features ({live_n}) != schema ({schema_n}); proceeding with name-based alignment and zero-fill")
+                    schema_names = set(getattr(model_pipe, "feature_schema_names", []) or [])
+                    live_names = set(feat_keys_sorted or [])
+                    missing = sorted(list(schema_names - live_names))[:10]
+                    extra = sorted(list(live_names - schema_names))[:10]
+
+                    # Recreate schema from live keys when the only "missing" are downstream outputs
+                    allowed_missing = {"p_xgb_raw", "p_xgb_calib"}
                     try:
-                        schema_names = set(getattr(model_pipe, "feature_schema_names", []) or [])
-                        live_names = set(feat_keys_sorted or [])
-                        missing = sorted(list(schema_names - live_names))[:10]
-                        extra = sorted(list(live_names - schema_names))[:10]
-                        logger.info(f"[{name}] [SCHEMA] Missing (up to 10): {missing}")
-                        logger.info(f"[{name}] [SCHEMA] Extra (up to 10): {extra}")
+                        import os, json
+                        xgb_path = os.getenv("XGB_PATH", "models/xgb_model.json")
+                        base_dir = os.path.dirname(xgb_path) or "."
+                        schema_path = os.path.join(base_dir, "feature_schema.json")
+
+                        # Always rebuild from current live keys to eliminate downstream keys
+                        payload = {
+                            "feature_names": feat_keys_sorted,
+                            "version": 1,
+                        }
+                        tmp = schema_path + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(payload, f, indent=2)
+                        os.replace(tmp, schema_path)
+                        model_pipe.set_feature_schema(feat_keys_sorted)
+                        logger.warning(
+                            f"[{name}] [SCHEMA] Rebuilt from live features (old_missing={missing}, extra={extra}); "
+                            f"applied n={len(feat_keys_sorted)}"
+                        )
                     except Exception as e:
-                        logger.debug(f"[{name}] [SCHEMA] Diff report failed: {e}")
+                        logger.critical(
+                            f"[{name}] [SCHEMA] Rebuild failed (live_n={live_n} schema_n={schema_n} | "
+                            f"missing={missing} extra={extra}): {e}"
+                        )
+                        await asyncio.sleep(0)
+                        continue
 
 
 
@@ -971,6 +1058,26 @@ async def _connection_processing_loop(
                 buy_prob = float(signal_probs[0][1])
 
                 logger.debug(f"[{name}] Prediction: buy_prob={buy_prob:.3f}, alpha={float(alpha_buy):.3f}")
+
+
+
+                # Enrich features_for_log with raw/calibrated XGB p for calibrator (not used in inference)
+                try:
+                    # Ensure features_for_log exists before enrichment
+                    if 'features_for_log' not in locals() or not isinstance(features_for_log, dict):
+                        features_for_log = {}
+                    
+                    p_raw = getattr(model_pipe, "last_p_xgb_raw", None)
+                    p_cal = getattr(model_pipe, "last_p_xgb_calib", None)
+                    
+                    if p_raw is not None:
+                        features_for_log["meta_p_xgb_raw"] = float(p_raw)
+                    if p_cal is not None:
+                        features_for_log["meta_p_xgb_calib"] = float(p_cal)
+                except Exception:
+                    pass
+
+
 
                 # Log schema alignment status periodically
                 if tick_counter % 60 == 0:
@@ -1110,17 +1217,21 @@ async def _connection_processing_loop(
                     advantage = float(p_new - p_prev)
 
                     # 1) Respect alpha crossings with small safety buffer
-                    if hyst_respect_alpha and (p_new >= (float(alpha_buy) + hyst_flip_buffer)):
+
+                    if hyst_respect_alpha and (p_new >= (float(alpha_buy) + hyst_flip_buffer_eff)):
+    
                         hysteresis_suppressed = False
-                        hysteresis_reason = f"flip allowed (crossed alpha+{hyst_flip_buffer:.3f})"
+                        hysteresis_reason = f"flip allowed (crossed alpha+{hyst_flip_buffer_eff:.3f})"
                         flip_marker = "allowed_alpha"
                     else:
                         # 2) Require the new side to beat the previous side by a small advantage
-                        if advantage < hyst_advantage:
+
+                        if advantage < hyst_advantage_eff:
+
                             hysteresis_suppressed = True
                             hysteresis_reason = (
                                 f"suppress flip {prev_directional_decision}->{decision} "
-                                f"(p_new={p_new:.3f}, p_prev={p_prev:.3f}, Δ={advantage:+.3f} < adv={hyst_advantage:.3f})"
+                                f"(p_new={p_new:.3f}, p_prev={p_prev:.3f}, Δ={advantage:+.3f} < adv={hyst_advantage_eff:.3f})"
                             )
                             flip_marker = "suppressed"
                             decision = prev_directional_decision
@@ -1172,21 +1283,53 @@ async def _connection_processing_loop(
 
 
 
+            # ========== HARD GATES: AND-based neutrality + low-vol/tight with MTF+RVOL override ==========
 
-            # ========== HARD GATES: NO-TRADE AND HIGH-NEUTRALITY ==========
+            # Safe defaults to prevent UnboundLocalError if exception occurs in gate block
+            high_neutral = False
+            low_vol_tight = False
+            override_hold = False
+            pat_confirmed = False
+            insufficient_ticks = False
+                        
             try:
-                high_neutral = (neutral_prob is not None) and (float(neutral_prob) >= 0.75) and (abs(float(mtf_consensus)) < 0.33)
-            except Exception:
-                high_neutral = False
+                neu_thr = 0.75
+                high_neutral = (neutral_prob is not None) and (float(neutral_prob) >= neu_thr)
+                # Ensure gate thresholds are pulled from config locally (avoid relying on earlier scope)
+                std_eps = float(getattr(config, 'gate_std_short_epsilon', 1e-6))
+                tight_thr = float(getattr(config, 'gate_tightness_threshold', 0.995))
 
-            if gate_no_trade or high_neutral:
+                low_vol_tight = (std_short <= std_eps) and (tightness >= tight_thr)
+                
+                # Strong multi-timeframe confirmation and RVOL confirmation can override the HOLD gate
+                pat_confirmed = bool((pattern_features or {}).get('pat_confirmed_by_rvol', 0.0) >= 0.5)
+                strong_cons = abs(float(mtf_consensus)) >= float(getattr(config, "consensus_threshold", 0.66))
+                override_hold = strong_cons and pat_confirmed
+                
+                # Separate insufficient ticks gate (kept as no-trade failsafe)
+                insufficient_ticks = (n_short < int(getattr(config, 'micro_short_min_ticks_1m', 12)))
+                
+                # Final HOLD gate: insufficient ticks OR (high_neutral AND low_vol_tight) unless overridden
+                gate_hold = insufficient_ticks or ((high_neutral and low_vol_tight) and (not override_hold))
+            except Exception as e:
+                gate_hold = gate_no_trade  # fallback to earlier gate if any exception
+                logger.debug(f"[{name}] Gate compute fallback: {e}")
+
+
+
+
+            if gate_hold:
                 decision = "HOLD"
                 override = None
-                logger.info(f"[{name}] Gate forced HOLD: no_trade={gate_no_trade} high_neutral={high_neutral} "
-                            f"(p_neutral={neutral_prob if neutral_prob is not None else 'na'}, mtf={mtf_consensus:+.2f})")
+                logger.info(
+                    f"[{name}] [GATE] HOLD enforced: insufficient_ticks={insufficient_ticks} "
+                    f"high_neutral={high_neutral} low_vol_tight={low_vol_tight} override_hold={override_hold} "
+                    f"(p_neutral={neutral_prob if neutral_prob is not None else 'na'}, mtf={mtf_consensus:+.2f}, pat_conf={pat_confirmed})"
+                )
 
-
-
+            
+            
+    
             # Cache last_minute_prediction with final decision (after gates/override)
   
             last_minute_prediction = {
@@ -1478,6 +1621,25 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
     except Exception as e:
         logger.warning(f"Online trainer not started: {e}")
 
+
+    # Background Platt calibrator (auto-fits a,b from feature_log and hot-reloads)
+    calib_task = None
+    try:
+        from calibrator import background_calibrator_loop
+        calib_out = os.getenv("CALIB_PATH", "models/platt_calibration.json")
+        calib_task = asyncio.create_task(background_calibrator_loop(
+            feature_log_path=feature_log_path,
+            calib_out_path=calib_out,
+            pipeline_ref=model_pipe,
+            interval_sec=int(getattr(config, "calib_interval_sec", 1200)),
+            min_dir_rows=int(getattr(config, "calib_min_rows", 500))
+        ))
+        logger.info(f"[CALIB] Calibrator task started → {calib_out}")
+    except Exception as e:
+        logger.warning(f"[CALIB] Calibrator not started: {e}")
+
+
+
     # Per-connection tasks
     stop_events: Dict[str, asyncio.Event] = {}
     ws_tasks = []
@@ -1496,25 +1658,44 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
             # EVAL registry per connection
             pending_preds: Dict[datetime, Dict[str, float]] = {}
 
-            def _write_hitrate_records(candle_ts: datetime, hit: int):
+
+
+            def _write_hitrate_records(candle_ts: datetime, features_map: Dict[str, float], actual_direction: str):
                 """
-                Write one JSONL record per tunable indicator so weight tuner can adapt.
-                Called only for directional outcomes (see EVAL gating).
+                Per-indicator attribution:
+                - Compute each indicator's signed vote from the staged features at prediction time.
+                - Mark hit=1 if the indicator agreed with the actual direction (UP→+1, DOWN→-1).
+                - Skip FLAT minutes entirely (handled by caller).
                 """
                 try:
-                    indicators = ['micro_slope', 'imbalance', 'mean_drift']
-                    with open(getattr(cfg, 'hitrate_path', 'hitrate.txt'), 'a') as f:
-                        for ind in indicators:
+                    # Map direction to sign: UP=+1, DOWN=-1, FLAT=0 (skip handled by caller)
+                    dir_sign = 1 if actual_direction == "UP" else (-1 if actual_direction == "DOWN" else 0)
+                    if dir_sign == 0:
+                        return
+
+                    # Extract indicator votes from feature signs
+                    votes = {
+                        "micro_slope": np.sign(float(features_map.get("micro_slope", 0.0))),
+                        "imbalance":   np.sign(float(features_map.get("micro_imbalance", 0.0))),
+                        "mean_drift":  np.sign(float(features_map.get("mean_drift_pct", 0.0))),  # percent scale
+                    }
+
+                    path = getattr(cfg, 'hitrate_path', 'hitrate.txt')
+                    with open(path, 'a') as f:
+                        for ind, v in votes.items():
+                            agree = int(v == dir_sign and v != 0)
                             rec = {
                                 "timestamp": candle_ts.isoformat(),
                                 "indicator": ind,
-                                "hit": int(hit),
-                                "miss": int(1 - hit)
+                                "hit": agree,
+                                "miss": int(1 - agree)
                             }
                             f.write(json.dumps(rec) + "\n")
-                    logger.info(f"[{name}] [EVAL] Wrote hitrate for {candle_ts.strftime('%H:%M:%S')}: hit={hit}")
+                    logger.info(f"[{name}] [EVAL] Wrote per-indicator hitrate at {candle_ts.strftime('%H:%M:%S')}")
                 except Exception as e:
-                    logger.warning(f"[{name}] [EVAL] Failed to write hitrate: {e}")
+                    logger.warning(f"[{name}] [EVAL] Failed to write per-indicator hitrate: {e}")
+
+
 
             # Async callbacks
             async def _on_tick_cb(tick: Dict[str, Any]):
@@ -1627,11 +1808,19 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
                                         f"actual={direction} (O={o:.2f}→C={c:.2f}, is_flat={is_flat}) → {'HIT' if hit == 1 else 'MISS'}"
                                     )
 
+
                                     # Hitrate learning only for directional outcomes
                                     if hit is not None and expected in ("BUY", "SELL"):
-                                        _write_hitrate_records(idx_ts, hit)
-                                    else:
-                                        logger.debug(f"[{name}] [EVAL] Hitrate not updated for expected={expected}")
+                                        # Use ground truth direction and the staged feature snapshot
+                                        try:
+                                            feat_map_for_attr = (staged or {}).get("features", {})
+                                            if direction in ("UP", "DOWN") and isinstance(feat_map_for_attr, dict):
+                                                _write_hitrate_records(idx_ts, feat_map_for_attr, direction)
+                                            else:
+                                                logger.debug(f"[{name}] [EVAL] Skipped hitrate attribution (direction={direction})")
+                                        except Exception as e:
+                                            logger.debug(f"[{name}] [EVAL] Hitrate attribution failed: {e}")
+
 
                                     # PF update for directionals
                                     if expected in ("BUY", "SELL"):
@@ -1643,6 +1832,11 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
 
                                         except Exception:
                                             pass
+
+
+
+
+
 
                                 # Training row: features + label aligned with evaluation's flat rule
                                 try:
@@ -1829,6 +2023,16 @@ async def main_loop(config, cnn_lstm, xgb, rl_agent, train_features, token_b64, 
             pass
         except Exception as e:
             logger.error(f"Error cancelling drift baseline task: {e}")
+
+        # Cancel calibrator task
+        try:
+            if 'calib_task' in locals() and calib_task is not None:
+                calib_task.cancel()
+                await asyncio.wait_for(calib_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception as e:
+            logger.error(f"Error cancelling calibrator task: {e}")
 
 
 

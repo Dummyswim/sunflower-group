@@ -31,9 +31,9 @@ def _safe_series(arr, min_len=1):
 class TA:
     """Technical Analysis indicators without volume dependency."""
     
+
     @staticmethod
     def rsi(prices: List[float], period: int = 14) -> float:
-        """Calculate RSI indicator."""
         try:
             s = _safe_series(prices, min_len=period+2)
             delta = s.diff()
@@ -41,10 +41,12 @@ class TA:
             down = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
             rs = up / np.maximum(1e-12, down)
             rsi = 100 - (100 / (1 + rs.iloc[-1]))
-            return float(np.nan_to_num(rsi))
+            rsi = float(np.nan_to_num(rsi))
+            return float(np.clip(rsi, 0.0, 100.0))  # ← NEW: clip to natural bounds
         except Exception:
             return 50.0
-    
+
+
     @staticmethod
     def macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9):
         """Calculate MACD indicator."""
@@ -174,17 +176,98 @@ class FeaturePipeline:
         except Exception:
             return 'unknown'
 
+
+    @staticmethod
+    def _is_bounded_key(k: str) -> bool:
+        """Pattern flags, mtf votes/adj, bounded indicators and tightness/%B"""
+        if k.startswith("pat_is") or k.startswith("mtf_tf_"):
+            return True
+        return k in {
+            "pat_rvol", "probability_adjustment", "mtf_adj", "mtf_consensus",
+            "price_range_tightness", "ta_bb_pctb", "ta_rsi14"
+        }
+
+    @staticmethod
+    def _clip_feature_value(k: str, v: float) -> float:
+        """Clip features to their natural bounds"""
+        try:
+            if k == "ta_rsi14":
+                return float(np.clip(v, 0.0, 100.0))
+            if k == "ta_bb_pctb" or k == "price_range_tightness":
+                return float(np.clip(v, 0.0, 1.0))
+            if k == "micro_slope":
+                # micro_slope_normed is provided by main_event_loop;
+                # clip robustly to limit outliers in flat regimes
+                return float(np.clip(v, -3.0, +3.0))
+            if k == "last_zscore":
+                return float(np.clip(v, -6.0, +6.0))
+            if k == "pat_rvol":
+                # cap extreme RVOL spikes from tiny baselines
+                return float(np.clip(v, 0.0, 5.0))
+            return float(v)
+        except Exception:
+            return float(v) if isinstance(v, (int, float)) else 0.0
+
+
+
     @staticmethod
     def normalize_features(features: Dict, scale: float = 1.0) -> Dict[str, float]:
-        """Normalize numeric features by scale."""
-        denom = scale if (isinstance(scale, (int, float)) and scale > 0) else 1.0
-        out = {}
+        """
+        Schema-aware normalization:
+        - Do NOT divide bounded/dimensionless features by ret_std.
+        - Do NOT re-scale already-normalized micro_slope.
+        - Only apply ret_std scaling to selected unbounded features.
+        """
+        out: Dict[str, float] = {}
+        try:
+            denom = float(scale) if (isinstance(scale, (int, float)) and scale > 0) else 1.0
+        except Exception:
+            denom = 1.0
+
+        # Only these benefit from ret_std scaling (unbounded, magnitude-sensitive)
+        scale_by_retstd = {
+            "ema_8", "ema_21",            # raw magnitudes
+            "ta_macd", "ta_macd_signal", "ta_macd_hist",
+            "ta_bb_bw",                   # unbounded width proxy
+            # Note: we intentionally skip: last_price, last_zscore, mean_drift_pct,
+            # std_dltp_short, micro_imbalance, spread → keep consistent scales
+        }
+
         for k, v in features.items():
             try:
-                out[k] = float(v) / denom
+                fv = float(v)
             except Exception:
-                pass  # Skip non-numeric
+                continue
+
+            # Keep bounded keys untouched by ret_std; clip to natural bounds
+            if FeaturePipeline._is_bounded_key(k):
+                out[k] = FeaturePipeline._clip_feature_value(k, fv)
+                continue
+
+            # micro_slope already normalized upstream; no second scaling
+            if k == "micro_slope":
+                out[k] = FeaturePipeline._clip_feature_value(k, fv)
+                continue
+
+            # Optional clip for a few unstable but unbounded keys
+            if k in ("last_zscore", "pat_rvol"):
+                fv = FeaturePipeline._clip_feature_value(k, fv)
+
+            if k in scale_by_retstd and denom != 1.0:
+                out[k] = float(fv / max(1e-6, denom))
+            else:
+                out[k] = float(fv)
+
+        # Visibility: log a one-liner occasionally for debugging
+        try:
+            logger.debug(f"[NORM] scale={denom:.6g} | keys={len(out)} "
+                        f"| scaled_keys={len(scale_by_retstd & set(features.keys()))}")
+        except Exception:
+            pass
+
         return out
+
+
 
     # ========== DRIFT DETECTION ==========
 
