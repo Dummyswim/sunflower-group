@@ -4,7 +4,6 @@ Consolidates: enhanced_websocket_handler.py, microstructure_features.py, latency
 """
 import asyncio
 import struct
-import json
 import logging
 from typing import Dict, Optional, Any, List, Tuple
 import pandas as pd
@@ -40,13 +39,22 @@ class UnifiedWebSocketHandler:
     DISCONNECT_PACKET = 50
     
     def __init__(self, config):
-        logger.info("Initializing Unified WebSocket Handler (volume-free)")
+        logger.info("[WS] Initializing Unified WebSocket Handler (volume-free)")
+
         self.config = config
         self.websocket = None
         self.authenticated = False
         self.running = True
         
 
+        # ADD THESE LINES:
+        # Core data buffers
+        self.tick_buffer = []
+        self.current_candle = {'ticks': [], 'start_time': None}        
+
+        # ADD THIS LINE:
+        self.candle_data = pd.DataFrame()  # Initialize empty DataFrame with proper columns
+        
         # Timestamp mode: prefer arrival time to avoid vendor LTT ambiguities
         self.use_arrival_time = bool(getattr(config, "use_arrival_time", True))
         if self.use_arrival_time:
@@ -54,15 +62,7 @@ class UnifiedWebSocketHandler:
         else:
             logger.info("Timestamp mode: VENDOR (normalized LTT)")
 
-        
-        # Core data buffers
-        self.tick_buffer = []
-        self.candle_data = pd.DataFrame()
-        self.current_candle = {'ticks': [], 'start_time': None}
-        
-        # OI tracking
-        self.current_oi = None
-        self._last_candle_oi = None
+
         
         # Callbacks
         self.on_tick = None
@@ -83,29 +83,21 @@ class UnifiedWebSocketHandler:
         self._last_quote_times = {}
         
         # Market state
-        self._tick_queue: asyncio.Queue = asyncio.Queue()
+
         self._last_best = None
         self._last_depth = None
         
         # Statistics
-        self.packet_stats = {pt: 0 for pt in self.PACKET_TYPES.values()}
-        self.packet_stats.update({'ticker': 0, 'quote': 0, 'full': 0, 'oi': 0, 'other': 0})
+
         self.last_packet_time = None
         self.tick_count = 0
         
         # Control flags
         self._preclose_fired_for_bucket = None
-        self._preclose_lock = asyncio.Lock()
+
         self._bucket_closed = False
         self._diag_ticks_left = 50
         
-        # Tasks
-        self.boundary_task = None
-        self.data_watchdog_task = None
-        self._last_subscribe_time = None
-        
-        # Latency compensation (integrated from latency_compensation.py)
-        self._avg_network_delay = 0.0  # Can be calibrated
         
 
         # Rolling PnL / PF history
@@ -181,29 +173,6 @@ class UnifiedWebSocketHandler:
                 self._auth_event.set()
             except Exception:
                 pass
-
-    # NEW: awaitable for external consumers to wait for auth
-    async def wait_for_auth(self, timeout: Optional[float] = None) -> bool:
-        try:
-            if timeout is None:
-                await self._auth_event.wait()
-                return self.authenticated
-            await asyncio.wait_for(self._auth_event.wait(), timeout=timeout)
-            return self.authenticated
-        except asyncio.TimeoutError:
-            return False
-
-
-    # ========== LATENCY COMPENSATION (from latency_compensation.py) ==========
-
-    def _compensate_latency(self, tick_timestamp: int) -> float:
-        """Adjust timestamp for network delay (seconds)."""
-        try:
-            # tick_timestamp is seconds since epoch; subtract delay in seconds
-            return float(tick_timestamp) - float(self._avg_network_delay)
-        except Exception:
-            return float(tick_timestamp)
-
 
 
 
@@ -555,8 +524,7 @@ class UnifiedWebSocketHandler:
                 timestamp = self._normalize_tick_ts(ltt)
 
 
-            
-            self.packet_stats['ticker'] += 1
+
             self._last_best = ltp
             
             return {
@@ -579,16 +547,20 @@ class UnifiedWebSocketHandler:
             self.tick_count += 1
             self.tick_buffer.append(tick_data)
 
+
             # Emit periodic info-level logs so the operator can see ticks arriving
             try:
                 if self.tick_count == 1 or (self.tick_count % 50 == 0):
                     ltp_val = float(tick_data.get('ltp', 0.0))
                     ts = tick_data.get('timestamp')
                     ts_str = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
-                    # logger.info(f"Handler received tick #{self.tick_count}: ltp={ltp_val:.4f}, ts={ts_str}")
+                    logger.info("[WS] Tick #%d at %s | ltp=%.4f", self.tick_count, ts_str, ltp_val)
             except Exception:
                 # Non-fatal instrumentation
                 pass
+
+
+
 
             # INTEGRATED: Update microstructure in one place
             safe_ob = self._last_depth if self._last_depth else {}
@@ -615,9 +587,6 @@ class UnifiedWebSocketHandler:
 
             await self._maybe_fire_preclose(current_time)
 
-            # Queue for external consumers
-            self._tick_queue.put_nowait((tick_data, self._last_depth, current_time))
-
             if self.on_tick:
                 await self.on_tick(tick_data)
 
@@ -625,9 +594,7 @@ class UnifiedWebSocketHandler:
             logger.error(f"Tick processing error: {e}", exc_info=True)
 
     # ========== SIMPLIFIED GETTERS ==========
-    async def get_next_tick(self) -> Tuple[Dict, Dict, datetime]:
-        """Await next tick from queue."""
-        return await self._tick_queue.get()
+
 
     def get_prices(self, last_n: int = 200) -> List[float]:
         """Get recent LTP prices."""
@@ -759,18 +726,6 @@ class UnifiedWebSocketHandler:
 
 
 
-            # EVAL: score the just-closed candle if we had a registered prediction
-            # Note: pending_preds needs to be passed from main_event_loop context
-            # This is a placeholder - actual implementation requires access to pending_preds
-            # from the processing loop context
-            try:
-                # This will be called from main_event_loop's callback context
-                # where pending_preds is accessible
-                pass
-            except Exception as e:
-                logger.warning(f"Candle evaluation error: {e}")
-
-
 
         except asyncio.CancelledError:
             raise
@@ -858,7 +813,8 @@ class UnifiedWebSocketHandler:
         parse packets, and push ticks via _process_tick. This stub keeps
         the task alive until disconnect() is called.
         """
-        logger.info("UnifiedWebSocketHandler run_forever started (stub mode)")
+        logger.info("[WS] run_forever started (stub mode)")
+
 
         # NEW: attempt authentication once at start
         await self._authenticate()
@@ -871,7 +827,8 @@ class UnifiedWebSocketHandler:
         except Exception as e:
             logger.error(f"run_forever error: {e}", exc_info=True)
         finally:
-            logger.info("UnifiedWebSocketHandler run_forever exiting")
+            logger.info("[WS] run_forever exiting")
+
 
     async def disconnect(self, stop_running: bool = False):
         """Gracefully stop the handler and close resources."""
@@ -931,12 +888,7 @@ class UnifiedWebSocketHandler:
         except Exception:
             pass
 
-    def reset_pf_history(self) -> None:
-        try:
-            self._pnl_hist.clear()
-            logger.info("[PF] Profit factor history reset")
-        except Exception:
-            pass
+
 
     def get_recent_profit_factor(self, window: int = 120) -> float:
         """
