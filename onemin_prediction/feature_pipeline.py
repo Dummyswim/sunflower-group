@@ -315,15 +315,24 @@ class FeaturePipeline:
                     return (closes[-1] > closes[-2]) and (closes[-2] > closes[-3])
                 except Exception:
                     return False
+                     
+
+            # Robust RVOL baseline: trimmed median, drop very low-tick minutes (e.g., startup)
             try:
                 recent_ticks = tail['tick_count'].astype(float)
-                if len(recent_ticks) >= rvol_window:
-                    baseline = max(1e-9, recent_ticks.iloc[:-1].tail(rvol_window - 1).mean())
+                prev = recent_ticks.iloc[:-1]
+                prev_clean = prev[prev >= 60]  # ignore startup/partial bars
+                if len(prev_clean) >= max(1, rvol_window - 1):
+                    baseline = float(prev_clean.tail(rvol_window - 1).median())
                 else:
-                    baseline = max(1e-9, recent_ticks.iloc[:-1].mean()) if len(recent_ticks) > 1 else 1.0
+                    baseline = float(prev_clean.median()) if len(prev_clean) else float(prev.tail(max(1, rvol_window - 1)).mean())
+                baseline = max(1e-9, baseline)
                 rvol = float(recent_ticks.iloc[-1] / baseline) if baseline > 0 else 0.0
             except Exception:
                 rvol = 0.0
+
+
+                
             if c0 is not None:
                 o0, h0, l0, c0c = float(c0['open']), float(c0['high']), float(c0['low']), float(c0['close'])
                 b0 = body(o0, c0c)

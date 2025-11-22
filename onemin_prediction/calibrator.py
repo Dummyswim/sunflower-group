@@ -23,7 +23,7 @@ async def background_calibrator_loop(
     calib_out_path: str,
     pipeline_ref,
     interval_sec: int = 1200,
-    min_dir_rows: int = 500
+    min_dir_rows: int = 220
 ):
     """
     Periodically fit Platt calibration on recent logs and write a,b to calib_out_path.
@@ -101,74 +101,219 @@ async def background_calibrator_loop(
                 continue
 
 
+            # --- Adaptive multi-slice, class-balanced calibration ---
 
             use_all_dir = os.getenv("CALIB_USE_ALL_DIR", "").strip().lower() in ("1", "true", "yes")
-            if use_all_dir:
-                m = (df["label"].isin(["BUY", "SELL"]))
-            else:
-                m = (df["label"].isin(["BUY", "SELL"])) & (df["tradeable"] == True)
 
-            dfd = df[m].copy()
-            if dfd.empty or len(dfd) < min_dir_rows:
-                log_every("calib-dir-insufficient", 120, logger.info, f"[CALIB] directional rows insufficient: {len(dfd)}/{min_dir_rows} (all_dir={use_all_dir})")
+            # Base directional dataset (respect tradeable when requested and present)
+            if use_all_dir or ("tradeable" not in df.columns):
+                mask_dir = (df["label"].isin(["BUY", "SELL"]))
+            else:
+                mask_dir = (df["label"].isin(["BUY", "SELL"])) & (df["tradeable"] == True)
+
+            dfd_all = df[mask_dir].copy()
+            if dfd_all.empty or len(dfd_all) < min_dir_rows:
+                log_every(
+                    "calib-dir-insufficient",
+                    120,
+                    logger.info,
+                    f"[CALIB] directional rows insufficient: {len(dfd_all)}/{min_dir_rows} (all_dir={use_all_dir})",
+                )
                 continue
 
-            if "meta_p_xgb_raw" not in dfd.columns:
+
+
+            if "meta_p_xgb_raw" not in dfd_all.columns:
                 logger.info("[CALIB] meta_p_xgb_raw not found in logs; skipping this cycle to avoid corrupt calibration")
                 continue
 
-            dfd = dfd.replace([np.inf, -np.inf], np.nan)
-            before = len(dfd)
-            dfd = dfd.dropna(subset=["meta_p_xgb_raw"])
-            after = len(dfd)
-            if after < min_dir_rows:
-                log_every("calib-dropna-insufficient", 120, logger.info, f"[CALIB] rows after dropna insufficient: {after}/{min_dir_rows} (before={before})")
+            # Clean NaNs/Infs only for the calibration source column
+            dfd_all = dfd_all.replace([np.inf, -np.inf], np.nan)
+            dfd_all = dfd_all.dropna(subset=["meta_p_xgb_raw"])
+
+            if len(dfd_all) < min_dir_rows:
+                log_every(
+                    "calib-dropna-insufficient",
+                    120,
+                    logger.info,
+                    f"[CALIB] rows after cleaning insufficient: {len(dfd_all)}/{min_dir_rows}",
+                )
                 continue
 
-            p = np.asarray(dfd["meta_p_xgb_raw"].values, dtype=float)
-            y = np.asarray((dfd["label"] == "BUY").astype(int).values, dtype=int)
-            x = _logit_clip_arr(p).reshape(-1, 1)
+            # Compose candidate slices
+            recent_rows = int(os.getenv("CALIB_RECENT_ROWS", "1200") or "1200")
+            candidates = []
 
-            a = b = None
-            try:
-                from sklearn.linear_model import LogisticRegression
-                clf = LogisticRegression(max_iter=500, solver="lbfgs", class_weight=None)
+            # 1) recent/full tradeable-filtered (only if not using all_dir and column exists)
+            if (not use_all_dir) and ("tradeable" in df.columns):
+                dfd_tr = dfd_all.copy()
+                if not dfd_tr.empty:
+                    candidates.append(("recent_tr", dfd_tr.tail(recent_rows)))
+                    candidates.append(("full_tr", dfd_tr))
+
+
+
+            # 2) recent/full all directionals (ignoring tradeable)
+            dfd_all_dir = df[df["label"].isin(["BUY", "SELL"])].copy()
+            dfd_all_dir = dfd_all_dir.replace([np.inf, -np.inf], np.nan)
+            dfd_all_dir = dfd_all_dir.dropna(subset=["meta_p_xgb_raw"])
+
+            if len(dfd_all_dir) >= min_dir_rows:
+                candidates.append(("recent_all", dfd_all_dir.tail(recent_rows)))
+                candidates.append(("full_all", dfd_all_dir))
+
+
+
+            # Helper: fit class-balanced Platt and score
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.metrics import roc_auc_score
+
+            def _fit_and_score(dfd_slice: pd.DataFrame):
+                p = np.asarray(dfd_slice["meta_p_xgb_raw"].values, dtype=float)
+                y = np.asarray((dfd_slice["label"] == "BUY").astype(int).values, dtype=int)
+
+
+                # Fast skill gate: require AUC > 0.5
+                try:
+                    if len(np.unique(y)) == 2:
+                        auc = float(roc_auc_score(y, p))
+                    else:
+                        auc = 0.5
+                except Exception:
+                    auc = 0.5
+
+                # If AUC <= 0.5, try inverted mapping (1 - p) before giving up.
+                if not (auc > 0.5):
+                    try:
+                        if len(np.unique(y)) == 2:
+                            auc_inv = float(roc_auc_score(y, 1.0 - p))
+                        else:
+                            auc_inv = 0.5
+                    except Exception:
+                        auc_inv = 0.5
+
+                    if auc_inv > 0.5:
+                        # Use inverted probabilities going forward
+                        p = 1.0 - p
+                        auc = auc_inv
+                    else:
+                        # No positive skill in either direction for this slice
+                        return None
+
+
+
+                x = _logit_clip_arr(p).reshape(-1, 1)
+                clf = LogisticRegression(max_iter=500, solver="lbfgs", class_weight="balanced")
                 clf.fit(x, y)
                 a = float(clf.coef_.ravel()[0])
                 b = float(clf.intercept_.ravel()[0])
-            except Exception as e:
-                logger.warning(f"[CALIB] sklearn fit failed: {e}")
+                n = len(y)
+
+                # Validation on a small holdout tail
+                n_val = max(50, min(200, n // 5))
+                y_val = y[-n_val:]
+                p_raw_val = np.clip(p[-n_val:], 1e-9, 1 - 1e-9)
+                z_val = a * _logit_clip_arr(p_raw_val) + b
+                p_cal_val = _sigmoid(z_val)
+
+                brier_raw = _brier(y_val, p_raw_val)
+                brier_cal = _brier(y_val, p_cal_val)
+
+                return {
+                    "a": a,
+                    "b": b,
+                    "n": int(n),
+                    "auc": float(auc),
+                    "brier_raw": float(brier_raw),
+                    "brier_cal": float(brier_cal),
+                }
+
+            # Try candidates in order; accept the first valid one
+            accepted = None
+            for name, d in candidates:
+                try:
+                    if d is None or d.empty or len(d) < min_dir_rows:
+                        continue
+                    res = _fit_and_score(d)
+                    if res is None:
+                        logger.info(f"[CALIB] candidate={name} skipped: AUC ≤ 0.5 or invalid data")
+                        continue
+
+                    a, b = res["a"], res["b"]
+                    mono_ok = _monotonic_grid_ok(a, b)
+                    logger.info(
+                        "[CALIB] candidate=%s n=%d auc=%.3f a=%.6f b=%.6f raw=%.5f calib=%.5f mono_ok=%s",
+                        name,
+                        res["n"],
+                        res["auc"],
+                        a,
+                        b,
+                        res["brier_raw"],
+                        res["brier_cal"],
+                        mono_ok,
+                    )
+
+                    if not mono_ok:
+                        continue
+                    if res["brier_cal"] > (res["brier_raw"] + 0.002):
+                        continue
+
+                    accepted = (name, res)
+                    break
+                except Exception as e:
+                    logger.debug(f"[CALIB] candidate {name} failed: {e}")
+
+            # Maintain a small rejection streak counter on the function object
+            if not hasattr(background_calibrator_loop, "_reject_streak"):
+                setattr(background_calibrator_loop, "_reject_streak", 0)
+
+            if accepted is None:
+                background_calibrator_loop._reject_streak += 1
+                logger.info(
+                    "[CALIB] rejected all candidates (streak=%d)",
+                    background_calibrator_loop._reject_streak,
+                )
+                # Auto-bypass after repeated failures
+                try:
+                    if (
+                        background_calibrator_loop._reject_streak >= 3
+                        and hasattr(pipeline_ref, "_calib_bypass")
+                        and not getattr(pipeline_ref, "_calib_bypass", False)
+                    ):
+                        setattr(pipeline_ref, "_calib_bypass", True)
+                        logger.info("[CALIB-HEALTH] Bypass ENABLED (repeated calibration rejections)")
+                except Exception:
+                    pass
                 continue
 
-            if not np.isfinite(a) or not np.isfinite(b):
-                logger.info("[CALIB] invalid coefficients; skipping write")
-                continue
+            # Accept best candidate and write/hot-reload
+            background_calibrator_loop._reject_streak = 0
+            name, best = accepted
+            a, b, n = best["a"], best["b"], best["n"]
 
-            n = len(dfd)
-            n_val = max(50, min(200, n // 5))
-            y_val = y[-n_val:]
-            p_raw_val = np.clip(p[-n_val:], 1e-9, 1 - 1e-9)
-            z_val = a * _logit_clip_arr(p_raw_val) + b
-            p_cal_val = _sigmoid(z_val)
-            brier_raw = _brier(y_val, p_raw_val)
-            brier_cal = _brier(y_val, p_cal_val)
-
-            if not _monotonic_grid_ok(a, b):
-                logger.info(f"[CALIB] rejected (non-monotonic or non-positive slope): a={a:.6f}, b={b:.6f}")
-                continue
-            if brier_cal > (brier_raw + 0.002):
-                logger.info(f"[CALIB] rejected (Brier worsened): raw={brier_raw:.5f} calib={brier_cal:.5f}")
-                continue
+            try:
+                if hasattr(pipeline_ref, "_calib_bypass") and getattr(pipeline_ref, "_calib_bypass", False):
+                    setattr(pipeline_ref, "_calib_bypass", False)
+                    logger.info("[CALIB-HEALTH] Bypass DISABLED (valid calibration found)")
+            except Exception:
+                pass
 
             meta = {
-                "a": a,
-                "b": b,
+                "a": float(a),
+                "b": float(b),
                 "n": int(n),
                 "source": "meta_p_xgb_raw",
-                "last_success_ts": datetime.utcnow().isoformat() + "Z"
+                "last_success_ts": datetime.utcnow().isoformat() + "Z",
             }
             _atomic_write_json(calib_out_path, meta)
-            logger.info(f"[CALIB] wrote a,b (n={n}, src=meta_p_xgb_raw) → {calib_out_path} | a={a:.6f} b={b:.6f}")
+            logger.info(
+                "[CALIB] wrote a,b (n=%d, src=meta_p_xgb_raw, candidate=%s) → %s | a=%.6f b=%.6f",
+                n,
+                name,
+                calib_out_path,
+                a,
+                b,
+            )
 
             try:
                 if getattr(pipeline_ref, "_calib_bypass", False):
@@ -178,6 +323,10 @@ async def background_calibrator_loop(
                     logger.info(f"[CALIB] hot-reload {'ok' if ok else 'skipped'}")
             except Exception as e:
                 logger.warning(f"[CALIB] hot-reload failed: {e}")
+
+
+
+
 
         except asyncio.CancelledError:
             logger.info("[CALIB] Calibrator cancelled")

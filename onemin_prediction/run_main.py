@@ -74,15 +74,17 @@ config = SimpleNamespace(
     pattern_rvol_threshold=1.2,
     pattern_min_winrate=0.55,
 
-    # Flat labelling
-    flat_tolerance_pct=0.0002,       # 0.02%
+
+    # Flat labelling (relax to increase directional rows)
+    flat_tolerance_pct=0.00010,  # 0.01%
     flat_dyn_k_range=0.20,
     flat_min_points=0.20,
-    flat_tolerance_max_pts=6.0,
+    flat_tolerance_max_pts=3.0,
 
-    # Calibrator cadence (fit on >=300 directional rows)
+    # Calibrator cadence (fit on >=220 directional rows)
     calib_interval_sec=300,
-    calib_min_rows=300,
+    calib_min_rows=220,
+
 )
 
 # Minimal drift baseline seed (will be refreshed from feature_log)
@@ -270,6 +272,16 @@ if __name__ == "__main__":
         telegram_alerts=True,
         telegram_min_level=logging.ERROR
     )
+
+    # Force DEBUG for core modules while stabilizing
+    try:
+        for mod in ("main_event_loop", "core_handler", "feature_pipeline",
+                    "model_pipeline", "online_trainer", "calibrator"):
+            logging.getLogger(mod).setLevel(logging.DEBUG)
+        logging.info("[LOG] Forced DEBUG level for core modules")
+    except Exception as e:
+        logging.debug(f"[LOG] Force DEBUG failed (ignored): {e}")
+
 
     try:
         start_dynamic_level_watcher(config_path="logs/log_level.json", poll_sec=2.0)

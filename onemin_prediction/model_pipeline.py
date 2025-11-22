@@ -58,32 +58,77 @@ class AdaptiveModelPipeline:
 
         logger.info("Adaptive model pipeline initialized (probabilities-only)")
 
+
+
+
+
     def _apply_calibration(self, p: float) -> float:
+        """
+        Apply Platt calibration to a raw BUY probability.
+
+        Behaviour:
+        - If _calib_bypass is True, we never trust raw margins fully:
+          we shrink toward 0.5 so extreme values are softened.
+        - Otherwise, use current (a,b), with guards against
+          non-monotonic or extreme inversions.
+        """
         try:
+            # Respect dynamic bypass flag
+            if getattr(self, "_calib_bypass", False):
+                # When bypassed, never trust raw margins fully.
+                # Shrink towards 0.5 so 0.9 behaves more like ~0.66–0.7.
+                try:
+                    shrink_env = os.getenv("CALIB_BYPASS_SHRINK", "0.4") or "0.4"
+                    shrink = float(shrink_env)
+                except Exception:
+                    shrink = 0.4
+                shrink = max(0.1, min(0.8, shrink))
+                p_raw = float(np.clip(p, 1e-9, 1.0 - 1e-9))
+                p_shrunk = 0.5 + shrink * (p_raw - 0.5)
+                p_shrunk = float(np.clip(p_shrunk, 1e-6, 1.0 - 1e-6))
+                logger.info(
+                    "[CALIB] bypass active → shrink raw p=%.3f to %.3f (shrink=%.2f)",
+                    p_raw, p_shrunk, shrink
+                )
+                return p_shrunk
+
             if self._calib_a is None or self._calib_b is None:
                 return float(p)
+
             a = float(self._calib_a)
             b = float(self._calib_b)
             if not np.isfinite(a) or not np.isfinite(b) or a <= 0.0:
                 logger.info(f"[CALIB-GUARD] invalid coefficients a={a} b={b} → using raw")
                 return float(p)
+
             p = float(np.clip(p, 1e-9, 1.0 - 1e-9))
             logit = float(np.log(p / (1.0 - p)))
             z = (a * logit) + b
             q = 1.0 / (1.0 + np.exp(-z))
             q = float(np.clip(q, 1e-6, 1.0 - 1e-6))
+
+            # Guard against large sign inversions
             if (p - 0.5) * (q - 0.5) < 0 and abs(q - p) > 0.20:
                 logger.info(f"[CALIB-GUARD] large inversion Δ={q - p:+.3f} (p={p:.3f} → q={q:.3f}) → using raw")
                 return float(p)
+
+            # Clamp overly aggressive deltas
             max_delta = 0.12 + 0.25 * abs(p - 0.5)
             delta = q - p
             if abs(delta) > max_delta:
                 q_clamped = float(p + np.clip(delta, -max_delta, max_delta))
-                logger.info(f"[CALIB-GUARD] clamp Δ={delta:+.3f}→{(q_clamped - p):+.3f} (p={p:.3f} → q={q:.3f})")
+                logger.info(
+                    f"[CALIB-GUARD] clamp Δ={delta:+.3f}→{(q_clamped - p):+.3f} (p={p:.3f} → q={q:.3f})"
+                )
                 return q_clamped
+
             return q
         except Exception:
+            # On any error, fall back to raw
             return float(p)
+
+
+
 
     def reload_calibration(self, path: Optional[str] = None) -> bool:
         try:
@@ -229,9 +274,10 @@ class AdaptiveModelPipeline:
                     if self.last_p_xgb_raw is not None:
                         cal_buy = self._apply_calibration(self.last_p_xgb_raw)
                         self.last_p_xgb_calib = float(np.clip(cal_buy, 1e-6, 1.0 - 1e-6))
+    
                         if abs(self.last_p_xgb_calib - self.last_p_xgb_raw) > 1e-12:
                             signal_probs = np.array([[1.0 - self.last_p_xgb_calib, self.last_p_xgb_calib]], dtype=float)
-                            logger.info(f"[CALIB] p_buy raw={self.last_p_xgb_raw:.3f} → calib={self.last_p_xgb_calib:.3f}")
+                            logger.debug("[CALIB] p_buy raw=%.3f → calib=%.3f",self.last_p_xgb_raw,self.last_p_xgb_calib,)
                     else:
                         self.last_p_xgb_calib = None
                 except Exception as e:
@@ -277,42 +323,97 @@ class AdaptiveModelPipeline:
                         delta = float(np.clip(blended - p_model, -cap, cap))
                         p_after_indicator = float(np.clip(p_model + delta, 0.0, 1.0))
                         signal_probs = np.array([[1.0 - p_after_indicator, p_after_indicator]], dtype=float)
-                        logger.info(f"[BLEND] gated: p_model={p_model:.3f} indicator={indicator_norm:.3f} "
-                                    f"→ p_after_indicator={p_after_indicator:.3f} (Δ={delta:+.3f}, cap={cap:.3f})")
+                        logger.debug("[BLEND] gated: p_model=%.3f indicator=%.3f → p_after_indicator=%.3f (Δ=%+.3f, cap=%.3f)",p_model, indicator_norm, p_after_indicator, delta, cap)
                     else:
-                        log_every("blend-skip", 10, logger.info,
-                                  f"[BLEND] skipped: margin={margin:.3f} agree={agree} p_model={p_model:.3f} indicator={indicator_norm:.3f}")
+                      log_every("blend-skip",10,logger.debug,"[BLEND] skipped: margin=%.3f agree=%s p_model=%.3f indicator=%.3f",margin, agree, p_model, indicator_norm)
+                                              
+
                 except Exception as e:
                     logger.warning(f"Indicator modulation failed: {e}")
 
-            # Pattern adjustment
+
+
+            # Pattern adjustment (adaptive, neutral-aware and conflict-aware)
             p_after_pattern = float(signal_probs[0][1])
             try:
                 if pattern_prob_adjustment is not None:
                     adj_in = float(pattern_prob_adjustment)
-                    strong_cons = (mtf_consensus is not None) and (abs(float(mtf_consensus)) >= 0.60)
-                    ind_abs = abs(float(indicator_score)) if indicator_score is not None else 0.0
-                    adj = float(np.clip(adj_in, -0.10 if strong_cons else -0.08, 0.10 if strong_cons else 0.08))
                     p_cur = float(signal_probs[0][1])
-                    cap = 0.02 if (ind_abs < 0.25 and not strong_cons) else (0.10 if strong_cons else 0.08)
-                    if abs(adj) > cap:
-                        log_every("pattern-cap", 10, logger.info,
-                                  f"[PATTERN] weak-indicator cap applied: {adj:+.3f} → {np.sign(adj)*cap:+.3f}")
+
+                    ind = float(indicator_score) if indicator_score is not None else 0.0
+                    ind_abs = abs(ind)
+                    strong_cons = (mtf_consensus is not None) and (abs(float(mtf_consensus)) >= 0.60)
+                    sign_pat = np.sign(adj_in)
+                    sign_ind = np.sign(ind)
+                    sign_mtf = np.sign(float(mtf_consensus)) if (mtf_consensus is not None) else 0.0
+
+                    base_cap = 0.10 if strong_cons else 0.08
+
+                    # Neutral-aware shrink
+                    neu = float(engineered_features[engineered_feature_names.index("neutral_prob")] if "neutral_prob" in engineered_feature_names else 0.5)
+                    def _smoothstep(x, x0=0.55, x1=0.90):
+                        if x <= x0: return 0.0
+                        if x >= x1: return 1.0
+                        t = (x - x0) / max(1e-9, (x1 - x0))
+                        return t * t * (3 - 2 * t)
+                    s_neu = _smoothstep(neu, 0.55, 0.90)
+                    cap_ctx = base_cap * (1.0 - 0.65 * s_neu)  # up to -65% at high neutral
+
+                    # Conflict-aware shrink (unless strong consensus)
+                    conflict = ((sign_pat != 0) and ((sign_ind != 0 and sign_pat != sign_ind) or
+                                                    (sign_mtf != 0 and sign_pat != sign_mtf)))
+                    if conflict and not strong_cons:
+                        cap_ctx *= 0.5
+
+                    # Weak-indicator shrink (keep original behavior)
+                    if (ind_abs < 0.25) and not strong_cons:
+                        cap_ctx = min(cap_ctx, 0.02)
+
+                    # Clip incoming adjustment to base safety, then to context cap
+                    adj = float(np.clip(adj_in, -base_cap, base_cap))
+                    
+                    
+                    if abs(adj) > cap_ctx:
+        
+                        log_every("pattern-cap2",10,logger.debug,"[PATTERN] ctx-cap applied: %+.3f → %+.3f (neu=%.3f, ind_abs=%.3f, strong_cons=%s)",adj,float(np.sign(adj) * cap_ctx),neu,ind_abs,strong_cons,)                        
+
+                        
+                        
+                        adj = float(np.sign(adj) * cap_ctx)
+
+                    # Flip rule: block flips in high-neutral contexts unless consensus is strong and aligned
                     would_flip = ((p_cur - 0.5) * ((p_cur + adj) - 0.5)) < 0
-                    if would_flip and (ind_abs < 0.30) and (not strong_cons):
+                    aligned_consensus = (strong_cons and
+                                        (sign_mtf == np.sign(p_cur - 0.5)) and
+                                        (sign_ind == np.sign(p_cur - 0.5)))
+                    if would_flip and (neu >= 0.70) and (not aligned_consensus):
                         room = max(1e-3, abs(p_cur - 0.5) - 1e-3)
                         adj = float(np.sign(adj) * min(abs(adj), room))
-                        logger.info(f"[PATTERN] flip-prevent near 0.5 (weak ctx): adj→{adj:+.3f} (p_cur={p_cur:.3f})")
+                           
+                        logger.debug("[PATTERN] flip blocked by high-neutral ctx: adj→%+.3f (p_cur=%.3f, neu=%.3f, strong_cons=%s)",adj, p_cur, neu, strong_cons)
+                                          
+                                          
+
                     p_after_pattern = float(np.clip(p_cur + adj, 0.0, 1.0))
                     signal_probs = np.array([[1.0 - p_after_pattern, p_after_pattern]], dtype=float)
-                    logger.info(f"[PATTERN] adj_in={adj_in:+.3f} → adj={adj:+.3f} | p: {p_cur:.3f} → {p_after_pattern:.3f}")
+                     
+                    logger.debug("[PATTERN] adj_in=%+.3f → adj=%+.3f | p: %.3f → %.3f",adj_in, adj, p_cur, p_after_pattern)
+                                  
             except Exception as e:
                 logger.warning(f"Pattern adjustment failed: {e}")
 
+
+
             # Final log
-            logger.info(f"[PRED] p_model={p_model:.3f} p_after_indicator={p_after_indicator:.3f} "
-                        f"p_after_pattern={p_after_pattern:.3f} neutral_prob={neutral_prob if neutral_prob is not None else 'na'} "
-                        f"schema_n={self.feature_schema_size}")
+            logger.debug("[PRED] p_model=%.3f p_after_indicator=%.3f p_after_pattern=%.3f neutral_prob=%s schema_n=%s",
+                p_model,
+                p_after_indicator,
+                p_after_pattern,
+                str(neutral_prob) if neutral_prob is not None else "na",
+                str(self.feature_schema_size),
+            )
+       
+                   
             return signal_probs, neutral_prob
         except Exception as e:
             logger.error(f"Prediction pipeline failed: {e}", exc_info=True)

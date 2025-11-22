@@ -560,29 +560,63 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                         mtf_consensus=float(mtf.get("mtf_consensus", 0.0)) if mtf else 0.0,
                     )
                     buy_prob = float(signal_probs[0][1])
-
+                    
+                    
                     # Diagnostics Q and qmin (for optional UI suggestion)
                     model_sign = 1.0 if (buy_prob - 0.5) > 0 else (-1.0 if (buy_prob - 0.5) < 0 else 0.0)
                     ind_sign = np.sign(float(indicator_score)) if indicator_score is not None else 0.0
                     mtf_sign = np.sign(float(mtf.get("mtf_consensus", 0.0))) if mtf else 0.0
+
                     agree = 0
                     if model_sign != 0 and ind_sign == model_sign:
                         agree += 1
                     if model_sign != 0 and mtf_sign == model_sign:
                         agree += 1
+
+                    # A is a simple consensus scaling factor in [1/3, 1]
                     A = (1 + agree) / 3.0
                     Q_val = abs(buy_prob - 0.5) * A
+
+                    # Base threshold; comes from cfg.qmin if present, else default 0.11
                     qmin_base = float(getattr(cfg, "qmin", 0.11)) if hasattr(cfg, "qmin") else 0.11
+
+                    # Neutral-aware adjustment to qmin: increase in high-neutral, relax slightly in low-neutral
                     q_adj = 0.0
                     if neutral_prob is not None:
                         if neutral_prob >= 0.70:
                             q_adj += 0.02
                         elif neutral_prob <= 0.35:
                             q_adj -= 0.01
+
                     qmin_eff = float(np.clip(qmin_base + q_adj, 0.06, 0.20))
 
                     # Emit signal for next candle (decision=USER)
-                    suggest_tradeable = bool(Q_val >= qmin_eff) if bool(getattr(cfg, "suggest_tradeable_from_Q", True)) else None
+                    suggest_tradeable = (
+                        bool(Q_val >= qmin_eff)
+                        if bool(getattr(cfg, "suggest_tradeable_from_Q", True))
+                        else None
+                    )
+
+                    # --- NEW: hard neutral veto on tradeable suggestion ---
+                    # High neutral_prob → no trade; medium neutral → only allow if margin is strong.
+                    if neutral_prob is not None:
+                        try:
+                            neu = float(neutral_prob)
+                        except Exception:
+                            neu = None
+                        if neu is not None:
+                            if neu >= 0.60:
+                                suggest_tradeable = False
+                            elif neu >= 0.50 and suggest_tradeable:
+                                if abs(buy_prob - 0.5) < 0.20:
+                                    suggest_tradeable = False
+
+                    # Final tradeable flag stored for training/calibration.
+                    # If suggest_tradeable is None (gating disabled), default to True
+                    # to preserve previous behaviour.
+                    tradeable_flag = bool(suggest_tradeable) if (suggest_tradeable is not None) else True
+
+                    # Build signal record for next candle
                     sig = {
                         "pred_for": next_candle_start.isoformat(),
                         "decision": "USER",
@@ -596,15 +630,21 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                         "Q": float(Q_val),
                         "qmin_eff": float(qmin_eff),
                         "regime": "na",
-                        "suggest_tradeable": suggest_tradeable
+                        "suggest_tradeable": suggest_tradeable,
                     }
+
                     spath = getattr(cfg, "signals_path", "logs/signals.jsonl")
                     Path(Path(spath).parent).mkdir(parents=True, exist_ok=True)
                     with open(spath, "a", encoding="utf-8") as f:
                         f.write(json.dumps(sig) + "\n")
-                    logger.info(f"[{name}] Probabilities: BUY={buy_prob*100:.1f}% | SELL={(1.0-buy_prob)*100:.1f}% (no auto-decision)")
-                    logger.info(f"[{name}] [SIGNAL] Wrote signal for {next_candle_start.strftime('%H:%M:%S')} "
-                                f"(Q={Q_val:.3f} vs qmin={qmin_eff:.3f}, suggest_tradeable={suggest_tradeable}) → {spath}")
+
+                    logger.info(
+                        f"[{name}] Probabilities: BUY={buy_prob*100:.1f}% | SELL={(1.0-buy_prob)*100:.1f}% (no auto-decision)"
+                    )
+                    logger.info(
+                        f"[{name}] [SIGNAL] Wrote signal for {next_candle_start.strftime('%H:%M:%S')} "
+                        f"(Q={Q_val:.3f} vs qmin={qmin_eff:.3f}, suggest_tradeable={suggest_tradeable}) → {spath}"
+                    )
 
                     # Stage features/training info for candle-close logger
                     features_for_log = dict(features)
@@ -614,12 +654,14 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                         features_for_log["meta_p_xgb_raw"] = float(p_raw)
                     if p_cal is not None:
                         features_for_log["meta_p_xgb_calib"] = float(p_cal)
+
                     staged_map[next_candle_start] = {
                         "features": features_for_log,
                         "buy_prob": float(buy_prob),
                         "alpha": 0.0,  # reference only
-                        "tradeable": True
+                        "tradeable": tradeable_flag,
                     }
+                    
                 except Exception as e:
                     logger.error(f"[{name}] on_preclose error: {e}", exc_info=True)
 

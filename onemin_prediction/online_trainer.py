@@ -236,9 +236,19 @@ async def background_trainer_loop(
 
             dir_ds, neu_ds, feat_cols = _build_datasets(df)
 
-            # Gate XGB training/hot-reload
-            min_dir_rows = 500
-            min_minor_share = 0.30
+
+            # Gate XGB training/hot-reload (env-configurable)
+            try:
+                min_dir_rows = int(os.getenv("TRAIN_MIN_DIR_ROWS", "240"))
+            except Exception:
+                min_dir_rows = 240
+            try:
+                min_minor_share = float(os.getenv("TRAIN_MIN_MINOR_SHARE", "0.30"))
+            except Exception:
+                min_minor_share = 0.30
+
+
+            
             dir_ok = False
             dir_stats = "n/a"
             if dir_ds is not None:
