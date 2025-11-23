@@ -22,7 +22,7 @@ MAIN_SCRIPT="run_main.py"
 SIDECAR_SCRIPT="futures_vwap_cvd_sidecar.py"
 LOG_DIR="logs"
 MAIN_LOG="${LOG_DIR}/run_main.log"
-SIDECAR_LOG="${LOG_DIR}/fut_vwap_cvd_sidecar.out"
+SIDECAR_LOG="${LOG_DIR}/fut_vwap_cvd_sidecar.log"
 
 # Sidecar control (we still recommend running it, but you can disable via env)
 ENABLE_SIDECAR="${ENABLE_SIDECAR:-1}"
@@ -79,7 +79,7 @@ fi
 if [[ "${ENABLE_SIDECAR}" == "1" ]]; then
   echo "[$(date +'%F %T')] Starting VWAP+CVD sidecar..." >&2
   # Append stdout+stderr to sidecar log
-  #   python futures_vwap_cvd_sidecar.py >> logs/fut_vwap_cvd_sidecar.out
+  #   python futures_vwap_cvd_sidecar.py >> logs/fut_vwap_cvd_sidecar.log
   "${PYTHON_BIN}" "${SIDECAR_SCRIPT}" >> "${SIDECAR_LOG}" 2>&1 &
   SIDECAR_PID=$!
   echo "[$(date +'%F %T')] VWAP+CVD sidecar PID=${SIDECAR_PID}" >&2

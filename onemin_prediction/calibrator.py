@@ -63,7 +63,7 @@ async def background_calibrator_loop(
 
 
             mtime_daily = os.path.getmtime(feature_log_path)
-            hist_path = os.getenv("FEATURE_LOG_HIST", "feature_log_hist.csv")
+            hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
             mtime_hist = os.path.getmtime(hist_path) if os.path.exists(hist_path) else 0.0
             mtime_combined = max(mtime_daily, mtime_hist)
             if last_mtime is not None and mtime_combined <= last_mtime:
@@ -73,7 +73,7 @@ async def background_calibrator_loop(
 
 
 
-            hist_path = os.getenv("FEATURE_LOG_HIST", "feature_log_hist.csv")
+            hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
             try:
                 from online_trainer import _parse_feature_csv
                 df_daily = _parse_feature_csv(feature_log_path, min_rows=0)

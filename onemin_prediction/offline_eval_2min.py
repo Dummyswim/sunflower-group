@@ -28,7 +28,10 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from offline_train_2min import fetch_intraday_range, build_2min_dataset
+
+from offline_train_2min import fetch_intraday_range, build_2min_dataset, _parse_train_datetime
+
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -155,21 +158,30 @@ def _bin_accuracy(y_true: np.ndarray, p_buy: np.ndarray, bins, label: str = "buy
 
 
 def main():
-    # ----- Config from env -----
-    eval_start = os.getenv("EVAL_START_DATE", "").strip()
-    eval_end = os.getenv("EVAL_END_DATE", "").strip()
-    xgb_path = os.getenv("XGB_PATH", "").strip()
+    # ----- Config from env -----    
+
+    eval_start = os.getenv("EVAL_START_DATE", "").strip() or os.getenv("TRAIN_START_DATE", "").strip()
+    eval_end = os.getenv("EVAL_END_DATE", "").strip() or os.getenv("TRAIN_END_DATE", "").strip()
 
     if not eval_start or not eval_end:
-        logger.error("EVAL_START_DATE and EVAL_END_DATE must be set (YYYY-MM-DD).")
+        logger.error(
+            "EVAL_START_DATE/EVAL_END_DATE (or TRAIN_START_DATE/TRAIN_END_DATE) "
+            "must be set (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')."
+        )
         return
 
+
+    xgb_path = os.getenv("XGB_PATH", "").strip()
+
+
     try:
-        start_date = pd.to_datetime(eval_start).date()
-        end_date = pd.to_datetime(eval_end).date()
+        # Reuse the same parser as offline_train_2min; time part is ignored.
+        start_date = _parse_train_datetime(eval_start)
+        end_date = _parse_train_datetime(eval_end)
     except Exception as e:
         logger.error("Invalid EVAL_START_DATE/EVAL_END_DATE: %s", e)
         return
+    
     if end_date < start_date:
         logger.error("EVAL_END_DATE must be >= EVAL_START_DATE.")
         return

@@ -7,7 +7,7 @@ import pandas as pd
 
 def main():
     # Inputs
-    feature_log_path = os.getenv("FEATURE_LOG", "feature_log.csv")
+    feature_log_path = os.getenv("FEATURE_LOG", "trained_models/production/feature_log.csv")
     xgb_out_path = os.getenv(
         "XGB_PATH",
         "/home/hanumanth/Documents/sunflower-group_2/onemin_prediction/trained_models/production/xgb.json"

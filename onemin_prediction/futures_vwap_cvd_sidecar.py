@@ -85,8 +85,8 @@ class SidecarConfig:
     price_sanity_max: float = 200000.0
     candle_interval_seconds: int = 60
     max_tick_buffer: int = 10000
-    out_path_ticks: str = "logs/fut_ticks_vwap_cvd.csv"
-    out_path_candles: str = "logs/fut_candles_vwap_cvd.csv"
+    out_path_ticks: str = "trained_models/production/fut_ticks_vwap_cvd.csv"
+    out_path_candles: str = "trained_models/production/fut_candles_vwap_cvd.csv"
 
     def validate(self) -> None:
         """

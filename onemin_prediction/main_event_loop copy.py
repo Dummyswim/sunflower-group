@@ -264,6 +264,7 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
             for name, cfg in config.connections.items():
                 connections.append((str(name), cfg))
         elif hasattr(config, "connections") and hasattr(config, "__iter__"):
+            # Basic iterable support
             for i, cfg in enumerate(config.connections, start=1):
                 sec = getattr(cfg, "nifty_security_id", getattr(cfg, "security_id", "NA"))
                 seg = getattr(cfg, "nifty_exchange_segment", getattr(cfg, "exchange_segment", "NA"))
@@ -280,6 +281,7 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
     # Shared components
     feat_pipe = FeaturePipeline(train_features=train_features)
     model_pipe = create_default_pipeline(cnn_lstm, xgb, neutral_model=neutral_model)
+    # Align schema to the booster right away (prevents schema drift)
     try:
         model_pipe.replace_models(xgb=xgb)
         logger.info("Pipeline schema aligned to booster at startup (if embedded)")
@@ -295,7 +297,7 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
     trainer_task = None
     try:
         from online_trainer import background_trainer_loop
-        xgb_out = os.getenv("XGB_PATH", "trained_models/production/xgb_model.json")
+        xgb_out = os.getenv("XGB_PATH", "trained_models/production/production/xgb_model.json")
         neutral_out = os.getenv("NEUTRAL_PATH", "trained_models/production/neutral_model.pkl")
         Path(Path(xgb_out).parent or ".").mkdir(parents=True, exist_ok=True)
         Path(Path(neutral_out).parent or ".").mkdir(parents=True, exist_ok=True)
@@ -380,9 +382,11 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
         try:
             ws_handler = WSHandler(cfg)
 
-            ob_ring = deque(maxlen=10)
-            staged_map: Dict[datetime, Dict[str, Any]] = {}   # features staged per reference candle start (2-min horizon)
+            # Per-connection state
+            ob_ring = deque(maxlen=10)                        # order book snapshots (for spread calc)
+            staged_map: Dict[datetime, Dict[str, Any]] = {}   # features staged per next candle start
 
+            # on_tick: capture a lightweight OB snapshot for spread calc and any UI needs
             async def _on_tick_cb(tick: Dict[str, Any]):
                 try:
                     best_px, mid_px = _extract_best_and_mid_from_tick(tick)
@@ -394,23 +398,16 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                 except Exception as e:
                     logger.debug(f"[{name}] on_tick callback error (ignored): {e}")
 
-            # ---------- PRE-CLOSE: STAGE FEATURES AT CURRENT CANDLE START (2-MIN HORIZON) ----------
+            # on_preclose: predict ONCE per bucket (handled by ws_handler guard)
             async def _on_preclose_cb(preview_df: pd.DataFrame, full_df: pd.DataFrame):
                 try:
+                    # Determine current bucket start and next candle start
                     if preview_df is None or preview_df.empty:
                         return
-
-                    # Current bucket start time t (candle being closed now)
                     current_bucket_start = preview_df.index[-1]
-
                     interval_sec = int(getattr(cfg, 'candle_interval_seconds', 60))
                     interval_min = max(1, interval_sec // 60)
-                    horizon_min = 2 * interval_min  # 2-minute target horizon
-
-                    # Reference time for label & training row
-                    ref_start = current_bucket_start
-                    # Target close candle start (for logging only)
-                    target_start = current_bucket_start + timedelta(minutes=horizon_min)
+                    next_candle_start = current_bucket_start + timedelta(minutes=interval_min)
 
                     # Gather prices for TA/indicator scaling
                     try:
@@ -420,8 +417,9 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                     if not prices or len(prices) < 2:
                         return
 
-                    # TA/EMA
+                    # Compute TA/EMA
                     ema_feats = FeaturePipeline.compute_emas(prices)
+                    ta = {}
                     try:
                         ta = TA.compute_ta_bundle(prices)
                     except Exception:
@@ -458,10 +456,12 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                         order_books = []
                     ofd = FeaturePipeline.order_flow_dynamics(order_books)
 
+                    # Micro features
                     try:
                         micro_ctx = ws_handler.get_micro_features()
                         px_arr = np.asarray(prices[-64:], dtype=float)
                         last_px = float(px_arr[-1]) if px_arr.size else 0.0
+                        # Normalize micro_slope by realized short vol to keep it scale-safe
                         try:
                             vol_short = float(micro_ctx.get('std_dltp_short', 0.0))
                             denom = max(1e-6, vol_short)
@@ -474,6 +474,7 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                         micro_ctx = {}
                         micro_slope_normed = 0.0
 
+                    # Indicator score (context only)
                     indicator_features = {
                         'ema_trend': 1.0 if float(ema_feats.get('ema_8', 0.0)) > float(ema_feats.get('ema_21', 0.0))
                                      else (-1.0 if float(ema_feats.get('ema_8', 0.0)) < float(ema_feats.get('ema_21', 0.0)) else 0.0),
@@ -497,7 +498,7 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                     except Exception:
                         scale = 1.0
 
-                    # last_zscore
+                    # Feature map
                     try:
                         last_zscore = 0.0
                         if len(prices) >= 2:
@@ -547,7 +548,7 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                     except Exception:
                         live_tensor = np.zeros((1, 64, 1), dtype=float)
 
-                    # Predict
+                    # Predict (probabilities only)
                     feat_keys_sorted = sorted(features.keys())
                     engineered_features = [features[k] for k in feat_keys_sorted]
                     signal_probs, neutral_prob = model_pipe.predict(
@@ -559,8 +560,9 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                         mtf_consensus=float(mtf.get("mtf_consensus", 0.0)) if mtf else 0.0,
                     )
                     buy_prob = float(signal_probs[0][1])
-
-                    # Diagnostics for Q
+                    
+                    
+                    # Diagnostics Q and qmin (for optional UI suggestion)
                     model_sign = 1.0 if (buy_prob - 0.5) > 0 else (-1.0 if (buy_prob - 0.5) < 0 else 0.0)
                     ind_sign = np.sign(float(indicator_score)) if indicator_score is not None else 0.0
                     mtf_sign = np.sign(float(mtf.get("mtf_consensus", 0.0))) if mtf else 0.0
@@ -571,11 +573,14 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                     if model_sign != 0 and mtf_sign == model_sign:
                         agree += 1
 
+                    # A is a simple consensus scaling factor in [1/3, 1]
                     A = (1 + agree) / 3.0
                     Q_val = abs(buy_prob - 0.5) * A
 
+                    # Base threshold; comes from cfg.qmin if present, else default 0.11
                     qmin_base = float(getattr(cfg, "qmin", 0.11)) if hasattr(cfg, "qmin") else 0.11
 
+                    # Neutral-aware adjustment to qmin: increase in high-neutral, relax slightly in low-neutral
                     q_adj = 0.0
                     if neutral_prob is not None:
                         if neutral_prob >= 0.70:
@@ -585,13 +590,15 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
 
                     qmin_eff = float(np.clip(qmin_base + q_adj, 0.06, 0.20))
 
+                    # Emit signal for next candle (decision=USER)
                     suggest_tradeable = (
                         bool(Q_val >= qmin_eff)
                         if bool(getattr(cfg, "suggest_tradeable_from_Q", True))
                         else None
                     )
 
-                    # Neutral veto on suggestion
+                    # --- NEW: hard neutral veto on tradeable suggestion ---
+                    # High neutral_prob → no trade; medium neutral → only allow if margin is strong.
                     if neutral_prob is not None:
                         try:
                             neu = float(neutral_prob)
@@ -604,11 +611,14 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                                 if abs(buy_prob - 0.5) < 0.20:
                                     suggest_tradeable = False
 
+                    # Final tradeable flag stored for training/calibration.
+                    # If suggest_tradeable is None (gating disabled), default to True
+                    # to preserve previous behaviour.
                     tradeable_flag = bool(suggest_tradeable) if (suggest_tradeable is not None) else True
 
-                    # Signal record: prediction for close at t+2*interval
+                    # Build signal record for next candle
                     sig = {
-                        "pred_for": target_start.isoformat(), # where target_start = t + 2*interval
+                        "pred_for": next_candle_start.isoformat(),
                         "decision": "USER",
                         "buy_prob": float(buy_prob),
                         "sell_prob": float(1.0 - buy_prob),
@@ -623,21 +633,20 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                         "suggest_tradeable": suggest_tradeable,
                     }
 
-                    spath = getattr(cfg, "signals_path", "trained_models/production/signals.jsonl")
+                    spath = getattr(cfg, "signals_path", "logs/signals.jsonl")
                     Path(Path(spath).parent).mkdir(parents=True, exist_ok=True)
                     with open(spath, "a", encoding="utf-8") as f:
                         f.write(json.dumps(sig) + "\n")
 
                     logger.info(
-                        f"[{name}] Probabilities (2-min): BUY={buy_prob*100:.1f}% | SELL={(1.0-buy_prob)*100:.1f}% (no auto-decision)"
+                        f"[{name}] Probabilities: BUY={buy_prob*100:.1f}% | SELL={(1.0-buy_prob)*100:.1f}% (no auto-decision)"
                     )
                     logger.info(
-                        f"[{name}] [SIGNAL] 2-min horizon: start={current_bucket_start.strftime('%H:%M:%S')} "
-                        f"target={target_start.strftime('%H:%M:%S')} "
+                        f"[{name}] [SIGNAL] Wrote signal for {next_candle_start.strftime('%H:%M:%S')} "
                         f"(Q={Q_val:.3f} vs qmin={qmin_eff:.3f}, suggest_tradeable={suggest_tradeable}) → {spath}"
                     )
 
-                    # Stage features for training when t+2 candle closes
+                    # Stage features/training info for candle-close logger
                     features_for_log = dict(features)
                     p_raw = getattr(model_pipe, "last_p_xgb_raw", None)
                     p_cal = getattr(model_pipe, "last_p_xgb_calib", None)
@@ -646,107 +655,72 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                     if p_cal is not None:
                         features_for_log["meta_p_xgb_calib"] = float(p_cal)
 
-                    staged_map[ref_start] = {
+                    staged_map[next_candle_start] = {
                         "features": features_for_log,
                         "buy_prob": float(buy_prob),
-                        "alpha": 0.0,
+                        "alpha": 0.0,  # reference only
                         "tradeable": tradeable_flag,
                     }
-
+                    
                 except Exception as e:
                     logger.error(f"[{name}] on_preclose error: {e}", exc_info=True)
 
-            # ---------- CANDLE CLOSE: 2-MIN LABEL (close_{t+2} vs close_t) ----------
+            # on_candle: label last candle and log one row for training
             async def _on_candle_cb(candle_df: pd.DataFrame, full_df: pd.DataFrame):
                 try:
-                    if not isinstance(candle_df, pd.DataFrame) or candle_df.empty:
+                    idx_ts = candle_df.index[-1] if (isinstance(candle_df, pd.DataFrame) and not candle_df.empty) else None
+                    if idx_ts is None:
                         return
-
-                    idx_ts = candle_df.index[-1]
-                    row_t2 = candle_df.iloc[-1]
-
+                    row = candle_df.iloc[-1]
                     logger.info(
                         f"[{name}] Candle closed at {idx_ts.strftime('%H:%M:%S')} | "
-                        f"O:{float(row_t2.get('open', 0.0)):.2f} "
-                        f"H:{float(row_t2.get('high', 0.0)):.2f} "
-                        f"L:{float(row_t2.get('low', 0.0)):.2f} "
-                        f"C:{float(row_t2.get('close', 0.0)):.2f} "
-                        f"Vol:{int(row_t2.get('volume', 0)):,} "
-                        f"Ticks:{int(row_t2.get('tick_count', 0))}"
+                        f"O:{float(row.get('open', 0.0)):.2f} "
+                        f"H:{float(row.get('high', 0.0)):.2f} "
+                        f"L:{float(row.get('low', 0.0)):.2f} "
+                        f"C:{float(row.get('close', 0.0)):.2f} "
+                        f"Vol:{int(row.get('volume', 0)):,} "
+                        f"Ticks:{int(row.get('tick_count', 0))}"
                     )
-
-                    # 2-minute horizon: label time t using close at t and close at t+2*interval
-                    interval_sec = int(getattr(cfg, 'candle_interval_seconds', 60))
-                    interval_min = max(1, interval_sec // 60)
-                    horizon_min = 2 * interval_min
-
-                    ref_ts = idx_ts - timedelta(minutes=horizon_min)
-
-                    if not isinstance(full_df, pd.DataFrame) or full_df.empty or ref_ts not in full_df.index:
-                        logger.info(
-                            f"[{name}] [TRAIN] Skipping 2-min label for {idx_ts.strftime('%H:%M:%S')} "
-                            f"(missing reference candle at {ref_ts.strftime('%H:%M:%S')})"
-                        )
-                        return
-
-                    ref_row = full_df.loc[ref_ts]
-
-                    ref_close = float(ref_row.get('close', 0.0))
-                    tgt_close = float(row_t2.get('close', 0.0))
-                    if not (np.isfinite(ref_close) and np.isfinite(tgt_close)) or ref_close <= 0.0:
-                        logger.info(
-                            f"[{name}] [TRAIN] Skipping 2-min label for {idx_ts.strftime('%H:%M:%S')} "
-                            f"(invalid closes: ref={ref_close}, tgt={tgt_close})"
-                        )
-                        return
-
-
-                    move = tgt_close - ref_close
-
-                    # Simple fixed-percentage tolerance (match offline_train_2min.build_2min_dataset)
-                    # tol_pts = flat_tolerance_pct * close_t
-                    base_tol_pct = float(getattr(cfg, 'flat_tolerance_pct', 0.00010))
-                    tol_pts = float(base_tol_pct * ref_close)
-
+                    # Compute label with dynamic flat tolerance
+                    o = float(row.get('open', 0.0)); c = float(row.get('close', 0.0))
+                    move = c - o
+                    base_tol = float(getattr(cfg, 'flat_tolerance_pct', 0.0002))
+                    price_denom = max(1e-6, o)
+                    rng_points = float(row.get('high', o)) - float(row.get('low', o))
+                    rng_pct = rng_points / price_denom
+                    try:
+                        closes = full_df['close'].astype(float).tail(20).values if hasattr(full_df, 'columns') else []
+                        vol_pct = (np.std(np.diff(closes)) / price_denom) if len(closes) >= 3 else 0.0
+                    except Exception:
+                        vol_pct = 0.0
+                    k_range = float(getattr(cfg, 'flat_dyn_k_range', 0.20))
+                    min_pts = float(getattr(cfg, 'flat_min_points', 0.20))
+                    dyn_raw = (k_range * rng_pct) + (0.50 * vol_pct)
+                    dyn_tol = max(0.5 * base_tol, min(base_tol, dyn_raw))
+                    tol_pts = max(min_pts, dyn_tol * price_denom)
+                    tol_cap_pts = float(getattr(cfg, 'flat_tolerance_max_pts', 6.00))
+                    tol_pts = min(tol_pts, tol_cap_pts) if tol_cap_pts > 0 else tol_pts
                     is_flat = abs(move) <= tol_pts
-                    label = "FLAT" if is_flat else ("BUY" if tgt_close > ref_close else "SELL")
+                    label = "FLAT" if is_flat else ("BUY" if c > o else "SELL")
 
-
-                    # Retrieve staged features for the reference time t
-                    staged = staged_map.pop(ref_ts, None)
+                    staged = staged_map.pop(idx_ts, None)
                     buy_prob = float((staged or {}).get("buy_prob", 0.5))
                     alpha = float((staged or {}).get("alpha", 0.0))
                     tradeable = bool((staged or {}).get("tradeable", True))
                     features_for_log = dict((staged or {}).get("features", {}))
 
-                    # Write training row timestamped at ref_ts (start of 2-min horizon)
-
                     cols = [
-                        idx_ts.isoformat(),  # use target close time so it matches signals.pred_for
-                        "USER",
-                        label,
-                        f"{buy_prob:.6f}",
-                        f"{alpha:.6f}",
-                        str(tradeable),
-                        str(is_flat),
-                        str(int(row_t2.get('tick_count', 0)))
+                        idx_ts.isoformat(), "USER", label, f"{buy_prob:.6f}", f"{alpha:.6f}",
+                        str(tradeable), str(is_flat), str(int(row.get('tick_count', 0)))
                     ]
-
-                    
                     for k in sorted(features_for_log.keys()):
                         try:
                             cols.append(f"{k}={float(features_for_log[k]):.8f}")
                         except Exception:
                             continue
-
                     with open(feature_log_path, "a", encoding="utf-8") as f:
                         f.write(",".join(cols) + "\n")
-
-                    logger.info(
-                        f"[{name}] [TRAIN] Logged 2-min features for ref={ref_ts.strftime('%H:%M:%S')} "
-                        f"-> tgt={idx_ts.strftime('%H:%M:%S')} label={label} tradeable={tradeable}"
-                    )
-
+                    logger.info(f"[{name}] [TRAIN] Logged features for {idx_ts.strftime('%H:%M:%S')} label={label} tradeable={tradeable}")
                 except Exception as e:
                     logger.error(f"[{name}] on_candle callback error: {e}", exc_info=True)
 
@@ -777,11 +751,16 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
             pass
         return
 
+
+
+
+
     # Keep main alive until session guard requests stop
     stop_main_event = asyncio.Event()
 
     async def _session_guard():
         try:
+            # Compute today's cutoff times in IST
             def _today_ist(h, m):
                 now = datetime.now(IST)
                 return now.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -789,24 +768,25 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
             roll_ts = _today_ist(15, 10)
             exit_ts = _today_ist(15, 15)
 
+            # If running past cutoff (testing), schedule for next day
             now = datetime.now(IST)
             if now > exit_ts:
                 roll_ts = roll_ts + timedelta(days=1)
                 exit_ts = exit_ts + timedelta(days=1)
 
+            # Sleep until 15:10, then roll logs
             await asyncio.sleep(max(0.0, (roll_ts - datetime.now(IST)).total_seconds()))
             try:
-                hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
-                
                 _roll_feature_logs(
                     daily_path=getattr(config, 'feature_log_path', 'feature_log.csv'),
-                    hist_path=hist_path,
+                    hist_path="trained_models/production/feature_log_hist.csv",
                     cap_rows=2000
                 )
                 logger.info("[EOD] Rolled daily feature log into historical and capped to 2000 rows")
             except Exception as e:
                 logger.warning(f"[EOD] Roll failed: {e}")
 
+            # Sleep until 15:15, then request stop
             await asyncio.sleep(max(0.0, (exit_ts - datetime.now(IST)).total_seconds()))
             logger.info("[EOD] Session end reached (15:15 IST). Requesting shutdown.")
             stop_main_event.set()
@@ -815,6 +795,7 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
         except Exception as e:
             logger.warning(f"[EOD] Session guard error: {e}")
 
+    # Helper to roll logs with de-dup and capping
     def _roll_feature_logs(daily_path: str, hist_path: str, cap_rows: int = 2000) -> None:
         try:
             daily_lines = []
@@ -826,6 +807,7 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                 with open(hist_path, "r", encoding="utf-8") as f:
                     hist_lines = [ln.strip() for ln in f if ln.strip()]
 
+            # Merge and de-duplicate by timestamp (first CSV column)
             seen = set()
             merged = []
             for ln in hist_lines + daily_lines:
@@ -834,6 +816,7 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
                     seen.add(ts)
                     merged.append(ln)
 
+            # Keep only the last cap_rows rows
             if cap_rows > 0 and len(merged) > cap_rows:
                 merged = merged[-cap_rows:]
 
@@ -842,6 +825,7 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
         except Exception as e:
             raise e
 
+    # Start session guard
     session_task = asyncio.create_task(_session_guard())
 
     try:
@@ -852,43 +836,55 @@ async def main_loop(config, cnn_lstm, xgb, train_features, token_b64, chat_id, n
     except Exception as e:
         logger.error(f"Fatal error in main_loop: {e}", exc_info=True)
     finally:
-        logger.info("Shutting down main loop")
 
+        logger.info("Shutting down main loop")
+        # Stop WS connections
         for name, _handler, _task in ws_tasks:
             try:
                 stop_events[name].set()
             except Exception:
                 pass
+            
 
         for name, _handler, ws_task in ws_tasks:
             ws_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(ws_task, timeout=5.0)
+                
+             
 
         for name, hb_task in hb_tasks:
             hb_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(hb_task, timeout=3.0)
 
+
         if trainer_task:
             trainer_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(trainer_task, timeout=5.0)
+
 
         if baseline_task:
             baseline_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(baseline_task, timeout=5.0)
 
+
         if calib_task:
             calib_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(calib_task, timeout=5.0)
 
+
+
+        # Stop session guard
         if session_task:
             session_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(session_task, timeout=5.0)
+
+
 
         logger.info("=" * 60)
         logger.info("MAIN EVENT LOOP SHUTDOWN COMPLETE")

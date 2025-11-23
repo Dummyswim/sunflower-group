@@ -1,15 +1,15 @@
 # run_main.py
 """
-Runner script for probabilities-only one-minute predictor.
-Emits p(BUY)/p(SELL) per minute; user decides what to trade.
+Runner script for probabilities-only 2-minute directional predictor.
+Emits p(BUY)/p(SELL) for a 2-minute horizon; user decides what to trade.
 """
+
 from types import SimpleNamespace
 import asyncio
 import base64
 import numpy as np
 import logging, os
 from main_event_loop import main_loop
-import shutil
 from collections import deque
 
 
@@ -43,7 +43,7 @@ config = SimpleNamespace(
     user_trade_control=True,
     emit_prob_only=True,                 # NEW: probabilities-only mode
     suggest_tradeable_from_Q=True,       # optional UI hint
-    signals_path="logs/signals.jsonl",
+    signals_path="trained_models/production/signals.jsonl",
 
     # Timekeeping
     use_arrival_time=True,
@@ -62,8 +62,9 @@ config = SimpleNamespace(
     data_stall_reconnect_seconds=30,
 
     # Feature logging
-    feature_log_path="feature_log.csv",
-
+    feature_log_path=os.getenv("FEATURE_LOG", "feature_log.csv"),
+    
+     
     # Pre-close
     preclose_lead_seconds=1,
     preclose_completion_buffer_sec=1,
@@ -304,7 +305,7 @@ if __name__ == "__main__":
 
     # Bootstrap daily feature log from historical when directional rows are below threshold
     try:
-        hist_path = os.getenv("FEATURE_LOG_HIST", "feature_log_hist.csv")
+        hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
         daily_path = config.feature_log_path
         dir_threshold = int(getattr(config, "calib_min_rows", 300))
         bootstrap_feature_log(hist_path, daily_path, dir_threshold=dir_threshold, tail_rows=2000)

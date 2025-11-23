@@ -55,7 +55,7 @@ DHAN_HIST_PATH = os.getenv("DHAN_HIST_PATH", "/v2/charts/intraday")
 NIFTY_SECURITY_ID = int(os.getenv("NIFTY_SECURITY_ID", "13"))
 NIFTY_EXCHANGE_SEGMENT = os.getenv("NIFTY_EXCHANGE_SEGMENT", "IDX_I")
 INTRADAY_RESOLUTION = os.getenv("INTRADAY_RESOLUTION", "1")  # 1-minute
-
+NIFTY_INSTRUMENT = os.getenv("NIFTY_INSTRUMENT", "INDEX")
 
 def _check_dhan_config() -> bool:
     ok = True
@@ -78,6 +78,8 @@ def fetch_intraday_for_day(dt: date) -> Optional[pd.DataFrame]:
         return None
 
     url = DHAN_HIST_BASE_URL + DHAN_HIST_PATH
+    
+    # print(start_dt.strftime("%Y-%m-%dT%H:%M:%S"), end_dt.strftime("%Y-%m-%dT%H:%M:%S"))
 
     # Construct from/to for the given date in IST. Adjust format if API expects epoch / different TZ.
     start_dt = datetime(dt.year, dt.month, dt.day, 9, 15)
@@ -91,65 +93,112 @@ def fetch_intraday_for_day(dt: date) -> Optional[pd.DataFrame]:
         "Content-Type": "application/json",
     }
 
+    
+    
     payload = {
-        # Adjust payload keys per Dhan docs. These are placeholders consistent with your WS config.
         "securityId": str(NIFTY_SECURITY_ID),
         "exchangeSegment": NIFTY_EXCHANGE_SEGMENT,
-        "from": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-        "to": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-        "resolution": INTRADAY_RESOLUTION,
+        "fromDate": start_dt.strftime("%Y-%m-%d %H:%M:%S"),  # <- changed
+        "toDate": end_dt.strftime("%Y-%m-%d %H:%M:%S"),      # <- changed
+        "interval": INTRADAY_RESOLUTION,
+        "instrument": NIFTY_INSTRUMENT,
     }
 
+    print(f"{payload}")
     try:
         logger.info("Fetching intraday for %s from %s", dt.isoformat(), url)
+        
+
+
         resp = requests.post(url, headers=headers, json=payload, timeout=20)
         if resp.status_code != 200:
+            try:
+                err = resp.json()
+            except Exception:
+                err = {}
+
+            if err.get("errorCode") == "DH-905":
+                logger.warning(
+                    "No intraday data for %s (DH-905: %s)",
+                    dt.isoformat(),
+                    err.get("errorMessage", "no data"),
+                )
+                return None
+
             logger.error("Dhan intraday API returned %s: %s", resp.status_code, resp.text[:200])
             return None
+
+        
+        
         data = resp.json()
     except Exception as e:
         logger.error("Dhan intraday request failed: %s", e)
         return None
 
-    # Parse response; adapt the key names based on actual API
-    records = data.get("data") or data.get("candles") or []
-    if not records:
-        logger.warning("No intraday records for %s", dt.isoformat())
-        return None
+
+
+    # Parse response according to Dhan intraday format:
+    # {
+    #   "open": [...],
+    #   "high": [...],
+    #   "low": [...],
+    #   "close": [...],
+    #   "volume": [...],
+    #   "timestamp": [...]
+    # }
 
     rows = []
-    for rec in records:
-        try:
-            # Example layout: ["timestamp", open, high, low, close, volume]
-            # or object with keys. Adjust to your actual schema.
-            if isinstance(rec, dict):
-                ts = pd.to_datetime(rec.get("timestamp"))
-                o = float(rec.get("open"))
-                h = float(rec.get("high"))
-                l = float(rec.get("low"))
-                c = float(rec.get("close"))
-                v = float(rec.get("volume", 0.0))
-            else:
-                # Assume list-like
-                ts = pd.to_datetime(rec[0])
-                o = float(rec[1])
-                h = float(rec[2])
-                l = float(rec[3])
-                c = float(rec[4])
-                v = float(rec[5]) if len(rec) > 5 else 0.0
 
-            if not np.isfinite(o + h + l + c):
+    # Case 1: old "data"/"candles" list format (keep backward compat)
+    records = data.get("data") or data.get("candles")
+    if isinstance(records, list) and records:
+        for rec in records:
+            try:
+                if isinstance(rec, dict):
+                    ts = pd.to_datetime(rec.get("timestamp"))
+                    o = float(rec.get("open"))
+                    h = float(rec.get("high"))
+                    l = float(rec.get("low"))
+                    c = float(rec.get("close"))
+                    v = float(rec.get("volume", 0.0))
+                else:
+                    ts = pd.to_datetime(rec[0])
+                    o = float(rec[1])
+                    h = float(rec[2])
+                    l = float(rec[3])
+                    c = float(rec[4])
+                    v = float(rec[5]) if len(rec) > 5 else 0.0
+
+                if not np.isfinite(o + h + l + c):
+                    continue
+                rows.append(
+                    {"timestamp": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
+                )
+            except Exception:
                 continue
-            rows.append({
-                "timestamp": ts,
-                "open": o,
-                "high": h,
-                "low": l,
-                "close": c,
-                "volume": v,
-            })
-        except Exception:
-            continue
+
+    # Case 2: Dhan OHLC arrays at root (your curl response)
+    elif all(k in data for k in ("open", "high", "low", "close", "timestamp")):
+        opens = data["open"]
+        highs = data["high"]
+        lows = data["low"]
+        closes = data["close"]
+        volumes = data.get("volume") or [0.0] * len(opens)
+        timestamps = data["timestamp"]
+
+        for ts, o, h, l, c, v in zip(timestamps, opens, highs, lows, closes, volumes):
+            try:
+                ts_parsed = pd.to_datetime(ts, unit="s") if isinstance(ts, (int, float)) else pd.to_datetime(ts)
+                o = float(o); h = float(h); l = float(l); c = float(c)
+                v = float(v) if v is not None else 0.0
+                if not np.isfinite(o + h + l + c):
+                    continue
+                rows.append(
+                    {"timestamp": ts_parsed, "open": o, "high": h, "low": l, "close": c, "volume": v}
+                )
+            except Exception:
+                continue
+
 
     if not rows:
         logger.warning("Parsed 0 valid candles for %s", dt.isoformat())
@@ -405,19 +454,43 @@ def train_models_2min(df_train: pd.DataFrame, xgb_out_path: str, neutral_out_pat
         logger.error("Failed to save neutrality model: %s", e)
 
 
+def _parse_train_datetime(s: str) -> date:
+    """
+    Parse TRAIN_START_DATE / TRAIN_END_DATE env vars.
+
+    Accepts:
+        - "YYYY-MM-DD"
+        - "YYYY-MM-DD HH:MM:SS"
+
+    Returns a date object (time part is ignored for now).
+    """
+    s = s.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.date()
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid date format {s!r}; expected 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'")
+
+
 def main():
     # Date range from env
     start_str = os.getenv("TRAIN_START_DATE", "").strip()
     end_str = os.getenv("TRAIN_END_DATE", "").strip()
+
+
     if not start_str or not end_str:
-        logger.error("TRAIN_START_DATE and TRAIN_END_DATE must be set (YYYY-MM-DD).")
+        logger.error("TRAIN_START_DATE and TRAIN_END_DATE must be set (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS').")
         return
+
     try:
-        start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
-        end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
+        start_date = _parse_train_datetime(start_str)
+        end_date = _parse_train_datetime(end_str)
     except Exception as e:
         logger.error("Invalid TRAIN_START_DATE / TRAIN_END_DATE: %s", e)
         return
+
     if end_date < start_date:
         logger.error("TRAIN_END_DATE must be >= TRAIN_START_DATE.")
         return

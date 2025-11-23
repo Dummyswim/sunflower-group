@@ -4,17 +4,21 @@ Provides structured logging with IST timezone, rate limiting, and dynamic level 
 All color code functionality has been removed for clean file output.
 """
 
+
+
 import logging
 import logging.handlers
 import os
 import sys
 import time
 import json
-import asyncio
 from datetime import datetime, timezone, timedelta
+
 from pathlib import Path
 from typing import Optional, Dict, Callable, Any
 from threading import Lock, Thread
+
+
 
 # IST timezone constant
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -283,9 +287,6 @@ def start_dynamic_level_watcher(
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                 
-                
-                                
-
                 for logger_name, level_val in config.items():
                     try:
                         # Support nested mapping under a "loggers" key or similar
@@ -312,12 +313,6 @@ def start_dynamic_level_watcher(
                         logging.info("[LEVEL] Updated %s to %s", logger_name, level_val)
                     except Exception as e:
                         logging.warning("[LEVEL] Failed to update %s: %s", logger_name, e)
-
-
-    
-                
-                
-                
                 
             except Exception as e:
                 logging.debug(f"[LEVEL] Watcher error: {e}")

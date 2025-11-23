@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
+
 """
-Offline evaluation and reliability curves for probabilities-only system.
+Offline evaluation and reliability curves for the probabilities-only 2-minute system.
 
-- Joins logs/signals.jsonl (pre-close predictions) with feature_log_hist.csv
-  (candle-close labels + features).
-- Computes directional accuracy in bins of buy_prob and neutral_prob.
-- Focuses especially on tradeable=True rows.
-
-Usage:
-    python offline_eval.py
-
-Adjust paths or thresholds via environment variables if needed.
+- Joins trained_models/production/signals.jsonl (pre-close predictions) with feature_log_hist.csv
+  (2-minute directional labels + features, logged at the target close time).
+...
 """
 
 import os
@@ -149,8 +144,8 @@ def _bin_accuracy(df: pd.DataFrame, col: str, bins) -> None:
 
 
 def main():
-    signals_path = os.getenv("SIGNALS_PATH", "logs/signals.jsonl")
-    feat_hist_path = os.getenv("FEATURE_LOG_HIST", "feature_log_hist.csv")
+    signals_path = os.getenv("SIGNALS_PATH", "trained_models/production/signals.jsonl")
+    feat_hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
 
     logger.info("Loading signals from %s", signals_path)
     df_sig = _load_signals(signals_path)
