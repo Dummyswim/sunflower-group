@@ -209,6 +209,19 @@ async def background_calibrator_loop(
                 b = float(clf.intercept_.ravel()[0])
                 n = len(y)
 
+                # --- NEW: Minimum slope guard to avoid confidence collapse ---
+                try:
+                    min_slope = float(os.getenv("CALIB_MIN_SLOPE", "0.20"))
+                except Exception:
+                    min_slope = 0.20
+
+                if not np.isfinite(a) or a < min_slope:
+                    logger.info(
+                        "[CALIB] reject candidate due to weak slope: a=%.4f < min_slope=%.4f (auc=%.3f, n=%d)",
+                        float(a), float(min_slope), float(auc), int(n)
+                    )
+                    return None
+
                 # Validation on a small holdout tail
                 n_val = max(50, min(200, n // 5))
                 y_val = y[-n_val:]
@@ -290,6 +303,24 @@ async def background_calibrator_loop(
             background_calibrator_loop._reject_streak = 0
             name, best = accepted
             a, b, n = best["a"], best["b"], best["n"]
+            auc = best.get("auc", 0.5)
+
+            MIN_A = float(os.getenv("CALIB_MIN_SLOPE", "0.2"))
+            MIN_AUC = float(os.getenv("CALIB_MIN_AUC", "0.53"))
+
+            if float(auc) < MIN_AUC:
+                logger.info(
+                    "[CALIB] auc=%.3f below MIN_AUC=%.3f → skip overwrite, keep previous calib",
+                    float(auc), float(MIN_AUC)
+                )
+                continue
+
+            if abs(float(a)) < MIN_A:
+                logger.info(
+                    "[CALIB] slope a=%.4f below MIN_A=%.3f → skip overwrite, keep previous calib",
+                    float(a), float(MIN_A)
+                )
+                continue
 
             try:
                 if hasattr(pipeline_ref, "_calib_bypass") and getattr(pipeline_ref, "_calib_bypass", False):
@@ -302,6 +333,7 @@ async def background_calibrator_loop(
                 "a": float(a),
                 "b": float(b),
                 "n": int(n),
+                "auc": float(auc),  # NEW: persist skill for downstream model_quality
                 "source": "meta_p_xgb_raw",
                 "last_success_ts": datetime.utcnow().isoformat() + "Z",
             }

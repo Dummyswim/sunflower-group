@@ -254,10 +254,84 @@ def build_2min_dataset(df_candles: pd.DataFrame) -> pd.DataFrame:
     n = len(df)
     logger.info("Building 2-minute dataset from %d candles", n)
 
+    # --- 2-minute move distribution (for FLAT tolerance tuning) ---
+    try:
+        closes = df["close"].astype(float).values
+        if closes.size >= 4:
+            # 2-minute horizon: diff between t+2 and t
+            moves = closes[2:] - closes[:-2]
+            moves = moves[np.isfinite(moves)]
+            abs_moves = np.abs(moves)
+            if abs_moves.size >= 10:
+                sigma_pts = float(abs_moves.std())
+                med_pts = float(np.median(abs_moves))
+                p95_pts = float(np.percentile(abs_moves, 95))
+                logger.info(
+                    "2-min abs move stats (pts): sigma=%.4f, median=%.4f, p95=%.4f",
+                    sigma_pts,
+                    med_pts,
+                    p95_pts,
+                )
+
+                # Suggested flat tolerance in points:
+                # max(cost, sigma_mult * sigma)
+                cost_pts = float(os.getenv("OFFLINE_COST_POINTS", "0.0") or "0.0")
+                sigma_mult = float(os.getenv("OFFLINE_FLAT_SIGMA_MULT", "0.35") or "0.35")
+                min_pts = float(os.getenv("OFFLINE_FLAT_MIN_PTS", "0.0") or "0.0")
+
+                suggested_tol_pts = max(cost_pts, min_pts, sigma_mult * sigma_pts)
+                logger.info(
+                    "Suggested OFFLINE flat tolerance (pts): %.4f "
+                    "(cost=%.4f, sigma_mult=%.3f, min_pts=%.4f)",
+                    suggested_tol_pts,
+                    cost_pts,
+                    sigma_mult,
+                    min_pts,
+                )
+            else:
+                logger.info("Not enough 2-min moves for volatility stats (n=%d)", abs_moves.size)
+        else:
+            logger.info("Not enough candles for 2-min volatility stats (n=%d)", closes.size)
+    except Exception as e:
+        logger.warning("2-min move distribution analysis failed: %s", e)
+
     feat_pipe = FeaturePipeline(train_features={})
     rows = []
 
+    # FLAT tolerance configuration
     flat_tolerance_pct = float(os.getenv("OFFLINE_FLAT_TOL_PCT", "0.00010"))  # 0.01% default
+
+    # Optional: use a points-based tolerance derived from move stats.
+    use_points = os.getenv("OFFLINE_FLAT_USE_POINTS", "0").strip() == "1"
+    flat_tolerance_pts = None
+    if use_points:
+        try:
+            # Allow explicit override, otherwise reuse suggested formula.
+            cost_pts = float(os.getenv("OFFLINE_COST_POINTS", "0.0") or "0.0")
+            sigma_mult = float(os.getenv("OFFLINE_FLAT_SIGMA_MULT", "0.35") or "0.35")
+            min_pts = float(os.getenv("OFFLINE_FLAT_MIN_PTS", "0.0") or "0.0")
+
+            closes = df["close"].astype(float).values
+            if closes.size >= 4:
+                moves = closes[2:] - closes[:-2]
+                moves = moves[np.isfinite(moves)]
+                abs_moves = np.abs(moves)
+                if abs_moves.size >= 10:
+                    sigma_pts = float(abs_moves.std())
+                    flat_tolerance_pts = max(cost_pts, min_pts, sigma_mult * sigma_pts)
+                    logger.info(
+                        "Using points-based FLAT tolerance: %.4f pts "
+                        "(cost=%.4f, sigma_mult=%.3f, min_pts=%.4f)",
+                        flat_tolerance_pts,
+                        cost_pts,
+                        sigma_mult,
+                        min_pts,
+                    )
+        except Exception as e:
+            logger.warning("Failed to compute points-based FLAT tolerance; falling back to pct: %s", e)
+            flat_tolerance_pts = None
+            use_points = False
+
     lookback_prices = 200
     lookback_candles = 500
     horizon = 2  # 2-minute direction
@@ -278,7 +352,12 @@ def build_2min_dataset(df_candles: pd.DataFrame) -> pd.DataFrame:
             continue
 
         move = fut_close - ref_close
-        tol = flat_tolerance_pct * ref_close
+
+        if use_points and flat_tolerance_pts is not None:
+            tol = flat_tolerance_pts
+        else:
+            tol = flat_tolerance_pct * ref_close
+
         if move > tol:
             label = "BUY"
         elif move < -tol:
@@ -292,16 +371,19 @@ def build_2min_dataset(df_candles: pd.DataFrame) -> pd.DataFrame:
         if len(px_hist) < 5:
             continue
 
+        # Core trend/indicator features
         ema_feats = FeaturePipeline.compute_emas(px_hist)
         ta_feats = TA.compute_ta_bundle(px_hist)
 
         safe_df = df.iloc[max(0, i - lookback_candles + 1): i + 1]
+
         pat_feats = FeaturePipeline.compute_candlestick_patterns(
             candles=safe_df.tail(max(3, 5)),
             rvol_window=int(os.getenv("OFFLINE_PAT_RVOL_WINDOW", "5")),
             rvol_thresh=float(os.getenv("OFFLINE_PAT_RVOL_THRESH", "1.2")),
             min_winrate=float(os.getenv("OFFLINE_PAT_MIN_WINRATE", "0.55")),
         ) or {}
+
         mtf_feats = FeaturePipeline.compute_mtf_pattern_consensus(
             candle_df=safe_df,
             timeframes=["1T", "3T", "5T"],
@@ -309,24 +391,97 @@ def build_2min_dataset(df_candles: pd.DataFrame) -> pd.DataFrame:
             rvol_thresh=float(os.getenv("OFFLINE_MTF_RVOL_THRESH", "1.2")),
             min_winrate=float(os.getenv("OFFLINE_MTF_MIN_WINRATE", "0.55")),
         ) or {}
+
         sr_feats = FeaturePipeline.compute_sr_features(safe_df)
 
-        # last_zscore feature
+        micro = FeaturePipeline.compute_micro_trend(px_hist)
+        micro_slope = float(micro.get("micro_slope", 0.0))
+        imbalance = float(micro.get("micro_imbalance", 0.0))
+        mean_drift_pct = float(micro.get("mean_drift_pct", 0.0))
+        last_z = float(micro.get("last_zscore", 0.0))
+
+        # --- Regime features: realized range / volatility and time-of-day ---
+        atr_1t = 0.0
+        atr_3t = 0.0
+        rv_10 = 0.0
+        tod_sin = 0.0
+        tod_cos = 0.0
+
         try:
-            arr = np.asarray(px_hist[-64:], dtype=float)
-            if arr.size >= 2:
-                last_px = float(arr[-1])
-                if arr.size >= 32:
-                    mean32 = float(arr[-32:].mean())
-                    std32 = float(arr[-32:].std())
+            if not safe_df.empty:
+                hi = safe_df["high"].astype(float)
+                lo = safe_df["low"].astype(float)
+                rng = (hi - lo).clip(lower=0.0)
+
+                if len(rng) >= 1:
+                    atr_1t = float(rng.iloc[-1])
+                if len(rng) >= 3:
+                    atr_3t = float(rng.tail(3).mean())
                 else:
-                    mean32 = float(arr.mean())
-                    std32 = float(arr.std())
-                last_z = (last_px - mean32) / max(1e-9, std32)
-            else:
-                last_z = 0.0
+                    atr_3t = atr_1t
+
+            px_arr = np.asarray(px_hist, dtype=float)
+            if px_arr.size >= 10:
+                diff = np.diff(px_arr)
+                if diff.size >= 3:
+                    rv_10 = float(np.std(diff[-10:]))
         except Exception:
-            last_z = 0.0
+            atr_1t = atr_3t = rv_10 = 0.0
+
+        try:
+            # time-of-day as a cycle (minutes since midnight)
+            minute_of_day = ts.hour * 60 + ts.minute
+            tod_angle = 2.0 * np.pi * (minute_of_day / (24.0 * 60.0))
+            tod_sin = float(np.sin(tod_angle))
+            tod_cos = float(np.cos(tod_angle))
+        except Exception:
+            tod_sin = tod_cos = 0.0
+
+        # --- Reversal / regime flags: wick extremes, VWAP reversion, CVD divergence ---
+        try:
+            if isinstance(safe_df, pd.DataFrame) and not safe_df.empty:
+                last_candle = safe_df.iloc[-1]
+                prev_candle = safe_df.iloc[-2] if len(safe_df) >= 2 else last_candle
+            else:
+                last_candle = None
+                prev_candle = None
+        except Exception:
+            last_candle = None
+            prev_candle = None
+
+        try:
+            wick_up, wick_down = FeaturePipeline._compute_wick_extremes(last_candle) if last_candle is not None else (0.0, 0.0)
+        except Exception:
+            wick_up, wick_down = 0.0, 0.0
+
+        # Offline has no futures sidecar by default; use None
+        try:
+            vwap_val = None
+            px_change = float(px_hist[-1] - px_hist[-2]) if len(px_hist) >= 2 else 0.0
+            cvd_div = FeaturePipeline._compute_cvd_divergence(px_change, None)
+        except Exception:
+            vwap_val = None
+            cvd_div = 0.0
+
+        try:
+            vwap_rev_flag = float(
+                FeaturePipeline._compute_vwap_reversion_flag(
+                    safe_df if (isinstance(safe_df, pd.DataFrame) and not safe_df.empty) else None,
+                    vwap_val,
+                )
+            ) if (safe_df is not None) else 0.0
+        except Exception:
+            vwap_rev_flag = 0.0
+
+        rev_cross_feats = FeaturePipeline.compute_reversal_cross_features(
+            safe_df.tail(20) if isinstance(safe_df, pd.DataFrame) else pd.DataFrame(),
+            {
+                "wick_extreme_up": float(wick_up),
+                "wick_extreme_down": float(wick_down),
+                "vwap_reversion_flag": float(vwap_rev_flag),
+                "cvd_divergence": float(cvd_div),
+            },
+        )
 
         features_raw = {
             **ema_feats,
@@ -334,9 +489,23 @@ def build_2min_dataset(df_candles: pd.DataFrame) -> pd.DataFrame:
             **pat_feats,
             **mtf_feats,
             **sr_feats,
+            "micro_slope": micro_slope,
+            "micro_imbalance": imbalance,
+            "mean_drift_pct": mean_drift_pct,
             "last_price": ref_close,
             "last_zscore": float(last_z),
+            "atr_1t": atr_1t,
+            "atr_3t": atr_3t,
+            "rv_10": rv_10,
+            "tod_sin": tod_sin,
+            "tod_cos": tod_cos,
+            # Reversal/regime flags
+            "wick_extreme_up": float(wick_up),
+            "wick_extreme_down": float(wick_down),
+            "vwap_reversion_flag": float(vwap_rev_flag),
+            "cvd_divergence": float(cvd_div),
         }
+        features_raw.update(rev_cross_feats)
 
         # Normalisation scale: std of returns
         try:

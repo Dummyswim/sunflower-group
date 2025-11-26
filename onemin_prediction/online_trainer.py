@@ -94,6 +94,8 @@ def _parse_feature_csv(path: str, min_rows: int = 200) -> Optional[pd.DataFrame]
         logger.error(f"[TRAIN] Parse feature CSV failed: {e}", exc_info=True)
         return None
 
+
+
 def _build_datasets(df: pd.DataFrame) -> Tuple[
     Optional[Tuple[np.ndarray, np.ndarray]],
     Optional[Tuple[np.ndarray, np.ndarray]],
@@ -134,6 +136,52 @@ def _build_datasets(df: pd.DataFrame) -> Tuple[
     except Exception as e:
         logger.error(f"[TRAIN] Dataset build failed: {e}", exc_info=True)
         return None, None, []
+
+
+# def _build_datasets(df: pd.DataFrame) -> Tuple[
+#     Optional[Tuple[np.ndarray, np.ndarray]],
+#     Optional[Tuple[np.ndarray, np.ndarray]],
+#     List[str]
+# ]:
+#     try:
+#         y_neu = (df["label"] == "FLAT").astype(int).values
+#         exclude = {"ts","decision","label","buy_prob","alpha","tradeable","is_flat"}
+#         drop_prefixes = ("meta_", "p_xgb_")
+#         feat_cols = sorted([
+#             c for c in df.columns
+#             if (c not in exclude)
+#             and (df[c].dtype != "O")
+#             and not any(c.startswith(p) for p in drop_prefixes)
+#         ])
+        
+        
+        
+#         logger.info(f"[TRAIN] Feature columns selected: n={len(feat_cols)} (dropped prefixes: {list(drop_prefixes)})")
+
+#         X_neu = df[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+#         neu_ds = (X_neu, y_neu[:len(df)])
+
+#         # Directional: BUY vs SELL (use ALL directionals)
+#         mask_dir = (df["label"].isin(["BUY", "SELL"]))
+#         df_dir = df[mask_dir].copy()
+#         if df_dir.empty:
+#             return None, neu_ds, feat_cols
+
+#         y_dir = (df_dir["label"] == "BUY").astype(int).values
+#         X_dir = df_dir[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+
+#         try:
+#             neu_pos = float(np.mean(y_neu)) if len(y_neu) else 0.0
+#             dir_size = int(df_dir.shape[0])
+#             logger.info(f"[TRAIN] Dataset sizes: dir={dir_size} rows | neu={len(df)} rows | neu_pos={neu_pos:.3f}")
+#         except Exception:
+#             pass
+
+#         return (X_dir, y_dir), neu_ds, feat_cols
+#     except Exception as e:
+#         logger.error(f"[TRAIN] Dataset build failed: {e}", exc_info=True)
+#         return None, None, []
+
 
 def _train_xgb(X: np.ndarray, y: np.ndarray):
     try:
@@ -221,6 +269,9 @@ async def background_trainer_loop(
             else:
                 df = df_hist
 
+
+
+
             df = df.drop_duplicates(subset=["ts"], keep="last")
             cap_rows = int(os.getenv("TRAIN_MAX_ROWS", "4000") or "4000")
             if cap_rows > 0 and len(df) > cap_rows:
@@ -230,11 +281,57 @@ async def background_trainer_loop(
                 log_every("train-not-enough", 60, logger.info, f"[TRAIN] Not enough data to train (rows={len(df)}/{min_rows})")
                 await asyncio.sleep(interval_sec)
                 continue
-
-
-
-
             dir_ds, neu_ds, feat_cols = _build_datasets(df)
+
+            # Align trainer feature space to the XGB booster schema so XGB and neutrality share the same input space
+            schema_names = getattr(pipeline_ref, "feature_schema_names", None)
+            if schema_names and feat_cols:
+                original_n = len(feat_cols)
+                schema_set = set(schema_names)
+                aligned_cols = [c for c in feat_cols if c in schema_set]
+
+                if not aligned_cols:
+                    logger.warning(
+                        "[TRAIN] No overlap between feature columns (n=%d) and XGB schema (n=%d); skipping this cycle",
+                        original_n,
+                        len(schema_names),
+                    )
+                    await asyncio.sleep(interval_sec)
+                    continue
+
+                logger.info(
+                    "[TRAIN] Aligned feature columns to XGB schema: n=%d (was %d, schema_n=%d)",
+                    len(aligned_cols),
+                    original_n,
+                    len(schema_names),
+                )
+                feat_cols = aligned_cols
+
+                # Rebuild neutrality dataset on aligned columns
+                try:
+                    y_neu = (df["label"] == "FLAT").astype(int).values
+                    X_neu = df[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+                    neu_ds = (X_neu, y_neu[:len(df)])
+                except Exception as e:
+                    logger.error(f"[TRAIN] Rebuild neu_ds with aligned schema failed: {e}", exc_info=True)
+                    neu_ds = None
+
+                # Rebuild directional dataset on aligned columns
+                try:
+                    mask_dir = df["label"].isin(["BUY", "SELL"])
+                    df_dir = df[mask_dir].copy()
+                    if df_dir.empty:
+                        dir_ds = None
+                    else:
+                        y_dir = (df_dir["label"] == "BUY").astype(int).values
+                        X_dir = df_dir[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+                        dir_ds = (X_dir, y_dir)
+                except Exception as e:
+                    logger.error(f"[TRAIN] Rebuild dir_ds with aligned schema failed: {e}", exc_info=True)
+                    dir_ds = None
+
+
+
 
 
             # Gate XGB training/hot-reload (env-configurable)

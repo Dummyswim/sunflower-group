@@ -24,6 +24,7 @@ Usage:
 import os
 import logging
 from typing import Optional
+import json
 
 import numpy as np
 import pandas as pd
@@ -63,12 +64,19 @@ def _load_xgb_model(path: str):
         return None
 
 
-def _build_feature_matrix(df: pd.DataFrame) -> Optional[tuple[np.ndarray, np.ndarray, list[str]]]:
+def _build_feature_matrix(
+    df: pd.DataFrame,
+    booster_feat_names: Optional[list[str]] = None,
+) -> Optional[tuple[np.ndarray, np.ndarray, list[str]]]:
     """
     Build (X, y, feat_cols) from a 2-minute dataset DataFrame:
       - X: feature matrix
       - y: directional labels (1=BUY, -1=SELL, 0=FLAT)
       - feat_cols: list of feature column names used
+
+    If booster_feat_names is provided (from the XGB feature_schema),
+    we use those names and order to build X, ensuring the column
+    count matches the trained booster.
     """
     if df is None or df.empty:
         logger.error("Empty evaluation dataset")
@@ -83,15 +91,32 @@ def _build_feature_matrix(df: pd.DataFrame) -> Optional[tuple[np.ndarray, np.nda
 
     exclude = {"ts", "label", "dir_true"}
     drop_prefixes = ("meta_", "p_xgb_")
-    feat_cols = sorted([
-        c for c in df.columns
-        if (c not in exclude)
-        and (df[c].dtype != "O")
-        and not any(c.startswith(p) for p in drop_prefixes)
-    ])
-    if not feat_cols:
-        logger.error("No numeric feature columns found for evaluation.")
-        return None
+    if booster_feat_names:
+        # Use feature names from the booster schema, in that order
+        available = set(df.columns)
+        feat_cols = [c for c in booster_feat_names if c in available]
+        missing = [c for c in booster_feat_names if c not in available]
+        if missing:
+            logger.warning(
+                "Some booster feature names not found in eval DataFrame: %s",
+                missing,
+            )
+        if not feat_cols:
+            logger.error(
+                "None of the booster feature names are present in eval DataFrame."
+            )
+            return None
+    else:
+        # Fallback: infer numeric feature columns from the DataFrame
+        feat_cols = sorted([
+            c for c in df.columns
+            if (c not in exclude)
+            and (df[c].dtype != "O")
+            and not any(c.startswith(p) for p in drop_prefixes)
+        ])
+        if not feat_cols:
+            logger.error("No numeric feature columns found for evaluation.")
+            return None
 
     X = (
         df[feat_cols]
@@ -194,6 +219,26 @@ def main():
     if booster is None:
         return
 
+    # ----- Extract feature names from booster schema (if present) -----
+    booster_feat_names: Optional[list[str]] = None
+    try:
+        schema_raw = booster.attr("feature_schema")
+    except Exception:
+        schema_raw = None
+
+    if schema_raw:
+        try:
+            schema = json.loads(schema_raw)
+            names = schema.get("feature_names") or schema.get("features")
+            if isinstance(names, list) and names:
+                booster_feat_names = [str(c) for c in names]
+                logger.info(
+                    "Using booster feature_schema with %d features for evaluation",
+                    len(booster_feat_names),
+                )
+        except Exception as e:
+            logger.warning("Failed to parse booster feature_schema: %s", e)
+
     # ----- Fetch intraday data -----
     logger.info("Fetching intraday candles for evaluation range %s to %s",
                 start_date.isoformat(), end_date.isoformat())
@@ -211,7 +256,7 @@ def main():
     logger.info("2-minute evaluation dataset rows: %d", len(df_eval))
 
     # ----- Build feature matrix -----
-    out = _build_feature_matrix(df_eval)
+    out = _build_feature_matrix(df_eval, booster_feat_names=booster_feat_names)
     if out is None:
         return
     X, y_true, feat_cols = out
@@ -275,6 +320,49 @@ def main():
             "High-confidence subset (buy_prob>=%.2f): n=0",
             hc_thresh,
         )
+
+    # ----- Dump offline prediction dataset for Q-model training -----
+    try:
+        exp_dir = os.getenv("EXPERIMENT_DIR", "trained_models/experiments")
+        os.makedirs(exp_dir, exist_ok=True)
+        out_path = os.path.join(exp_dir, "offline_2min_with_preds.csv")
+
+        # ts column: use explicit 'ts' if present, else the index
+        if "ts" in df_eval.columns:
+            ts_vals = df_eval["ts"].values
+        else:
+            ts_vals = df_eval.index.astype(str).values
+
+        df_dump = pd.DataFrame(
+            {
+                "ts": ts_vals,
+                "label": df_eval["label"].values,
+                "p_buy": p_buy,
+            }
+        )
+
+        # Optionally include any extra meta-features that exist in df_eval
+        extra_cols = [
+            "neutral_prob",
+            "indicator_score",
+            "fut_vol_delta",
+            "cvd_divergence",
+            "vwap_reversion_flag",
+            "wick_extreme_up",
+            "wick_extreme_down",
+        ]
+        for col in extra_cols:
+            if col in df_eval.columns:
+                df_dump[col] = df_eval[col].values
+
+        df_dump.to_csv(out_path, index=False)
+        logger.info(
+            "Wrote offline Q training dataset with %d rows to %s",
+            len(df_dump),
+            out_path,
+        )
+    except Exception as e:
+        logger.warning("Failed to write offline Q dataset: %s", e)
 
 
 if __name__ == "__main__":

@@ -130,10 +130,233 @@ class FeaturePipeline:
     def _is_bounded_key(k: str) -> bool:
         if k.startswith("pat_is") or k.startswith("mtf_tf_"):
             return True
-        return k in {
+        bounded_keys = {
             "pat_rvol", "probability_adjustment", "mtf_adj", "mtf_consensus",
-            "price_range_tightness", "ta_bb_pctb", "ta_rsi14"
+            "price_range_tightness", "ta_bb_pctb", "ta_rsi14",
         }
+        bounded_keys.update({
+            "fut_vwap_dev",
+            "fut_cvd_delta",
+            "fut_vol_delta",
+            "rv_10",
+            "atr_1t",
+            "atr_3t",
+            "tod_sin",
+            "tod_cos",
+        })
+        return k in bounded_keys
+
+
+    @staticmethod
+    def compute_micro_trend(px_hist) -> dict:
+        """
+        Compute simple micro-trend features from a price history.
+
+        Inputs:
+            px_hist: list/array of recent closes (oldest -> newest)
+
+        Returns dict with:
+            - micro_slope: average per-bar price change (normalised)
+            - micro_imbalance: up vs down bar imbalance in [-1, 1]
+            - mean_drift_pct: total drift from first->last in percent
+            - last_zscore: z-score of last price vs recent mean
+        """
+        try:
+            arr = np.asarray(px_hist, dtype=float)
+        except Exception:
+            return {
+                "micro_slope": 0.0,
+                "micro_imbalance": 0.0,
+                "mean_drift_pct": 0.0,
+                "last_zscore": 0.0,
+            }
+
+        n = arr.size
+        if n < 3 or not np.all(np.isfinite(arr)):
+            return {
+                "micro_slope": 0.0,
+                "micro_imbalance": 0.0,
+                "mean_drift_pct": 0.0,
+                "last_zscore": 0.0,
+            }
+
+        # Basic differences
+        diffs = np.diff(arr)
+        diffs = diffs[np.isfinite(diffs)]
+        if diffs.size == 0:
+            micro_slope = 0.0
+        else:
+            # normalise by last price for scale invariance
+            last_px = float(arr[-1])
+            denom = max(abs(last_px), 1e-6)
+            micro_slope = float(diffs[-min(5, diffs.size) :].mean() / denom)
+
+        # Up/down bar imbalance
+        up = float((diffs > 0).sum())
+        down = float((diffs < 0).sum())
+        total = up + down
+        if total > 0:
+            micro_imbalance = (up - down) / total  # in [-1, 1]
+        else:
+            micro_imbalance = 0.0
+
+        # Overall drift from first -> last in pct
+        first_px = float(arr[0])
+        denom_first = max(abs(first_px), 1e-6)
+        mean_drift_pct = float((last_px - first_px) / denom_first)
+
+        # Last z-score vs recent window
+        try:
+            if n >= 32:
+                window = arr[-32:]
+            else:
+                window = arr
+            mu = float(window.mean())
+            sigma = float(window.std())
+            last_zscore = (last_px - mu) / max(sigma, 1e-6)
+        except Exception:
+            last_zscore = 0.0
+
+        return {
+            "micro_slope": micro_slope,
+            "micro_imbalance": micro_imbalance,
+            "mean_drift_pct": mean_drift_pct,
+            "last_zscore": last_zscore,
+        }
+
+
+    @staticmethod
+    def _compute_wick_extremes(last: pd.Series) -> tuple[float, float]:
+        """
+        Compute upper/lower wick ratios for the last candle.
+
+        Returns (wick_extreme_up, wick_extreme_down) in [-1, 1].
+        """
+        try:
+            o = float(last["open"])
+            h = float(last["high"])
+            l = float(last["low"])
+            c = float(last["close"])
+        except Exception:
+            return 0.0, 0.0
+
+        body = max(abs(c - o), 1e-6)
+        upper_wick = max(h - max(o, c), 0.0) / body
+        lower_wick = max(min(o, c) - l, 0.0) / body
+
+        # Clip to a sane range
+        upper_wick = float(max(-1.0, min(upper_wick, 5.0)))
+        lower_wick = float(max(-1.0, min(lower_wick, 5.0)))
+
+        # Normalise to roughly [-1, 1] with soft cap
+        upper_norm = max(-1.0, min(upper_wick / 3.0, 1.0))
+        lower_norm = max(-1.0, min(lower_wick / 3.0, 1.0))
+        return upper_norm, lower_norm
+
+    @staticmethod
+    def _compute_vwap_reversion_flag(px_hist: pd.DataFrame, vwap: float | None) -> float:
+        """
+        Flag when price pierces VWAP and closes back inside (mean-reversion flavour).
+
+        Returns value in [-1, 1]: +1 for bearish reversion from above,
+        -1 for bullish reversion from below, 0 otherwise.
+        """
+        if vwap is None:
+            return 0.0
+        try:
+            last = px_hist.iloc[-1]
+            prev = px_hist.iloc[-2] if len(px_hist) >= 2 else last
+            c_last = float(last["close"])
+            c_prev = float(prev["close"])
+        except Exception:
+            return 0.0
+
+        above_prev = c_prev > vwap
+        below_prev = c_prev < vwap
+        above_last = c_last > vwap
+        below_last = c_last < vwap
+
+        # From above back toward VWAP or below → bearish reversion
+        if above_prev and (not above_last):
+            return 1.0
+        # From below back toward VWAP or above → bullish reversion
+        if below_prev and (not below_last):
+            return -1.0
+        return 0.0
+
+    @staticmethod
+    def _compute_cvd_divergence(price_change: float, cvd_delta: float | None) -> float:
+        """
+        Simple divergence flag between price change and futures CVD.
+
+        Returns in [-1, 1]: +1 when price up but CVD down (bearish divergence),
+        -1 when price down but CVD up (bullish divergence), 0 otherwise.
+        """
+        if cvd_delta is None:
+            return 0.0
+
+        try:
+            p_chg = float(price_change)
+            c_chg = float(cvd_delta)
+        except Exception:
+            return 0.0
+
+        if abs(p_chg) < 1e-6 or abs(c_chg) < 1e-9:
+            return 0.0
+
+        price_sign = 1.0 if p_chg > 0 else -1.0
+        cvd_sign = 1.0 if c_chg > 0 else -1.0
+
+        if price_sign == 1.0 and cvd_sign == -1.0:
+            return 1.0
+        if price_sign == -1.0 and cvd_sign == 1.0:
+            return -1.0
+        return 0.0
+
+    @staticmethod
+    def compute_reversal_cross_features(tail: pd.DataFrame, features: Dict[str, float]) -> Dict[str, float]:
+        """
+        Crossed reversal flags using wick extremes, VWAP reversion, and CVD divergence context.
+        """
+        out: Dict[str, float] = {}
+        try:
+            wick_up = float(features.get("wick_extreme_up", 0.0) or 0.0)
+            wick_dn = float(features.get("wick_extreme_down", 0.0) or 0.0)
+            cvd_div = float(features.get("cvd_divergence", 0.0) or 0.0)
+            vwap_rev = float(features.get("vwap_reversion_flag", 0.0) or 0.0)
+
+            closes = (
+                tail["close"].astype(float)
+                if isinstance(tail, pd.DataFrame) and (not tail.empty) and ("close" in tail.columns)
+                else pd.Series(dtype=float)
+            )
+
+            if len(closes) >= 10:
+                recent = closes.tail(10)
+                last_close = float(recent.iloc[-1])
+                hi_10 = float(recent.max())
+                lo_10 = float(recent.min())
+                span = max(1.0, hi_10 - lo_10)
+                near_high = 1.0 if (hi_10 - last_close) / span <= 0.25 else 0.0
+                near_low = 1.0 if (last_close - lo_10) / span <= 0.25 else 0.0
+            else:
+                near_high = near_low = 0.0
+
+            out["rev_cross_upper_wick_cvd"] = float(
+                wick_up >= 0.7 and cvd_div < -0.2 and near_high > 0.0
+            )
+            out["rev_cross_upper_wick_vwap"] = float(
+                wick_up >= 0.7 and vwap_rev < 0.0 and near_high > 0.0
+            )
+            out["rev_cross_lower_wick_cvd"] = float(
+                wick_dn >= 0.7 and cvd_div > 0.2 and near_low > 0.0
+            )
+            out["rev_cross_lower_wick_vwap"] = float(
+                wick_dn >= 0.7 and vwap_rev > 0.0 and near_low > 0.0
+            )
+        except Exception as exc:
+            logger.debug("[REV] cross-feature computation failed: %s", exc)
+        return out
 
     @staticmethod
     def _clip_feature_value(k: str, v: float) -> float:

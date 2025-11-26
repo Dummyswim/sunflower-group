@@ -56,7 +56,7 @@ config = SimpleNamespace(
     price_sanity_min=1.0,
     price_sanity_max=100000.0,
     ws_ping_interval=30,
-    ws_ping_timeout=10,
+    ws_ping_timeout=30,
     enable_packet_checksum_validation=False,
     data_stall_seconds=15,
     data_stall_reconnect_seconds=30,
@@ -77,7 +77,7 @@ config = SimpleNamespace(
 
 
     # Flat labelling (relax to increase directional rows)
-    flat_tolerance_pct=0.00010,  # 0.01%
+    flat_tolerance_pct=float(os.getenv("FLAT_TOLERANCE_PCT", "0.00010")),  # default 0.01%
     flat_dyn_k_range=0.20,
     flat_min_points=0.20,
     flat_tolerance_max_pts=3.0,
@@ -86,6 +86,11 @@ config = SimpleNamespace(
     calib_interval_sec=300,
     calib_min_rows=220,
 
+)
+
+logging.info(
+    "[CFG] flat_tolerance_pct=%.6f (env FLAT_TOLERANCE_PCT)",
+    config.flat_tolerance_pct,
 )
 
 # Minimal drift baseline seed (will be refreshed from feature_log)

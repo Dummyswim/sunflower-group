@@ -1,0 +1,17 @@
+{
+  "intercept": -0.13795367775253423,
+  "coef": [
+    0.20932628934202535,
+    0.0,
+    0.0,
+    0.04092539685554726,
+    0.12810812906727168
+  ],
+  "features": [
+    "p_buy",
+    "cvd_divergence",
+    "vwap_reversion_flag",
+    "wick_extreme_up",
+    "wick_extreme_down"
+  ]
+}

@@ -6,6 +6,7 @@ Adaptive model pipeline (probabilities-only).
 - Optional neutrality probability
 """
 import json
+import math
 import numpy as np
 from typing import Dict, Optional, Tuple
 import logging
@@ -46,6 +47,8 @@ class AdaptiveModelPipeline:
         self._calib_b = None
         self.last_p_xgb_raw = None
         self.last_p_xgb_calib = None
+        # Global estimate of current model skill ("weak" / "ok" / "strong")
+        self.model_quality = "unknown"
 
         try:
             calib_path = os.getenv("CALIB_PATH", "").strip()
@@ -55,6 +58,13 @@ class AdaptiveModelPipeline:
                 logger.info("[CALIB] No calibration file; raw XGB probabilities will be used")
         except Exception as e:
             logger.warning(f"[CALIB] Failed to load calibration: {e}")
+
+        # If starting with bypass enabled, mark quality as weak baseline
+        if getattr(self, "_calib_bypass", False):
+            try:
+                self._update_model_quality(auc=0.5, slope=0.0)
+            except Exception:
+                pass
 
         logger.info("Adaptive model pipeline initialized (probabilities-only)")
 
@@ -67,30 +77,21 @@ class AdaptiveModelPipeline:
         Apply Platt calibration to a raw BUY probability.
 
         Behaviour:
-        - If _calib_bypass is True, we never trust raw margins fully:
-          we shrink toward 0.5 so extreme values are softened.
+        - If _calib_bypass is True, calibration is effectively disabled:
+          we return the raw probability (clipped) without extra damping.
         - Otherwise, use current (a,b), with guards against
           non-monotonic or extreme inversions.
         """
         try:
             # Respect dynamic bypass flag
             if getattr(self, "_calib_bypass", False):
-                # When bypassed, never trust raw margins fully.
-                # Shrink towards 0.5 so 0.9 behaves more like ~0.66–0.7.
-                try:
-                    shrink_env = os.getenv("CALIB_BYPASS_SHRINK", "0.4") or "0.4"
-                    shrink = float(shrink_env)
-                except Exception:
-                    shrink = 0.4
-                shrink = max(0.1, min(0.8, shrink))
+                # True bypass: trust raw XGB output, only clip for numerical safety.
                 p_raw = float(np.clip(p, 1e-9, 1.0 - 1e-9))
-                p_shrunk = 0.5 + shrink * (p_raw - 0.5)
-                p_shrunk = float(np.clip(p_shrunk, 1e-6, 1.0 - 1e-6))
                 logger.info(
-                    "[CALIB] bypass active → shrink raw p=%.3f to %.3f (shrink=%.2f)",
-                    p_raw, p_shrunk, shrink
+                    "[CALIB] bypass active → using raw probability p=%.3f",
+                    p_raw,
                 )
-                return p_shrunk
+                return p_raw
 
             if self._calib_a is None or self._calib_b is None:
                 return float(p)
@@ -123,9 +124,55 @@ class AdaptiveModelPipeline:
                 return q_clamped
 
             return q
+        except Exception as e:
+            logger.warning(f"[CALIB] calibration failed, using raw p (error={e})")
+            try:
+                return float(p)
+            except Exception:
+                return 0.5
+
+    def _update_model_quality(self, auc: float | None, slope: float | None) -> None:
+        """
+        Map calibration skill into a coarse model_quality bucket.
+
+        This is used by indicator blending to decide how much to trust raw p
+        when indicators / futures strongly disagree.
+        """
+        try:
+            a = float(slope) if slope is not None else 0.0
         except Exception:
-            # On any error, fall back to raw
-            return float(p)
+            a = 0.0
+
+        try:
+            auc_val = float(auc) if auc is not None else 0.5
+        except Exception:
+            auc_val = 0.5
+
+        # Env-tunable thresholds, but with sane defaults
+        try:
+            ok_auc = float(os.getenv("MODEL_OK_AUC", "0.53"))
+            ok_slope = float(os.getenv("MODEL_OK_SLOPE", "0.15"))
+            strong_auc = float(os.getenv("MODEL_STRONG_AUC", "0.57"))
+            strong_slope = float(os.getenv("MODEL_STRONG_SLOPE", "0.25"))
+        except Exception:
+            ok_auc, ok_slope = 0.53, 0.15
+            strong_auc, strong_slope = 0.57, 0.25
+
+        if auc_val >= strong_auc and a >= strong_slope:
+            q = "strong"
+        elif auc_val >= ok_auc and a >= ok_slope:
+            q = "ok"
+        else:
+            q = "weak"
+
+        if q != getattr(self, "model_quality", "unknown"):
+            logger.info(
+                "[CALIB-QUALITY] model_quality=%s (auc=%.3f, slope=%.3f)",
+                q,
+                auc_val,
+                a,
+            )
+        self.model_quality = q
 
 
 
@@ -153,8 +200,28 @@ class AdaptiveModelPipeline:
             if not _mono_ok(a, b):
                 logger.info(f"[CALIB] reload rejected: non-monotonic or invalid a={a:.6f} b={b:.6f} (n={n})")
                 return False
+
+            min_a = float(os.getenv("CALIB_MIN_SLOPE", "0.2"))
+            if abs(a) < min_a:
+                logger.info(
+                    "[CALIB] loaded weak slope a=%.4f (<%.2f) → enabling calib bypass",
+                    a, min_a
+                )
+                self._calib_bypass = True
+            else:
+                self._calib_bypass = False
+
             self._calib_a, self._calib_b = a, b
             logger.info(f"[CALIB] reloaded: a={a:.6f} b={b:.6f} (n={n})")
+            # update coarse model quality estimate from persisted auc (if present)
+            try:
+                auc = float(data.get("auc", 0.5))
+            except Exception:
+                auc = 0.5
+            try:
+                self._update_model_quality(auc=auc, slope=self._calib_a)
+            except Exception:
+                pass
             return True
         except Exception as e:
             logger.warning(f"[CALIB] reload failed: {e}")
@@ -219,6 +286,106 @@ class AdaptiveModelPipeline:
         except Exception as e:
             logger.warning(f"Indicator score computation failed: {e}")
             return 0.0
+
+    def _apply_indicator_modulation(
+        self,
+        p: float,
+        indicator_score: float,
+        mtf_consensus: float,
+        neutral_prob: float,
+        margin: float,
+        engineered_features: Optional[Dict[str, float]] = None,
+    ) -> Tuple[float, float]:
+        """
+        Blend raw model probability with indicator / MTF consensus.
+
+        New behaviour in WEAK model mode:
+        - Lower thresholds for "strong disagreement" so that cases like:
+            p > 0.8, indicator_score < -0.25 and fut_cvd_delta < 0
+          are explicitly clamped.
+        - In strong disagreement + weak model:
+            * Clamp p to 0.50 (no edge)
+            * Boost neutral_prob so trade is auto–skipped.
+        """
+
+        try:
+            raw_p = float(p)
+        except Exception:
+            raw_p = 0.5
+        p = max(0.0, min(1.0, raw_p))
+
+        try:
+            ind = float(indicator_score)
+        except Exception:
+            ind = 0.0
+
+        try:
+            mtf = float(mtf_consensus)
+        except Exception:
+            mtf = 0.0
+
+        # Futures CVD delta from engineered features (may be missing)
+        fut_cvd = 0.0
+        if engineered_features:
+            try:
+                fut_cvd = float(engineered_features.get("fut_cvd_delta", 0.0) or 0.0)
+            except Exception:
+                fut_cvd = 0.0
+
+        # Direction of raw model
+        dir_raw = 1 if p >= 0.5 else -1
+        abs_margin = abs(margin)
+
+        # --- agreement / disagreement checks ---------------------------------
+        ind_mag = abs(ind)
+        mtf_mag = abs(mtf)
+
+        agree_ind = (dir_raw > 0 and ind > 0.0) or (dir_raw < 0 and ind < 0.0)
+        agree_mtf = (dir_raw > 0 and mtf > 0.0) or (dir_raw < 0 and mtf < 0.0)
+
+        disagree_ind = (dir_raw > 0 and ind < -0.25) or (dir_raw < 0 and ind > 0.25)
+        disagree_fut = (dir_raw > 0 and fut_cvd < -1e-6) or (dir_raw < 0 and fut_cvd > 1e-6)
+
+        strong_consensus = (ind_mag >= 0.20) or (mtf_mag >= 0.20)
+        sign_disagree = disagree_ind or disagree_fut
+
+        strong_disagreement = (
+            abs_margin >= 0.12
+            and strong_consensus
+            and sign_disagree
+        )
+
+        if self.model_quality == "weak" and strong_disagreement:
+            boosted_neutral = max(neutral_prob, 0.70)
+            logger.debug(
+                "[IND] weak-quality STRONG disagreement clamp → p=0.500, "
+                "neutral_prob=%.3f (p_raw=%.3f, margin=%.3f, ind=%.3f, mtf=%.3f, fut_cvd=%.6f)",
+                boosted_neutral, raw_p, margin, ind, mtf, fut_cvd,
+            )
+            return 0.5, boosted_neutral
+
+        if strong_consensus and sign_disagree:
+            shrink = min(0.15, abs_margin * 0.6)
+            p = 0.5 + (p - 0.5) * (1.0 - shrink)
+            logger.debug(
+                "[IND] disagreement shrink → p=%.3f (from %.3f), "
+                "margin=%.3f, ind=%.3f, mtf=%.3f, fut_cvd=%.6f",
+                p, raw_p, margin, ind, mtf, fut_cvd,
+            )
+            return p, neutral_prob
+
+        if strong_consensus and (agree_ind or agree_mtf):
+            boost = min(0.08, abs_margin * 0.4)
+            p = 0.5 + (p - 0.5) * (1.0 + boost)
+            p = max(0.0, min(1.0, p))
+            logger.debug(
+                "[IND] agreement boost → p=%.3f (from %.3f), "
+                "margin=%.3f, ind=%.3f, mtf=%.3f, fut_cvd=%.6f",
+                p, raw_p, margin, ind, mtf, fut_cvd,
+            )
+            return p, neutral_prob
+
+        return p, neutral_prob
 
     def predict(
         self,
@@ -289,6 +456,17 @@ class AdaptiveModelPipeline:
                 self.last_p_xgb_raw = None
                 self.last_p_xgb_calib = None
 
+            # Build engineered feature map for downstream lookups (futures, etc.)
+            engineered_feature_map: Dict[str, float] = {}
+            try:
+                if engineered_feature_names and engineered_features:
+                    engineered_feature_map = {
+                        str(k): float(v)
+                        for k, v in zip(engineered_feature_names, engineered_features)
+                    }
+            except Exception:
+                engineered_feature_map = {}
+
             # Neutrality (optional)
             neutral_prob = None
             try:
@@ -308,28 +486,29 @@ class AdaptiveModelPipeline:
                 logger.debug(f"Neutrality model inference failed: {e}")
                 neutral_prob = None
 
-            # Conservative indicator modulation
+            # Indicator / MTF modulation (with futures CVD awareness)
             p_model = float(signal_probs[0][1])
             p_after_indicator = p_model
-            if indicator_score is not None:
-                try:
-                    indicator_norm = 0.5 + 0.5 * np.tanh(indicator_score)
-                    margin = abs(p_model - 0.5)
-                    agree = (np.sign(indicator_norm - 0.5) == np.sign(p_model - 0.5)) and (np.sign(p_model - 0.5) != 0)
-                    strong_cons = (mtf_consensus is not None) and (abs(float(mtf_consensus)) >= 0.60)
-                    cap = 0.04 if strong_cons else 0.02
-                    if margin <= 0.12 and agree:
-                        blended = 0.9 * p_model + 0.1 * indicator_norm
-                        delta = float(np.clip(blended - p_model, -cap, cap))
-                        p_after_indicator = float(np.clip(p_model + delta, 0.0, 1.0))
-                        signal_probs = np.array([[1.0 - p_after_indicator, p_after_indicator]], dtype=float)
-                        logger.debug("[BLEND] gated: p_model=%.3f indicator=%.3f → p_after_indicator=%.3f (Δ=%+.3f, cap=%.3f)",p_model, indicator_norm, p_after_indicator, delta, cap)
-                    else:
-                      log_every("blend-skip",10,logger.debug,"[BLEND] skipped: margin=%.3f agree=%s p_model=%.3f indicator=%.3f",margin, agree, p_model, indicator_norm)
-                                              
-
-                except Exception as e:
-                    logger.warning(f"Indicator modulation failed: {e}")
+            try:
+                margin = abs(p_model - 0.5)
+                mtf_val = float(mtf_consensus) if mtf_consensus is not None else 0.0
+                ind_val = float(indicator_score) if indicator_score is not None else 0.0
+                neutral_in = float(neutral_prob) if neutral_prob is not None else 0.0
+                p_after_indicator, neutral_prob = self._apply_indicator_modulation(
+                    p=p_model,
+                    indicator_score=ind_val,
+                    mtf_consensus=mtf_val,
+                    neutral_prob=neutral_in,
+                    margin=margin,
+                    engineered_features=engineered_feature_map,
+                )
+                p_after_indicator = float(np.clip(p_after_indicator, 1e-4, 1 - 1e-4))
+                signal_probs = np.array(
+                    [[1.0 - p_after_indicator, p_after_indicator]],
+                    dtype=float,
+                )
+            except Exception as e:
+                logger.warning(f"Indicator modulation failed: {e}")
 
 
 
@@ -338,14 +517,12 @@ class AdaptiveModelPipeline:
             try:
                 if pattern_prob_adjustment is not None:
                     adj_in = float(pattern_prob_adjustment)
+                    pat_max_adj = adj_in
                     p_cur = float(signal_probs[0][1])
 
                     ind = float(indicator_score) if indicator_score is not None else 0.0
                     ind_abs = abs(ind)
                     strong_cons = (mtf_consensus is not None) and (abs(float(mtf_consensus)) >= 0.60)
-                    sign_pat = np.sign(adj_in)
-                    sign_ind = np.sign(ind)
-                    sign_mtf = np.sign(float(mtf_consensus)) if (mtf_consensus is not None) else 0.0
 
                     base_cap = 0.10 if strong_cons else 0.08
 
@@ -359,6 +536,18 @@ class AdaptiveModelPipeline:
                     s_neu = _smoothstep(neu, 0.55, 0.90)
                     cap_ctx = base_cap * (1.0 - 0.65 * s_neu)  # up to -65% at high neutral
 
+                    # --- NEW: allow bigger cap when pat + mtf + ind align and margin decent ---
+                    sign_pat = float(np.sign(pat_max_adj))
+                    sign_mtf = float(np.sign(float(mtf_consensus))) if (mtf_consensus is not None) else 0.0
+                    sign_ind = float(np.sign(ind))
+                    margin_cur = abs(p_cur - 0.5)
+
+                    aligned_triplet = (sign_pat != 0 and sign_pat == sign_mtf == sign_ind and margin_cur >= 0.08)
+
+                    if aligned_triplet and not strong_cons:
+                        cap_ctx = max(cap_ctx, 0.05)
+                        logger.debug("[PAT] aligned triplet -> cap floor to 0.05 (cap_ctx=%.3f)", cap_ctx)
+
                     # Conflict-aware shrink (unless strong consensus)
                     conflict = ((sign_pat != 0) and ((sign_ind != 0 and sign_pat != sign_ind) or
                                                     (sign_mtf != 0 and sign_pat != sign_mtf)))
@@ -366,7 +555,7 @@ class AdaptiveModelPipeline:
                         cap_ctx *= 0.5
 
                     # Weak-indicator shrink (keep original behavior)
-                    if (ind_abs < 0.25) and not strong_cons:
+                    if (ind_abs < 0.25) and (not strong_cons) and (not aligned_triplet):
                         cap_ctx = min(cap_ctx, 0.02)
 
                     # Clip incoming adjustment to base safety, then to context cap
@@ -404,13 +593,26 @@ class AdaptiveModelPipeline:
 
 
 
+            p_final = float(signal_probs[0][1])
+
+            # --- Final weak-model safety clip ------------------------------------
+            if self.model_quality == "weak":
+                clipped_p = min(0.65, max(0.35, p_final))
+                if clipped_p != p_final:
+                    logger.debug(
+                        "[PRED] weak-quality hard clip → p_final %.3f → %.3f",
+                        p_final,
+                        clipped_p,
+                    )
+                p_final = clipped_p
+                signal_probs = np.array([[1.0 - p_final, p_final]], dtype=float)
+
             # Final log
-            logger.debug("[PRED] p_model=%.3f p_after_indicator=%.3f p_after_pattern=%.3f neutral_prob=%s schema_n=%s",
+            logger.debug("[PRED] p_model=%.3f p_after_indicator=%.3f p_after_pattern=%.3f neutral_prob=%s",
                 p_model,
                 p_after_indicator,
                 p_after_pattern,
                 str(neutral_prob) if neutral_prob is not None else "na",
-                str(self.feature_schema_size),
             )
        
                    
