@@ -4,7 +4,7 @@ futures_vwap_cvd_sidecar.py
 Sidecar VWAP + CVD calculator for NIFTY futures (Dhan WebSocket v2).
 
 - Connects to DhanHQ live market feed as a separate process.
-- Subscribes to NIFTY-Nov2025-FUT (SecurityId=37054, NSE_FNO).
+- Subscribes to the configured front-month NIFTY future (SecurityId from FUT_SECURITY_ID env).
 - Parses Quote (code=4) and Full (code=8) packets to get REAL volume [[1]].
 - Computes:
     * Session VWAP  = Σ(price * dVol) / Σ(dVol)
@@ -75,7 +75,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 class SidecarConfig:
     dhan_access_token: str
     dhan_client_id: str
-    security_id: int = 37054              # NIFTY-Nov2025-FUT
+    security_id: int = 0                  # MUST be provided via FUT_SECURITY_ID env (roll every expiry)
     exchange_segment: str = "NSE_FNO"     # futures segment
     ws_ping_interval: int = 30
     ws_ping_timeout: int = 10
@@ -95,7 +95,10 @@ class SidecarConfig:
         if not self.dhan_access_token or not self.dhan_client_id:
             raise ValueError("DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID must be set in environment.")
         if not isinstance(self.security_id, int) or self.security_id <= 0:
-            raise ValueError(f"Invalid security_id: {self.security_id!r}")
+            raise ValueError(
+                f"Invalid security_id: {self.security_id!r}. "
+                "Set FUT_SECURITY_ID env to the current front-month futures instrument."
+            )
         if not isinstance(self.exchange_segment, str) or not self.exchange_segment:
             raise ValueError(f"Invalid exchange_segment: {self.exchange_segment!r}")
         if self.candle_interval_seconds <= 0:
@@ -207,6 +210,9 @@ class FuturesVWAPCVDClient:
         self._ticks_path = Path(cfg.out_path_ticks)
         self._candles_path = Path(cfg.out_path_candles)
         self._ensure_output_dirs()
+        
+        # Instrument/price diagnostics
+        self._price_sanity_failures: int = 0
 
     # ---------- helpers ----------
 
@@ -235,6 +241,28 @@ class FuturesVWAPCVDClient:
         minute_span = max(1, interval_sec // 60)
         bucket_min = (ts.minute // minute_span) * minute_span
         return ts.replace(second=0, microsecond=0, minute=bucket_min)
+    
+    def _record_price_sanity_failure(self, ltp: float, pkt: str) -> None:
+        """
+        Track repeated zero/invalid prices to surface likely contract roll issues.
+        """
+        try:
+            self._price_sanity_failures += 1
+            if self._price_sanity_failures in (1, 5):
+                self.log.error(
+                    "[%s] Price sanity failed (ltp=%.4f). "
+                    "If this repeats, verify FUT_SECURITY_ID for the current front-month contract "
+                    "(current=%s %s).", 
+                    pkt, float(ltp), self.cfg.exchange_segment, self.cfg.security_id,
+                )
+        except Exception:
+            pass
+    
+    def _clear_price_sanity_failures(self) -> None:
+        try:
+            self._price_sanity_failures = 0
+        except Exception:
+            pass
 
     def _reset_session_if_needed(self, ts: datetime) -> None:
         """
@@ -275,8 +303,10 @@ class FuturesVWAPCVDClient:
             if not np.isfinite(ltp):
                 return None
             if not (self.cfg.price_sanity_min <= ltp <= self.cfg.price_sanity_max):
-                self.log.warning(f"[TICKER] Price sanity failed: {ltp}")
+                self._record_price_sanity_failure(ltp, "TICKER")
                 return None
+            else:
+                self._clear_price_sanity_failures()
 
             # LTT is epoch per Dhan docs [[1]], but we prefer arrival time for bucket consistency
             # Guard: keep LTT in case we want to inspect later.
@@ -325,8 +355,10 @@ class FuturesVWAPCVDClient:
             if not np.isfinite(ltp):
                 return None
             if not (self.cfg.price_sanity_min <= ltp <= self.cfg.price_sanity_max):
-                self.log.warning(f"[QUOTE/FULL] Price sanity failed: {ltp}")
+                self._record_price_sanity_failure(ltp, "QUOTE/FULL")
                 return None
+            else:
+                self._clear_price_sanity_failures()
 
             last_qty = struct.unpack("<h", data[12:14])[0]
             ltt_raw = struct.unpack("<I", data[14:18])[0]

@@ -38,6 +38,13 @@ import requests
 from feature_pipeline import FeaturePipeline, TA
 from online_trainer import _train_xgb, _train_neutrality
 
+"""
+Purpose:
+- Build 2-minute labeled dataset (BUY / SELL / FLAT) from 1-minute candles.
+- Train XGB directional model (+ neutrality model).
+- This script uses *only past information* per reference bar; no future leakage.
+"""
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -231,6 +238,13 @@ def fetch_intraday_range(start: date, end: date) -> pd.DataFrame:
     return df_all
 
 
+def fetch_intraday_range_2min(start: date, end: date) -> pd.DataFrame:
+    """
+    Alias for fetch_intraday_range; retained for compatibility with leakage tests.
+    """
+    return fetch_intraday_range(start, end)
+
+
 def build_2min_dataset(df_candles: pd.DataFrame) -> pd.DataFrame:
     """
     Build features + 2-minute direction labels from 1-minute candles.
@@ -327,6 +341,11 @@ def build_2min_dataset(df_candles: pd.DataFrame) -> pd.DataFrame:
                         sigma_mult,
                         min_pts,
                     )
+                    if not np.isfinite(flat_tolerance_pts) or flat_tolerance_pts <= 0:
+                        raise ValueError(
+                            f"Computed flat_tolerance_pts={flat_tolerance_pts} is invalid; "
+                            "check sigma / cost settings before training."
+                        )
         except Exception as e:
             logger.warning("Failed to compute points-based FLAT tolerance; falling back to pct: %s", e)
             flat_tolerance_pts = None
@@ -543,6 +562,12 @@ def train_models_2min(df_train: pd.DataFrame, xgb_out_path: str, neutral_out_pat
         logger.error("No training data for 2-minute model.")
         return
 
+    # Optional: shuffle labels for leakage sanity check (offline only)
+    if os.getenv("SHUFFLE_LABELS_FOR_SANITY", "0") == "1":
+        logger.warning("[LEAKAGE] SHUFFLE_LABELS_FOR_SANITY=1 → shuffling labels for sanity test (offline only)")
+        df_train = df_train.copy()
+        df_train["label"] = np.random.permutation(df_train["label"].values)
+
     # Build feature matrix
     exclude = {"ts", "label"}
     drop_prefixes = ("meta_", "p_xgb_")
@@ -582,6 +607,12 @@ def train_models_2min(df_train: pd.DataFrame, xgb_out_path: str, neutral_out_pat
         pos_share,
         minor_share,
     )
+
+    # Ensure no NaNs / inf in features
+    if not np.isfinite(X_dir).all():
+        raise ValueError("Directional feature matrix contains NaN or inf values.")
+    if not np.isfinite(X_neu).all():
+        raise ValueError("Neutrality feature matrix contains NaN or inf values.")
 
     # Train XGB using your existing helper
     xgb_model = _train_xgb(X_dir, y_dir)

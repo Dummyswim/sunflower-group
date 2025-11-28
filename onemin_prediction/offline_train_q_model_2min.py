@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -30,32 +31,42 @@ def load_offline_predictions() -> pd.DataFrame:
 
 
 def build_training_matrix(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    df = df.copy()
+    if "is_directional" not in df.columns:
+        df["is_directional"] = df["label"].isin(["BUY", "SELL"]).astype(int)
+
     # Use only directional rows
-    mask_dir = df["label"].isin(["BUY", "SELL"])
-    df = df[mask_dir].copy()
-    if df.empty:
+    df_dir = df[df["is_directional"] == 1].copy()
+    if df_dir.empty:
         raise SystemExit("no directional rows for Q training")
 
-    # Target: 1 if direction correct
-    y_true = (df["label"] == "BUY").astype(int).values
-    y_pred = (df["p_buy"] >= 0.5).astype(int)
-    y = (y_true == y_pred).astype(int)
+    # Ensure clean inputs and target
+    if "correct" not in df_dir.columns:
+        df_dir["correct"] = (
+            ((df_dir["label"] == "BUY") & (df_dir["p_buy"] >= 0.5))
+            | ((df_dir["label"] == "SELL") & (df_dir["p_buy"] < 0.5))
+        ).astype(int)
 
-    feat_cols = [
+    df_dir = df_dir.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["p_buy", "cvd_divergence", "vwap_reversion_flag", "wick_extreme_up", "wick_extreme_down", "correct"]
+    )
+
+    feature_names = [
         "p_buy",
-        "neutral_prob",
-        "indicator_score",
-        "fut_vol_delta",
         "cvd_divergence",
         "vwap_reversion_flag",
         "wick_extreme_up",
         "wick_extreme_down",
     ]
-    cols = [c for c in feat_cols if c in df.columns]
+    cols = [c for c in feature_names if c in df_dir.columns]
+    if len(cols) != len(feature_names):
+        missing = [c for c in feature_names if c not in cols]
+        logger.warning("Missing Q features in dataset: %s", missing)
     if not cols:
         raise SystemExit("no Q features found in dataset")
 
-    X = df[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    X = df_dir[cols].values
+    y = df_dir["correct"].astype(int).values
     return X, y, cols
 
 
@@ -64,13 +75,25 @@ def main() -> None:
     X, y, cols = build_training_matrix(df)
 
     logger.info("Training Q logistic on %d samples, pos_rate=%.3f", len(y), y.mean())
-    clf = LogisticRegression(max_iter=500)
-    clf.fit(X, y)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    clf = LogisticRegression(
+        solver="lbfgs",
+        max_iter=2000,
+    )
+    clf.fit(X_scaled, y)
 
     coef = clf.coef_.ravel().tolist()
     intercept = float(clf.intercept_.ravel()[0])
 
-    payload = {"intercept": intercept, "coef": coef, "features": cols}
+    payload = {
+        "intercept": intercept,
+        "coef": coef,
+        "features": cols,
+        "scaler_mean": scaler.mean_.tolist(),
+        "scaler_scale": scaler.scale_.tolist(),
+    }
     Path(OUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)

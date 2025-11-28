@@ -32,6 +32,16 @@ import pandas as pd
 
 from offline_train_2min import fetch_intraday_range, build_2min_dataset, _parse_train_datetime
 
+"""
+Purpose:
+- Evaluate *raw* XGB directional model on a hold-out day.
+- Uses the same feature pipeline as offline_train_2min, but does NOT:
+  * apply calibration,
+  * blend indicators or patterns,
+  * use Q-model or neutrality gating.
+This script is your "no-extras" benchmark for true model edge.
+"""
+
 
 
 logger = logging.getLogger(__name__)
@@ -184,6 +194,12 @@ def _bin_accuracy(y_true: np.ndarray, p_buy: np.ndarray, bins, label: str = "buy
 
 def main():
     # ----- Config from env -----    
+    raw_only = os.getenv('EVAL_RAW_ONLY', '1') == '1'
+    if raw_only:
+        logger.info(
+            "EVAL_RAW_ONLY=1 → evaluating pure XGB probabilities "
+            "(no indicator/pattern/Q layers)."
+        )
 
     eval_start = os.getenv("EVAL_START_DATE", "").strip() or os.getenv("TRAIN_START_DATE", "").strip()
     eval_end = os.getenv("EVAL_END_DATE", "").strip() or os.getenv("TRAIN_END_DATE", "").strip()
@@ -262,6 +278,28 @@ def main():
     X, y_true, feat_cols = out
     logger.info("Feature matrix shape: X=%s, labels=%s, n_features=%d",
                 X.shape, y_true.shape, len(feat_cols))
+
+    # Verify we are using exactly the same feature set the booster was trained on
+    X_df = pd.DataFrame(X, columns=feat_cols)
+    try:
+        schema_json = booster.attr("feature_schema")
+    except Exception:
+        schema_json = None
+    if schema_json:
+        try:
+            schema = json.loads(schema_json)
+            expected_cols = schema.get("feature_names", [])
+            if expected_cols:
+                missing = [c for c in expected_cols if c not in X_df.columns]
+                extra = [c for c in X_df.columns if c not in expected_cols]
+                if missing:
+                    logger.warning("Missing expected features in eval X: %s", missing)
+                if extra:
+                    logger.warning("Extra features present in eval X (not in booster schema): %s", extra)
+                X_df = X_df[[c for c in expected_cols if c in X_df.columns]]
+        except Exception as e:
+            logger.warning("Failed to align features to booster schema: %s", e)
+    X = X_df.values
 
     # ----- Predict buy_prob -----
     p_buy = _predict_buy_prob(booster, X)

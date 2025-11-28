@@ -18,6 +18,14 @@ import pandas as pd
 
 from online_trainer import _parse_feature_csv  # re-use existing parser
 
+"""
+Purpose:
+- Evaluate *live* signals emitted by main_event_loop:
+  * signals.jsonl + feature_log_hist.csv
+- This is a \"how did my live system actually perform?\" report,
+  separate from offline_train_2min/offline_eval_2min.
+"""
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -169,6 +177,8 @@ def main():
         return
 
     logger.info("Merged rows: %d", len(merged))
+
+    merged = merged.replace([np.inf, -np.inf], np.nan).dropna(subset=["p_buy", "label"])
 
 
     # ---- NEW: normalize 'buy_prob' column name after merge ----
