@@ -18,12 +18,87 @@ def _atomic_write_json(path: str, obj: dict) -> None:
         json.dump(obj, f, indent=2)
     os.replace(tmp, p)
 
+
+
+def _looks_like_jsonl(path: str) -> bool:
+    p = (path or "").lower().strip()
+    if p.endswith(".jsonl") or p.endswith(".json"):
+        return True
+    # Peek first non-empty line
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for _ in range(5):
+                ln = f.readline()
+                if not ln:
+                    break
+                ln = ln.strip()
+                if not ln:
+                    continue
+                return ln.startswith("{") and ln.endswith("}")
+    except Exception:
+        return False
+    return False
+
+
+def _df_from_trainlog(path: str, max_rows: int = 50000):
+    """Build a calibration DataFrame from TRAIN_LOG_PATH JSONL.
+
+    Expected in each record:
+      - label: BUY/SELL/FLAT
+      - tradeable: bool (optional)
+      - features.meta_p_xgb_raw: float (preferred)
+    """
+    try:
+        from online_trainer_regen_v2 import load_train_log
+    except Exception:
+        load_train_log = None
+
+    if load_train_log is None:
+        return None
+
+    rows = load_train_log(path, max_rows=max_rows)
+    if not rows:
+        return None
+
+    out = []
+    for r in rows:
+        feats = r.get("features") or {}
+        ts = r.get("ts_ref_start") or r.get("ts_target_close") or r.get("ts")
+        out.append({
+            "ts": str(ts) if ts is not None else None,
+            "label": str(r.get("label", "")),
+            "tradeable": bool(r.get("tradeable")) if "tradeable" in r else True,
+            "meta_p_xgb_raw": feats.get("meta_p_xgb_raw", None),
+        })
+
+    import pandas as pd
+    df = pd.DataFrame(out)
+    if df.empty:
+        return None
+    df = df.dropna(subset=["ts", "label"])
+    return df
+
+
+def _load_calib_frame(path: str, *, max_rows: int):
+    """Load calibration rows from either JSONL train log (preferred) or legacy CSV."""
+    if not path or not os.path.exists(path):
+        return None
+
+    if _looks_like_jsonl(path):
+        return _df_from_trainlog(path, max_rows=max_rows)
+
+    # Legacy CSV
+    try:
+        from online_trainer_regen_v2 import _parse_feature_csv
+        return _parse_feature_csv(path, min_rows=0)
+    except Exception:
+        return None
 async def background_calibrator_loop(
     feature_log_path: str,
     calib_out_path: str,
     pipeline_ref,
     interval_sec: int = 1200,
-    min_dir_rows: int = 220
+    min_dir_rows: int = 120
 ):
     """
     Periodically fit Platt calibration on recent logs and write a,b to calib_out_path.
@@ -64,21 +139,18 @@ async def background_calibrator_loop(
 
             mtime_daily = os.path.getmtime(feature_log_path)
             hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
-            mtime_hist = os.path.getmtime(hist_path) if os.path.exists(hist_path) else 0.0
-            mtime_combined = max(mtime_daily, mtime_hist)
-            if last_mtime is not None and mtime_combined <= last_mtime:
-                log_every("calib-unchanged", 30, logger.debug, "[CALIB] Feature logs unchanged; skipping")
-                continue
-            last_mtime = mtime_combined
 
-
-
-            hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
+            # Option A (cleanest): prefer JSONL train log (stable schema).
+            # We still support legacy CSV feature logs for backward compatibility.
             try:
-                from online_trainer import _parse_feature_csv
-                df_daily = _parse_feature_csv(feature_log_path, min_rows=0)
-                df_hist = _parse_feature_csv(hist_path, min_rows=0) if os.path.exists(hist_path) else None
-                
+                max_rows = int(os.getenv("CALIB_MAX_LOAD_ROWS", "60000") or "60000")
+            except Exception:
+                max_rows = 60000
+
+            try:
+                df_daily = _load_calib_frame(feature_log_path, max_rows=max_rows)
+                df_hist = _load_calib_frame(hist_path, max_rows=max_rows) if os.path.exists(hist_path) else None
+
                 if df_daily is None and df_hist is None:
                     df = None
                 elif df_daily is not None and df_hist is not None:
@@ -87,7 +159,7 @@ async def background_calibrator_loop(
                 else:
                     df = df_daily if df_daily is not None else df_hist
             except Exception as e:
-                logger.warning(f"[CALIB] parse failed: {e}")
+                logger.warning(f"[CALIB] parse/load failed: {e}")
                 df = None
 
             # Optional freshness cap
@@ -99,6 +171,11 @@ async def background_calibrator_loop(
             if df is None or (isinstance(df, pd.DataFrame) and df.empty):
                 log_every("calib-not-enough", 60, logger.info, f"[CALIB] Not enough rows yet for calibration (min_dir_rows={min_dir_rows})")
                 continue
+
+            try:
+                min_dir_rows = int(os.getenv("CALIB_MIN_DIR_ROWS", str(min_dir_rows)))
+            except Exception:
+                pass
 
 
             # --- Adaptive multi-slice, class-balanced calibration ---
@@ -203,7 +280,15 @@ async def background_calibrator_loop(
 
 
                 x = _logit_clip_arr(p).reshape(-1, 1)
-                clf = LogisticRegression(max_iter=500, solver="lbfgs", class_weight="balanced")
+                try:
+                    calib_logit_max_iter = int(os.getenv("CALIB_LOGIT_MAX_ITER", "1000") or "1000")
+                except Exception:
+                    calib_logit_max_iter = 1000
+                clf = LogisticRegression(
+                    max_iter=calib_logit_max_iter,
+                    solver="lbfgs",
+                    class_weight="balanced",
+                )
                 clf.fit(x, y)
                 a = float(clf.coef_.ravel()[0])
                 b = float(clf.intercept_.ravel()[0])

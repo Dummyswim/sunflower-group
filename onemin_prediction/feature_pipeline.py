@@ -4,7 +4,7 @@ Unified feature engineering and drift detection (probabilities-only).
 """
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import logging
 
 try:
@@ -69,21 +69,243 @@ class TA:
             return 0.0, 0.0, 0.0, 0.5, 0.0
 
     @staticmethod
-    def compute_ta_bundle(prices: List[float]) -> Dict[str, float]:
-        rsi14 = TA.rsi(prices, period=14)
-        macd, macd_sig, macd_hist = TA.macd(prices)
-        bb_u, bb_m, bb_l, bb_pctb, bb_bw = TA.bollinger(prices)
-        return {
-            "ta_rsi14": float(rsi14),
-            "ta_macd": float(macd),
-            "ta_macd_signal": float(macd_sig),
-            "ta_macd_hist": float(macd_hist),
-            "ta_bb_upper": float(bb_u),
-            "ta_bb_mid": float(bb_m),
-            "ta_bb_lower": float(bb_l),
-            "ta_bb_pctb": float(bb_pctb),
-            "ta_bb_bw": float(bb_bw),
-        }
+    def stoch_kd(
+        high: pd.Series,
+        low: pd.Series,
+        close: pd.Series,
+        k_window: int = 14,
+        d_window: int = 3,
+    ) -> Tuple[pd.Series, pd.Series]:
+        """Stochastic %K / %D, 0–100, NaN-safe."""
+        try:
+            highest = high.rolling(k_window, min_periods=1).max()
+            lowest = low.rolling(k_window, min_periods=1).min()
+            denom = (highest - lowest).replace(0.0, np.nan)
+            k = 100.0 * (close - lowest) / denom
+            k = k.fillna(method="bfill").fillna(50.0)
+            d = k.rolling(d_window, min_periods=1).mean()
+            return k, d
+        except Exception:
+            return pd.Series(dtype=float), pd.Series(dtype=float)
+
+    @staticmethod
+    def cci(
+        high: pd.Series,
+        low: pd.Series,
+        close: pd.Series,
+        window: int = 20,
+    ) -> pd.Series:
+        """Commodity Channel Index."""
+        try:
+            tp = (high + low + close) / 3.0
+            ma = tp.rolling(window, min_periods=1).mean()
+            md = (tp - ma).abs().rolling(window, min_periods=1).mean()
+            md = md.replace(0.0, np.nan)
+            cci = (tp - ma) / (0.015 * md)
+            return cci.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        except Exception:
+            return pd.Series(dtype=float)
+
+    @staticmethod
+    def adx(
+        high: pd.Series,
+        low: pd.Series,
+        close: pd.Series,
+        window: int = 14,
+    ) -> pd.Series:
+        """Average Directional Index (0–100)."""
+        try:
+            up_move = high.diff()
+            down_move = -low.diff()
+            plus_dm = np.where(
+                (up_move > down_move) & (up_move > 0), up_move, 0.0
+            )
+            minus_dm = np.where(
+                (down_move > up_move) & (down_move > 0), down_move, 0.0
+            )
+
+            tr1 = high - low
+            tr2 = (high - close.shift()).abs()
+            tr3 = (low - close.shift()).abs()
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+            tr_s = tr.rolling(window, min_periods=1).sum().replace(0.0, np.nan)
+            plus_di = 100.0 * pd.Series(plus_dm).rolling(window, min_periods=1).sum() / tr_s
+            minus_di = 100.0 * pd.Series(minus_dm).rolling(window, min_periods=1).sum() / tr_s
+
+            dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+            adx = dx.rolling(window, min_periods=1).mean()
+            return adx.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        except Exception:
+            return pd.Series(dtype=float)
+
+    @staticmethod
+    def mfi(
+        high: pd.Series,
+        low: pd.Series,
+        close: pd.Series,
+        volume: pd.Series,
+        window: int = 14,
+    ) -> pd.Series:
+        """Money Flow Index (0–100)."""
+        try:
+            tp = (high + low + close) / 3.0
+            mf = tp * volume
+            pos_mf = mf.where(tp >= tp.shift(), 0.0)
+            neg_mf = mf.where(tp < tp.shift(), 0.0).abs()
+
+            pos_sum = pos_mf.rolling(window, min_periods=1).sum()
+            neg_sum = neg_mf.rolling(window, min_periods=1).sum().replace(0.0, np.nan)
+            mr = pos_sum / neg_sum
+            mfi = 100.0 - (100.0 / (1.0 + mr))
+            return mfi.replace([np.inf, -np.inf], np.nan).fillna(50.0)
+        except Exception:
+            return pd.Series(dtype=float)
+
+    @staticmethod
+    def momentum(close: pd.Series, window: int = 14) -> pd.Series:
+        """Simple close-to-close momentum."""
+        try:
+            mom = close.diff(window)
+            return mom.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        except Exception:
+            return pd.Series(dtype=float)
+
+    @staticmethod
+    def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+        """On-Balance Volume; we’ll z-score it later."""
+        try:
+            direction = np.sign(close.diff().fillna(0.0))
+            obv = (direction * volume).cumsum()
+            return obv.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        except Exception:
+            return pd.Series(dtype=float)
+
+    @staticmethod
+    def _zscore_last(series: pd.Series, window: int = 100) -> float:
+        """Return last value as clipped z-score (NaN-safe)."""
+        if series is None or series.empty:
+            return 0.0
+        tail = series.iloc[-window:]
+        try:
+            m = float(tail.mean())
+            s = float(tail.std(ddof=0))
+            if not np.isfinite(s) or s <= 0.0:
+                return 0.0
+            z = (float(tail.iloc[-1]) - m) / s
+            return float(np.clip(z, -5.0, 5.0))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def compute_ta_bundle(
+        candle_df: pd.DataFrame,
+        ema_feats: Dict[str, float],
+    ) -> Dict[str, float]:
+        """
+        Compute a compact TA bundle used by both offline and online pipelines.
+
+        All outputs are NaN-safe and either naturally bounded or softly clipped
+        so that downstream normalization does not explode.
+        """
+        try:
+            close = candle_df["close"].astype(float)
+        except Exception:
+            return {}
+
+        out: Dict[str, float] = {}
+
+        # --- Base series ----------------------------------------------------
+        high = candle_df.get("high")
+        low = candle_df.get("low")
+        vol = candle_df.get("volume", candle_df.get("vol"))
+
+        if high is not None:
+            high = high.astype(float)
+        if low is not None:
+            low = low.astype(float)
+        if vol is not None:
+            vol = vol.astype(float).fillna(0.0)
+
+        # --- RSI14 ----------------------------------------------------------
+        try:
+            rsi = TA.rsi(close, window=14)
+            out["ta_rsi14"] = float(rsi.iloc[-1]) if len(rsi) else 50.0
+        except Exception:
+            out["ta_rsi14"] = 50.0
+
+        # --- MACD (line / signal / hist) -----------------------------------
+        try:
+            macd_line, macd_signal, macd_hist = TA.macd(close)
+            if len(close):
+                out["ta_macd_line"] = float(macd_line)
+                out["ta_macd_signal"] = float(macd_signal)
+                out["ta_macd_hist"] = float(np.clip(macd_hist, -5.0, 5.0))
+        except Exception:
+            pass
+
+        # --- Bollinger Bands (+ %B, bandwidth) ------------------------------
+        try:
+            bb_up, bb_mid, bb_low, bb_pctb, bb_bw = TA.bollinger(prices=list(close))
+            if len(close):
+                out["ta_bb_mid"] = float(bb_mid)
+                out["ta_bb_pctb"] = float(bb_pctb)  # 0–1
+                out["ta_bb_bw"] = float(np.clip(bb_bw, 0.0, 5.0))
+        except Exception:
+            pass
+
+        # --- Stoch / CCI / ADX / MFI (need H/L[/V]) -------------------------
+        if high is not None and low is not None:
+            try:
+                stoch_k, stoch_d = TA.stoch_kd(high, low, close)
+                if len(stoch_k):
+                    out["ta_stoch_k"] = float(stoch_k.iloc[-1])  # 0–100
+                if len(stoch_d):
+                    out["ta_stoch_d"] = float(stoch_d.iloc[-1])
+            except Exception:
+                pass
+
+            try:
+                cci = TA.cci(high, low, close)
+                if len(cci):
+                    out["ta_cci"] = float(np.clip(cci.iloc[-1] / 200.0, -3.0, 3.0))
+            except Exception:
+                pass
+
+            try:
+                adx = TA.adx(high, low, close)
+                if len(adx):
+                    out["ta_adx"] = float(np.clip(adx.iloc[-1], 0.0, 100.0))
+            except Exception:
+                pass
+
+        if high is not None and low is not None and vol is not None:
+            try:
+                mfi = TA.mfi(high, low, close, vol)
+                if len(mfi):
+                    out["ta_mfi"] = float(mfi.iloc[-1])  # 0–100
+            except Exception:
+                pass
+
+        # --- Momentum & OBV-based oscillator --------------------------------
+        try:
+            mom14 = TA.momentum(close, window=14)
+            if len(mom14):
+                out["ta_mom14"] = float(
+                    np.clip(mom14.iloc[-1] / max(1.0, float(close.iloc[-1])), -0.05, 0.05)
+                )
+        except Exception:
+            pass
+
+        if vol is not None:
+            try:
+                obv = TA.obv(close, vol)
+                z = TA._zscore_last(obv, window=100)
+                out["ta_obv_z"] = float(z)
+            except Exception:
+                pass
+
+        return out
 
 class FeaturePipeline:
     def __init__(self, train_features: Dict):
@@ -128,23 +350,37 @@ class FeaturePipeline:
 
     @staticmethod
     def _is_bounded_key(k: str) -> bool:
-        if k.startswith("pat_is") or k.startswith("mtf_tf_"):
-            return True
         bounded_keys = {
-            "pat_rvol", "probability_adjustment", "mtf_adj", "mtf_consensus",
-            "price_range_tightness", "ta_bb_pctb", "ta_rsi14",
+            # Existing bounded features
+            "indicator_score",
+            "struct_pivot_swipe_up",
+            "struct_pivot_swipe_down",
+            "struct_fvg_up_present",
+            "struct_fvg_down_present",
+            "struct_ob_bull_present",
+            "struct_ob_bear_present",
+            "ta_rsi14",
+            "ta_bb_pctb",
+            "ta_bb_bw",
+            "mtf_consensus",
+            "pattern_prob_adjustment",
+            "vwap_reversion_flag",
+            "cvd_divergence",
+            # New TA features
+            "ta_macd_line",
+            "ta_macd_signal",
+            "ta_macd_hist",
+            "ta_stoch_k",
+            "ta_stoch_d",
+            "ta_cci",
+            "ta_adx",
+            "ta_mfi",
+            "ta_mom14",
+            "ta_obv_z",
         }
-        bounded_keys.update({
-            "fut_vwap_dev",
-            "fut_cvd_delta",
-            "fut_vol_delta",
-            "rv_10",
-            "atr_1t",
-            "atr_3t",
-            "tod_sin",
-            "tod_cos",
-        })
-        return k in bounded_keys
+        if k in bounded_keys:
+            return True
+        return k.startswith("struct_")
 
 
     @staticmethod
@@ -183,13 +419,27 @@ class FeaturePipeline:
         # Basic differences
         diffs = np.diff(arr)
         diffs = diffs[np.isfinite(diffs)]
+        # --- Fast regression slope on last N bars -------------------------
         if diffs.size == 0:
             micro_slope = 0.0
         else:
-            # normalise by last price for scale invariance
             last_px = float(arr[-1])
             denom = max(abs(last_px), 1e-6)
-            micro_slope = float(diffs[-min(5, diffs.size) :].mean() / denom)
+
+            window_n = min(5, arr.size)
+            y = arr[-window_n:]
+            x = np.arange(window_n, dtype=float)
+
+            try:
+                x_mean = float(x.mean())
+                y_mean = float(y.mean())
+                num = float(np.sum((x - x_mean) * (y - y_mean)))
+                den = float(np.sum((x - x_mean) ** 2)) or 1e-6
+                slope = num / den
+            except Exception:
+                slope = 0.0
+
+            micro_slope = float(slope / denom)
 
         # Up/down bar imbalance
         up = float((diffs > 0).sum())
@@ -224,6 +474,314 @@ class FeaturePipeline:
             "last_zscore": last_zscore,
         }
 
+    @staticmethod
+    def compute_pivot_swipe_features(df: pd.DataFrame, lookback: int = 20) -> dict:
+        """
+        Approximate pivot swing + swipe behaviour on the last candles.
+
+        Returns keys:
+          - struct_pivot_is_swing_high / struct_pivot_is_swing_low ∈ {0,1}
+          - struct_pivot_swipe_up / struct_pivot_swipe_down ∈ {0,1}
+          - struct_pivot_dist_from_high / struct_pivot_dist_from_low  (normalised distance)
+        """
+        feats = {
+            "struct_pivot_is_swing_high": 0.0,
+            "struct_pivot_is_swing_low": 0.0,
+            "struct_pivot_swipe_up": 0.0,
+            "struct_pivot_swipe_down": 0.0,
+            "struct_pivot_dist_from_high": 0.0,
+            "struct_pivot_dist_from_low": 0.0,
+        }
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return feats
+
+        df = df.tail(max(3, lookback)).copy()
+        if len(df) < 3:
+            return feats
+
+        highs = df["high"].astype(float)
+        lows = df["low"].astype(float)
+        closes = df["close"].astype(float)
+
+        last = df.iloc[-1]
+        last_close = float(last["close"])
+        if not np.isfinite(last_close) or last_close <= 0.0:
+            last_close = 0.0
+
+        pivot = df.iloc[-2]
+        pivot_high = float(pivot["high"])
+        pivot_low = float(pivot["low"])
+
+        try:
+            swing_high = float(highs.max())
+            swing_low = float(lows.min())
+        except Exception:
+            swing_high = pivot_high
+            swing_low = pivot_low
+
+        if np.isfinite(pivot_high) and pivot_high >= swing_high:
+            feats["struct_pivot_is_swing_high"] = 1.0
+        if np.isfinite(pivot_low) and pivot_low <= swing_low:
+            feats["struct_pivot_is_swing_low"] = 1.0
+
+        if last_close > 0.0:
+            if np.isfinite(swing_high):
+                feats["struct_pivot_dist_from_high"] = float((last_close - swing_high) / last_close)
+            if np.isfinite(swing_low):
+                feats["struct_pivot_dist_from_low"] = float((last_close - swing_low) / last_close)
+
+        prev = df.iloc[-2]
+        prev_high = float(prev["high"])
+        prev_low = float(prev["low"])
+        last_high = float(last["high"])
+        last_low = float(last["low"])
+
+        if np.isfinite(prev_high) and np.isfinite(last_high) and np.isfinite(last_close):
+            if (last_high > prev_high) and (last_close < prev_high):
+                feats["struct_pivot_swipe_up"] = 1.0
+
+        if np.isfinite(prev_low) and np.isfinite(last_low) and np.isfinite(last_close):
+            if (last_low < prev_low) and (last_close > prev_low):
+                feats["struct_pivot_swipe_down"] = 1.0
+
+        return feats
+
+    @staticmethod
+    def compute_fvg_features(df: pd.DataFrame) -> dict:
+        """
+        Simple 3-candle Fair Value Gap (FVG) approximation around last bars.
+        """
+        feats = {
+            "struct_fvg_up_present": 0.0,
+            "struct_fvg_down_present": 0.0,
+            "struct_fvg_up_size": 0.0,
+            "struct_fvg_down_size": 0.0,
+        }
+        if not isinstance(df, pd.DataFrame) or len(df) < 3:
+            return feats
+
+        df = df.tail(3).copy()
+        a, b, c = df.iloc[0], df.iloc[1], df.iloc[2]
+
+        try:
+            high_a = float(a["high"])
+            low_a = float(a["low"])
+            low_b = float(b["low"])
+            high_b = float(b["high"])
+            low_c = float(c["low"])
+        except Exception:
+            return feats
+
+        px_ref = float(c.get("close", high_b))
+        if not np.isfinite(px_ref) or px_ref <= 0.0:
+            px_ref = 1.0
+
+        if np.isfinite(low_b) and np.isfinite(high_a) and (low_b > high_a):
+            gap = float(low_b - high_a)
+            if gap > 0.0:
+                feats["struct_fvg_up_present"] = 1.0
+                feats["struct_fvg_up_size"] = gap / px_ref
+
+        if np.isfinite(high_b) and np.isfinite(low_a) and (high_b < low_a):
+            gap = float(low_a - high_b)
+            if gap > 0.0:
+                feats["struct_fvg_down_present"] = 1.0
+                feats["struct_fvg_down_size"] = gap / px_ref
+
+        return feats
+
+    @staticmethod
+    def compute_orderblock_features(df: pd.DataFrame, lookback: int = 20) -> dict:
+        """
+        Very lightweight order-block proxy:
+
+        - Bullish OB ≈ lowest low within lookback (support zone)
+        - Bearish OB ≈ highest high within lookback (resistance zone)
+        """
+        feats = {
+            "struct_ob_bull_present": 0.0,
+            "struct_ob_bear_present": 0.0,
+            "struct_ob_bull_dist": 0.0,
+            "struct_ob_bear_dist": 0.0,
+        }
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return feats
+
+        df = df.tail(max(3, lookback)).copy()
+        closes = df["close"].astype(float).to_numpy()
+        highs = df["high"].astype(float).to_numpy()
+        lows = df["low"].astype(float).to_numpy()
+
+        if closes.size == 0 or highs.size == 0 or lows.size == 0:
+            return feats
+
+        last_close = float(closes[-1])
+        if not np.isfinite(last_close) or last_close <= 0.0:
+            last_close = 0.0
+
+        idx_low = int(np.nanargmin(lows))
+        ob_low = float(lows[idx_low])
+        if np.isfinite(ob_low) and last_close > 0.0:
+            feats["struct_ob_bull_present"] = 1.0
+            feats["struct_ob_bull_dist"] = (last_close - ob_low) / last_close
+
+        idx_high = int(np.nanargmax(highs))
+        ob_high = float(highs[idx_high])
+        if np.isfinite(ob_high) and last_close > 0.0:
+            feats["struct_ob_bear_present"] = 1.0
+            feats["struct_ob_bear_dist"] = (last_close - ob_high) / last_close
+
+        # --- Conflict resolution: do NOT allow both bull & bear OB at once ---
+        bull = bool(feats["struct_ob_bull_present"])
+        bear = bool(feats["struct_ob_bear_present"])
+        if bull and bear:
+            bull_dist = float(feats.get("struct_ob_bull_dist", 0.0))
+            bear_dist = float(feats.get("struct_ob_bear_dist", 0.0))
+
+            bull_mag = abs(bull_dist)
+            bear_mag = abs(bear_dist)
+
+            max_rel_dist = 0.01
+            if bull_mag > max_rel_dist and bear_mag > max_rel_dist:
+                feats["struct_ob_bull_present"] = 0.0
+                feats["struct_ob_bear_present"] = 0.0
+                feats["struct_ob_bull_dist"] = 0.0
+                feats["struct_ob_bear_dist"] = 0.0
+            elif bull_mag <= bear_mag:
+                feats["struct_ob_bear_present"] = 0.0
+                feats["struct_ob_bear_dist"] = 0.0
+            else:
+                feats["struct_ob_bull_present"] = 0.0
+                feats["struct_ob_bull_dist"] = 0.0
+
+        return feats
+
+    @staticmethod
+    def compute_structure_bundle(df: pd.DataFrame) -> dict:
+        """
+        Unified structure signal bundle:
+          - pivot swipe / swing distance
+          - FVG presence & size
+          - order-block presence & distance
+        """
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {
+                "struct_pivot_is_swing_high": 0.0,
+                "struct_pivot_is_swing_low": 0.0,
+                "struct_pivot_swipe_up": 0.0,
+                "struct_pivot_swipe_down": 0.0,
+                "struct_pivot_dist_from_high": 0.0,
+                "struct_pivot_dist_from_low": 0.0,
+                "struct_fvg_up_present": 0.0,
+                "struct_fvg_down_present": 0.0,
+                "struct_fvg_up_size": 0.0,
+                "struct_fvg_down_size": 0.0,
+                "struct_ob_bull_present": 0.0,
+                "struct_ob_bear_present": 0.0,
+                "struct_ob_bull_dist": 0.0,
+                "struct_ob_bear_dist": 0.0,
+            }
+
+        feats = {}
+        feats.update(FeaturePipeline.compute_pivot_swipe_features(df))
+        feats.update(FeaturePipeline.compute_fvg_features(df))
+        feats.update(FeaturePipeline.compute_orderblock_features(df))
+        return feats
+
+    @staticmethod
+    def compute_pattern_features(df: pd.DataFrame) -> Dict[str, float]:
+        try:
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return {}
+            return FeaturePipeline.compute_candlestick_patterns(
+                candles=df.tail(max(3, 5)),
+                rvol_window=5,
+                rvol_thresh=1.2,
+                min_winrate=0.55,
+            )
+        except Exception:
+            return {}
+
+    @staticmethod
+    def compute_mtf_pattern_features(
+        df: pd.DataFrame,
+        base_tf: str = "1T",
+        higher_tfs: Optional[List[str]] = None,
+        rvol_window: int = 5,
+        rvol_thresh: float = 1.2,
+        min_winrate: float = 0.55,
+    ) -> Dict[str, float]:
+        if higher_tfs is None:
+            higher_tfs = ["3T", "5T"]
+        try:
+            return FeaturePipeline.compute_mtf_pattern_consensus(
+                candle_df=df,
+                timeframes=[base_tf] + list(higher_tfs),
+                rvol_window=rvol_window,
+                rvol_thresh=rvol_thresh,
+                min_winrate=min_winrate,
+            )
+        except Exception:
+            return {}
+
+    @staticmethod
+    def compute_rvol(volume: np.ndarray, window: int = 10) -> float:
+        try:
+            v = np.asarray(volume, dtype=float)
+            if v.size < window + 1:
+                return 0.0
+            recent = v[-1]
+            base = np.nanmedian(v[-window - 1:-1])
+            return float(recent / max(1e-9, base))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def compute_atr_from_candles(df: pd.DataFrame, window: int = 14) -> float:
+        try:
+            if df is None or df.empty:
+                return 0.0
+            hi = pd.to_numeric(df["high"], errors="coerce")
+            lo = pd.to_numeric(df["low"], errors="coerce")
+            tr = (hi - lo).abs().tail(max(1, window))
+            return float(np.nanmean(tr))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def compute_atr(df: pd.DataFrame, window: int = 14) -> float:
+        return FeaturePipeline.compute_atr_from_candles(df, window=window)
+
+    @staticmethod
+    def compute_realised_vol(px_hist: List[float], window: int = 10) -> float:
+        try:
+            arr = np.asarray(px_hist, dtype=float)
+            if arr.size < window + 1:
+                return 0.0
+            diff = np.diff(arr[-(window + 1):])
+            return float(np.nanstd(diff))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def time_of_day_sin_cos(ts) -> tuple[float, float]:
+        try:
+            if not isinstance(ts, (pd.Timestamp,)):
+                ts = pd.to_datetime(ts)
+            minute_of_day = ts.hour * 60 + ts.minute
+            angle = 2.0 * np.pi * (minute_of_day / (24.0 * 60.0))
+            return float(np.sin(angle)), float(np.cos(angle))
+        except Exception:
+            return 0.0, 0.0
+
+    @staticmethod
+    def compute_tod_features(ts) -> Dict[str, float]:
+        s, c = FeaturePipeline.time_of_day_sin_cos(ts)
+        return {"tod_sin": s, "tod_cos": c}
+
+    @staticmethod
+    def compute_wick_extremes(last: pd.Series) -> tuple[float, float]:
+        return FeaturePipeline._compute_wick_extremes(last)
 
     @staticmethod
     def _compute_wick_extremes(last: pd.Series) -> tuple[float, float]:
@@ -780,25 +1338,26 @@ class FeaturePipeline:
         # END original body
 
     @staticmethod
-    def compute_sr_features(candle_df: pd.DataFrame) -> Dict[str, float]:
+    def compute_sr_features(candle_df: pd.DataFrame, timeframes: Optional[List[str]] = None) -> Dict[str, float]:
         """
         Compute simple support/resistance features over 1T/3T/5T windows:
         - distances from last close to rolling high/low
         - recent breakout flags
         """
-        out = {
-            "sr_1T_hi_dist": 0.0, "sr_1T_lo_dist": 0.0,
-            "sr_3T_hi_dist": 0.0, "sr_3T_lo_dist": 0.0,
-            "sr_5T_hi_dist": 0.0, "sr_5T_lo_dist": 0.0,
-            "sr_breakout_up": 0.0, "sr_breakout_dn": 0.0
-        }
+        if timeframes is None:
+            timeframes = ["1T", "3T", "5T"]
+        out = {"sr_breakout_up": 0.0, "sr_breakout_dn": 0.0}
+        for tf in timeframes:
+            key = str(tf).replace("min", "T") if str(tf).endswith("min") else str(tf)
+            out[f"sr_{key}_hi_dist"] = 0.0
+            out[f"sr_{key}_lo_dist"] = 0.0
         try:
             if not isinstance(candle_df, pd.DataFrame) or candle_df.empty:
                 return out
             df = candle_df.copy()
             last_close = float(df["close"].astype(float).iloc[-1])
             def _dist(window: int) -> tuple:
-                sub = df.tail(window)
+                sub = df.tail(max(1, window))
                 if sub.empty:
                     return 0.0, 0.0
                 hi = float(sub["high"].astype(float).max())
@@ -806,11 +1365,23 @@ class FeaturePipeline:
                 hi_dist = (hi - last_close) / max(1e-9, last_close)
                 lo_dist = (last_close - lo) / max(1e-9, last_close)
                 return hi_dist, lo_dist
-            out["sr_1T_hi_dist"], out["sr_1T_lo_dist"] = _dist(1)
-            out["sr_3T_hi_dist"], out["sr_3T_lo_dist"] = _dist(3)
-            out["sr_5T_hi_dist"], out["sr_5T_lo_dist"] = _dist(5)
-            # breakout flags vs recent 5T band
-            sub5 = df.tail(5)
+
+            breakout_window = 0
+            for tf in timeframes:
+                try:
+                    tf_str = str(tf)
+                    tf_clean = tf_str.replace("T", "").replace("min", "")
+                    bars = int(float(tf_clean)) if tf_clean else 0
+                except Exception:
+                    bars = 0
+                bars = max(1, bars)
+                key = tf_str.replace("min", "T") if tf_str.endswith("min") else tf_str
+                hi_d, lo_d = _dist(bars)
+                out[f"sr_{key}_hi_dist"] = hi_d
+                out[f"sr_{key}_lo_dist"] = lo_d
+                breakout_window = max(breakout_window, bars)
+
+            sub5 = df.tail(max(5, breakout_window))
             if not sub5.empty:
                 hi5 = float(sub5["high"].astype(float).max())
                 lo5 = float(sub5["low"].astype(float).min())

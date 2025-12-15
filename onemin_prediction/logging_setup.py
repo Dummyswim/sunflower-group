@@ -385,3 +385,6 @@ def get_logger(name: str) -> logging.Logger:
 
 # Module-level logger for this file
 _module_logger = logging.getLogger(__name__)
+
+# Backwards-compatible alias for existing callers
+setup_logging = setup_logging2

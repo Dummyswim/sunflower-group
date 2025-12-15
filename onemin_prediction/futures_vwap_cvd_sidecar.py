@@ -10,9 +10,9 @@ Sidecar VWAP + CVD calculator for NIFTY futures (Dhan WebSocket v2).
     * Session VWAP  = Σ(price * dVol) / Σ(dVol)
     * CVD           = cumulative signed dVol using tick-rule classification.
 - Aggregates to 1-minute candles.
-- Writes outputs to:
-    * logs/fut_ticks_vwap_cvd.csv    (per-tick)
-    * logs/fut_candles_vwap_cvd.csv  (per-minute)
+- Writes outputs to (paths are configurable):
+    * FUT_TICKS_PATH   (per-tick, default: trained_models/production/fut_ticks_vwap_cvd.csv)
+    * FUT_SIDECAR_PATH (per-minute, default: trained_models/production/fut_candles_vwap_cvd.csv)
 - Does NOT modify or depend on the existing automation's event loop.
   It only uses the same logging conventions (logging_setup.py).
 
@@ -41,8 +41,8 @@ Usage:
 
     python futures_vwap_cvd_sidecar.py
 
-Later, the main automation can read logs/fut_candles_vwap_cvd.csv
-and logs/fut_ticks_vwap_cvd.csv to integrate VWAP/CVD.
+Later, the main automation can read FUT_SIDECAR_PATH (candles) and FUT_TICKS_PATH (ticks) to integrate VWAP/CVD.
+(Your main_event_loop_regen defaults FUT_SIDECAR_PATH to trained_models/production/fut_candles_vwap_cvd.csv.)
 
 """
 
@@ -756,6 +756,16 @@ async def _async_main():
     seg_env = os.getenv("FUT_EXCHANGE_SEGMENT", "").strip()
     if seg_env:
         cfg.exchange_segment = seg_env
+
+    # Output paths (fix docs vs defaults): allow runtime override via env
+    # - FUT_SIDECAR_PATH is what main_event_loop_regen reads for per-minute candles
+    # - FUT_TICKS_PATH is optional, for tick-level inspection/debug
+    out_ticks = os.getenv("FUT_TICKS_PATH", "").strip()
+    out_candles = os.getenv("FUT_SIDECAR_PATH", "").strip()
+    if out_ticks:
+        cfg.out_path_ticks = out_ticks
+    if out_candles:
+        cfg.out_path_candles = out_candles
 
     # Validate config (#5)
     try:

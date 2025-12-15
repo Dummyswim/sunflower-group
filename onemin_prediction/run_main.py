@@ -1,7 +1,7 @@
 # run_main.py
 """
-Runner script for probabilities-only 2-minute directional predictor.
-Emits p(BUY)/p(SELL) for a 2-minute horizon; user decides what to trade.
+Runner script for probabilities-only 5-minute directional predictor.
+Emits p(BUY)/p(SELL) for a 5-minute horizon; user decides what to trade.
 """
 
 from types import SimpleNamespace
@@ -9,7 +9,7 @@ import asyncio
 import base64
 import numpy as np
 import logging, os
-from main_event_loop import main_loop
+from main_event_loop_regen import main_loop
 from collections import deque
 
 
@@ -19,25 +19,26 @@ except ImportError:
     joblib = None
     logging.warning("[MODELS] joblib not available; neutrality model cannot be loaded (NEUTRAL_PATH is required)")
 
-# Dummy model stub for latent extraction (optional)
-class DummyCNNLSTM:
-    def predict(self, x):
-        return np.zeros((8,), dtype=float)
-
 # ========== CONFIGURATION ==========
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-REQUIRE_TRAINED_MODELS = os.getenv("REQUIRE_TRAINED_MODELS", "0") in ("1", "true", "True")
 
 config = SimpleNamespace(
+    # Instrument / subscription
+    symbol=os.getenv("TRAIN_SYMBOL", "IDX_I:NIFTY 50"),
+    nifty_security_id=13,
+    nifty_exchange_segment="IDX_I",
+
     # Provider credentials (encoded)
     dhan_access_token_b64=base64.b64encode(DHAN_ACCESS_TOKEN.encode()).decode(),
     dhan_client_id_b64=base64.b64encode(DHAN_CLIENT_ID.encode()).decode(),
-    nifty_security_id=13,
-    nifty_exchange_segment="IDX_I",
-    candle_interval_seconds=60,
+
+    # --- TIMEFRAME / CANDLE CONFIG -----------------------------------------
+    # Use 5-minute candles by default; override with CANDLE_INTERVAL_SECONDS
+    # if you want to experiment with other bar sizes.
+    candle_interval_seconds=int(os.getenv("CANDLE_INTERVAL_SECONDS", "300")),
 
     # User control and signal output
     user_trade_control=True,
@@ -75,22 +76,15 @@ config = SimpleNamespace(
     pattern_rvol_threshold=1.2,
     pattern_min_winrate=0.55,
 
-
-    # Flat labelling (relax to increase directional rows)
-    flat_tolerance_pct=float(os.getenv("FLAT_TOLERANCE_PCT", "0.00010")),  # default 0.01%
-    flat_dyn_k_range=0.20,
-    flat_min_points=0.20,
-    flat_tolerance_max_pts=3.0,
+    # Trade-window TP/SL config (replaces flat tolerance)
+    trade_horizon_min=int(os.getenv("TRADE_HORIZON_MIN", "10") or "10"),
+    trade_tp_pct=float(os.getenv("TRADE_TP_PCT", "0.0015") or "0.0015"),
+    trade_sl_pct=float(os.getenv("TRADE_SL_PCT", "0.0008") or "0.0008"),
 
     # Calibrator cadence (fit on >=220 directional rows)
     calib_interval_sec=300,
     calib_min_rows=220,
 
-)
-
-logging.info(
-    "[CFG] flat_tolerance_pct=%.6f (env FLAT_TOLERANCE_PCT)",
-    config.flat_tolerance_pct,
 )
 
 # Minimal drift baseline seed (will be refreshed from feature_log)
@@ -106,25 +100,14 @@ train_features = {
 }
 
 def _load_models():
-    cnn = None
     xgb_model = None
     neutral_model = None
 
-    cnn_path = os.getenv("CNN_LSTM_PATH", "").strip()
-    xgb_path = os.getenv("XGB_PATH", "").strip()
-    neutral_path = os.getenv("NEUTRAL_PATH", "").strip()
+    xgb_default = "trained_models/production/xgb_5min_trade_window.json"
+    neutral_default = "trained_models/production/neutral_5min.pkl"
 
-    # CNN-LSTM optional
-    if cnn_path:
-        try:
-            os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-            from tensorflow import keras
-            cnn = keras.models.load_model(cnn_path)
-            logging.info(f"[MODELS] CNN-LSTM loaded from {cnn_path}")
-        except Exception as e:
-            logging.warning(f"Failed to load CNN-LSTM, using dummy: {e}")
-    else:
-        logging.info("[MODELS] CNN-LSTM not configured; using dummy")
+    xgb_path = (os.getenv("XGB_PATH", "") or xgb_default).strip()
+    neutral_path = (os.getenv("NEUTRAL_PATH", "") or neutral_default).strip()
 
     # XGB required
     if not xgb_path or not os.path.exists(xgb_path):
@@ -171,18 +154,15 @@ def _load_models():
         logging.critical(f"Failed to load Neutrality model at {neutral_path}: {e}")
         raise SystemExit(3)
 
-    return (cnn if cnn is not None else DummyCNNLSTM(),
-            xgb_model,
-            neutral_model)
+    return xgb_model, neutral_model
 
 # Globals for main()
-global cnn_model, xgb_model, neutral_model
-cnn_model, xgb_model, neutral_model = _load_models()
+global xgb_model, neutral_model
+xgb_model, neutral_model = _load_models()
 
 async def main():
     await main_loop(
         config=config,
-        cnn_lstm=cnn_model,
         xgb=xgb_model,
         train_features=train_features,
         token_b64=base64.b64encode(TELEGRAM_BOT_TOKEN.encode()).decode(),
@@ -279,14 +259,15 @@ if __name__ == "__main__":
         telegram_min_level=logging.ERROR
     )
 
-    # Force DEBUG for core modules while stabilizing
-    try:
-        for mod in ("main_event_loop", "core_handler", "feature_pipeline",
-                    "model_pipeline", "online_trainer", "calibrator"):
-            logging.getLogger(mod).setLevel(logging.DEBUG)
-        logging.info("[LOG] Forced DEBUG level for core modules")
-    except Exception as e:
-        logging.debug(f"[LOG] Force DEBUG failed (ignored): {e}")
+    # Force DEBUG for core modules while stabilizing (only when LOG_HIGH_VERBOSITY=1)
+    if _high_verbose:
+        try:
+            for mod in ("main_event_loop_regen", "core_handler", "feature_pipeline",
+                        "model_pipeline_regen_v2", "online_trainer_regen_v2", "calibrator"):
+                logging.getLogger(mod).setLevel(logging.DEBUG)
+            logging.info("[LOG] Forced DEBUG level for core modules (LOG_HIGH_VERBOSITY=1)")
+        except Exception as e:
+            logging.debug(f"[LOG] Force DEBUG failed (ignored): {e}")
 
 
     try:
@@ -295,7 +276,6 @@ if __name__ == "__main__":
     except Exception as e:
         logging.debug(f"[LOG] Log watcher not started: {e}")
 
-    logging.info("[BOOT] REQUIRE_TRAINED_MODELS=%s (env)", REQUIRE_TRAINED_MODELS)
     logging.info("XGB_PATH=%s | NEUTRAL_PATH=%s",
                 os.getenv("XGB_PATH","") or "(not set)",
                 os.getenv("NEUTRAL_PATH","") or "(not set)")
@@ -309,13 +289,16 @@ if __name__ == "__main__":
 
 
     # Bootstrap daily feature log from historical when directional rows are below threshold
-    try:
-        hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
-        daily_path = config.feature_log_path
-        dir_threshold = int(getattr(config, "calib_min_rows", 300))
-        bootstrap_feature_log(hist_path, daily_path, dir_threshold=dir_threshold, tail_rows=2000)
-    except Exception as e:
-        logging.debug(f"[BOOT] Bootstrap failed (ignored): {e}")
+    if os.getenv("BOOTSTRAP_FEATURE_LOG", "0").lower() in ("1", "true", "yes"):
+        try:
+            hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
+            daily_path = config.feature_log_path
+            dir_threshold = int(getattr(config, "calib_min_rows", 300))
+            bootstrap_feature_log(hist_path, daily_path, dir_threshold=dir_threshold, tail_rows=2000)
+        except Exception as e:
+            logging.debug(f"[BOOT] Bootstrap failed (ignored): {e}")
+    else:
+        logging.info("[BOOT] Bootstrap disabled (set BOOTSTRAP_FEATURE_LOG=1 to enable).")
 
 
 

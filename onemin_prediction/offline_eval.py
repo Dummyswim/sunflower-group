@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
-
 """
-Offline evaluation and reliability curves for the probabilities-only 2-minute system.
+offline_eval.py
 
-- Joins trained_models/production/signals.jsonl (pre-close predictions) with feature_log_hist.csv
-  (2-minute directional labels + features, logged at the target close time).
-...
+Offline evaluation for live signals emitted by main_event_loop_regen:
+
+- signals.jsonl (pred_for, buy_prob, neutral_prob, etc.)
+- labels come from:
+    (A) FEATURE_LOG_HIST (if parseable), else
+    (B) TRAIN_LOG_PATH (data/train_log_v2.jsonl)
+
+This makes evaluation robust against CSV schema drift/corruption.
 """
 
 import os
 import json
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 
 import numpy as np
 import pandas as pd
 
-from online_trainer import _parse_feature_csv  # re-use existing parser
-
-"""
-Purpose:
-- Evaluate *live* signals emitted by main_event_loop:
-  * signals.jsonl + feature_log_hist.csv
-- This is a \"how did my live system actually perform?\" report,
-  separate from offline_train_2min/offline_eval_2min.
-"""
+from online_trainer_regen_v2 import _parse_feature_csv, load_train_log  # shim must re-export
 
 
 logger = logging.getLogger(__name__)
@@ -33,20 +29,18 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 )
 
-
 def _load_signals(path: str) -> Optional[pd.DataFrame]:
     if not os.path.exists(path):
         logger.error("Signals file not found: %s", path)
         return None
-    rows = []
+    rows: List[Dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as f:
         for ln in f:
             ln = ln.strip()
             if not ln:
                 continue
             try:
-                obj = json.loads(ln)
-                rows.append(obj)
+                rows.append(json.loads(ln))
             except Exception:
                 continue
     if not rows:
@@ -59,31 +53,54 @@ def _load_signals(path: str) -> Optional[pd.DataFrame]:
     return df
 
 
-def _join_signals_features(
-    df_sig: pd.DataFrame,
-    df_feat: pd.DataFrame
-) -> pd.DataFrame:
-    """
-    Inner-join signals and feature logs on timestamp:
-    signals.pred_for == features.ts
-    """
+def _labels_from_trainlog(train_log_path: str, max_rows: int = 300000) -> Optional[pd.DataFrame]:
+    if not os.path.exists(train_log_path):
+        logger.error("TRAIN_LOG_PATH not found: %s", train_log_path)
+        return None
+
+    rows = load_train_log(train_log_path, max_rows=max_rows)
+    if not rows:
+        logger.error("No rows in TRAIN_LOG_PATH: %s", train_log_path)
+        return None
+
+    out = []
+    for r in rows:
+        # prefer ts_target_close (what you trained on), else ts
+        ts = r.get("ts_target_close") or r.get("ts")
+        lbl = r.get("label")
+        if ts is None or lbl is None:
+            continue
+        out.append({
+            "ts": str(ts),
+            "label": str(lbl),
+            "tradeable": bool(r.get("tradeable")) if "tradeable" in r else None,
+            "aux_label_short": r.get("aux_label_short"),
+        })
+
+    if not out:
+        return None
+
+    df = pd.DataFrame(out)
+
+    # If multiple entries per timestamp, keep the last one (latest view of that bar)
+    df = df.dropna(subset=["ts", "label"])
+    df = df.drop_duplicates(subset=["ts"], keep="last")
+    return df
+
+
+def _join_signals_labels(df_sig: pd.DataFrame, df_lbl: pd.DataFrame) -> pd.DataFrame:
     df_sig = df_sig.copy()
-    df_feat = df_feat.copy()
+    df_lbl = df_lbl.copy()
 
-    # Ensure minimal required columns
-    if "ts" not in df_feat.columns or "label" not in df_feat.columns:
-        raise ValueError("feature_log_hist is missing ts/label columns")
-
-    # Use string keys for join to avoid timezone confusion
     df_sig["pred_for_str"] = df_sig["pred_for"].astype(str)
-    df_feat["ts_str"] = df_feat["ts"].astype(str)
+    df_lbl["ts_str"] = df_lbl["ts"].astype(str)
 
     merged = df_sig.merge(
-        df_feat,
+        df_lbl,
         left_on="pred_for_str",
         right_on="ts_str",
         how="inner",
-        suffixes=("_sig", "_feat")
+        suffixes=("_sig", "_lbl"),
     )
     return merged
 
@@ -96,52 +113,61 @@ def _dir_label_to_int(lbl: str) -> int:
     return 0
 
 
-def _compute_accuracy(merged: pd.DataFrame) -> Tuple[float, float]:
-    """
-    Returns (overall_acc, tradeable_acc).
-    """
-    df = merged.copy()
-    if "label" not in df.columns:
-        logger.error("Merged DataFrame missing 'label' column")
-        return 0.0, 0.0
-
-    df["dir_true"] = df["label"].map(_dir_label_to_int).fillna(0).astype(int)
-    df["dir_pred"] = np.sign(df["buy_prob"] - 0.5).astype(int)
-
+def _compute_accuracy(df: pd.DataFrame) -> Tuple[float, float]:
     mask_dir = df["dir_true"].isin([1, -1])
     if mask_dir.sum() == 0:
-        logger.warning("No directional labels (BUY/SELL) in merged data")
         return 0.0, 0.0
 
     overall_acc = float((df.loc[mask_dir, "dir_pred"] == df.loc[mask_dir, "dir_true"]).mean())
 
     if "tradeable" in df.columns:
         mask_tr = mask_dir & (df["tradeable"] == True)
-        if mask_tr.sum() > 0:
-            tradeable_acc = float((df.loc[mask_tr, "dir_pred"] == df.loc[mask_tr, "dir_true"]).mean())
-        else:
-            tradeable_acc = 0.0
+        tradeable_acc = float((df.loc[mask_tr, "dir_pred"] == df.loc[mask_tr, "dir_true"]).mean()) if mask_tr.sum() else 0.0
     else:
         tradeable_acc = overall_acc
 
     return overall_acc, tradeable_acc
 
 
+def _compute_auc(dir_true: np.ndarray, buy_prob: np.ndarray) -> Optional[float]:
+    try:
+        dir_true = np.asarray(dir_true, dtype=float)
+        buy_prob = np.asarray(buy_prob, dtype=float)
+    except Exception:
+        return None
+
+    mask = np.isfinite(dir_true) & np.isfinite(buy_prob) & (dir_true != 0.0)
+    if not mask.any():
+        return None
+
+    y = (dir_true[mask] == 1.0).astype(float)
+    p = buy_prob[mask]
+
+    n_pos = float(y.sum())
+    n_neg = float(len(y) - n_pos)
+    if n_pos <= 0.0 or n_neg <= 0.0:
+        return None
+
+    order = np.argsort(p)
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(len(p), dtype=float) + 1.0
+    pos_ranks_sum = float(ranks[y == 1.0].sum())
+    auc = (pos_ranks_sum - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)
+    return float(auc)
+
+
 def _bin_accuracy(df: pd.DataFrame, col: str, bins) -> None:
-    """
-    Print accuracy per bin for a probability-like column.
-    """
     logger.info("=== Accuracy vs %s bins ===", col)
     if col not in df.columns:
         logger.info("Column %s not present; skipping.", col)
         return
 
     x = df[col].astype(float)
-    df = df.copy()
-    df["bin"] = pd.cut(x, bins=bins, include_lowest=True)
+    tmp = df.copy()
+    tmp["bin"] = pd.cut(x, bins=bins, include_lowest=True)
 
-    for b in df["bin"].cat.categories:
-        sub = df[df["bin"] == b]
+    for b in tmp["bin"].cat.categories:
+        sub = tmp[tmp["bin"] == b]
         if sub.empty:
             continue
         mask_dir = sub["dir_true"].isin([1, -1])
@@ -151,62 +177,79 @@ def _bin_accuracy(df: pd.DataFrame, col: str, bins) -> None:
         logger.info("  %s: n=%d, acc=%.3f", str(b), int(mask_dir.sum()), acc)
 
 
+def _short_horizon_accuracy(df: pd.DataFrame) -> None:
+    if "aux_label_short" not in df.columns or df["aux_label_short"].isna().all():
+        logger.info("[EVAL] aux_label_short not present; skipping short-horizon accuracy.")
+        return
+
+    try:
+        aux = (
+            df["aux_label_short"]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .astype(float)
+        )
+    except Exception as e:
+        logger.info("[EVAL] Failed to coerce aux_label_short: %s", e)
+        return
+
+    tmp = df.copy()
+    tmp["short_true"] = np.sign(aux).astype(int)
+    mask_dir = tmp["short_true"].isin([1, -1])
+    if mask_dir.sum() == 0:
+        logger.info("[EVAL] No directional short-horizon rows; skipping.")
+        return
+
+    acc = float((tmp.loc[mask_dir, "dir_pred"] == tmp.loc[mask_dir, "short_true"]).mean())
+    logger.info("[EVAL] Short-horizon directional accuracy: n=%d, acc=%.3f", int(mask_dir.sum()), acc)
+
+
 def main():
+    # Prefer production bundle artifacts, but allow runtime override.
     signals_path = os.getenv("SIGNALS_PATH", "trained_models/production/signals.jsonl")
     feat_hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
+    train_log_path = os.getenv("TRAIN_LOG_PATH", "data/train_log_v2.jsonl")
 
     logger.info("Loading signals from %s", signals_path)
     df_sig = _load_signals(signals_path)
     if df_sig is None:
         return
 
-    logger.info("Loading feature log from %s", feat_hist_path)
-    df_feat = _parse_feature_csv(feat_hist_path, min_rows=0)
-    if df_feat is None or df_feat.empty:
-        logger.error("No data in feature_log_hist for evaluation")
-        return
+    # 1) Try feature_log_hist.csv
+    df_lbl = None
+    if os.path.exists(feat_hist_path):
+        logger.info("Loading labels from feature_log_hist: %s", feat_hist_path)
+        try:
+            df_feat = _parse_feature_csv(feat_hist_path, min_rows=0)
+            if df_feat is not None and not df_feat.empty and "ts" in df_feat.columns and "label" in df_feat.columns:
+                df_lbl = df_feat[["ts", "label"] + ([c for c in ["tradeable", "aux_label_short"] if c in df_feat.columns])].copy()
+                df_lbl["ts"] = df_lbl["ts"].astype(str)
+                df_lbl = df_lbl.drop_duplicates(subset=["ts"], keep="last")
+            else:
+                df_lbl = None
+        except Exception as e:
+            logger.warning("feature_log_hist parse failed (%s). Falling back to TRAIN_LOG_PATH.", e)
+            df_lbl = None
 
-    try:
-        merged = _join_signals_features(df_sig, df_feat)
-    except Exception as e:
-        logger.error("Join failed: %s", e)
-        return
+    # 2) Fallback to train_log_v2.jsonl
+    if df_lbl is None or df_lbl.empty:
+        logger.info("Loading labels from TRAIN_LOG_PATH: %s", train_log_path)
+        df_lbl = _labels_from_trainlog(train_log_path)
+        if df_lbl is None or df_lbl.empty:
+            logger.error("No labels available from feature_log_hist or TRAIN_LOG_PATH.")
+            return
 
+    merged = _join_signals_labels(df_sig, df_lbl)
     if merged.empty:
-        logger.error("Merged DataFrame is empty (no matching timestamps)")
+        logger.error("Merged DataFrame is empty (no matching timestamps).")
         return
 
     logger.info("Merged rows: %d", len(merged))
 
-    merged = merged.replace([np.inf, -np.inf], np.nan).dropna(subset=["p_buy", "label"])
+    # Normalize buy_prob to float
+    merged["buy_prob"] = pd.to_numeric(merged["buy_prob"], errors="coerce")
+    merged = merged.replace([np.inf, -np.inf], np.nan).dropna(subset=["buy_prob", "label"])
 
-
-    # ---- NEW: normalize 'buy_prob' column name after merge ----
-    # Because we merged with suffixes=("_sig", "_feat"), overlapping columns
-    # like buy_prob become buy_prob_sig / buy_prob_feat.
-    buy_col = None
-    if "buy_prob_sig" in merged.columns:
-        buy_col = "buy_prob_sig"          # prefer signals' pre-close prediction
-    elif "buy_prob" in merged.columns:
-        buy_col = "buy_prob"
-    elif "buy_prob_feat" in merged.columns:
-        buy_col = "buy_prob_feat"
-    else:
-        logger.error(
-            "No buy_prob column found after merge "
-            "(expected one of: buy_prob_sig, buy_prob, buy_prob_feat). "
-            "Available columns: %s",
-            list(merged.columns),
-        )
-        return
-
-    try:
-        merged["buy_prob"] = merged[buy_col].astype(float)
-    except Exception as e:
-        logger.error("Failed to coerce %s to float: %s", buy_col, e)
-        return
-
-    # Compute directional ints
     merged["dir_true"] = merged["label"].map(_dir_label_to_int).fillna(0).astype(int)
     merged["dir_pred"] = np.sign(merged["buy_prob"] - 0.5).astype(int)
 
@@ -214,43 +257,29 @@ def main():
     logger.info("Overall directional accuracy (BUY/SELL only): %.3f", overall_acc)
     logger.info("Tradeable directional accuracy: %.3f", tradeable_acc)
 
-    # Restrict to tradeable for bin analysis
-    if "tradeable" in merged.columns:
-        df_tr = merged[merged["tradeable"] == True].copy()
-        logger.info("Tradeable rows: %d", len(df_tr))
-    else:
-        df_tr = merged
+    auc = _compute_auc(merged["dir_true"].values, merged["buy_prob"].values)
+    if auc is not None:
+        mask_dir = merged["dir_true"].isin([1, -1])
+        logger.info("Directional AUC: n=%d (BUY/SELL rows), AUC=%.3f", int(mask_dir.sum()), float(auc))
 
-    # Accuracy vs predicted probability (tradeable only)
-    prob_bins = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    _bin_accuracy(df_tr, "buy_prob", prob_bins)
-
-    # Accuracy vs neutral_prob (if available)
+    _bin_accuracy(merged, "buy_prob", bins=[0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
     if "neutral_prob" in merged.columns:
-        neu_bins = [0.0, 0.3, 0.5, 0.7, 1.0]
-        _bin_accuracy(df_tr, "neutral_prob", neu_bins)
+        _bin_accuracy(merged, "neutral_prob", bins=[-0.001, 0.3, 0.5, 0.7, 1.0])
 
+    _short_horizon_accuracy(merged)
 
-    # --- Extra: summarize high-confidence tradeable subset ---
-    try:
-        if "tradeable" in merged.columns:
-            mask_tr = (merged["tradeable"] == True)
-        else:
-            mask_tr = np.ones(len(merged), dtype=bool)
+    # High confidence subset
+    if "tradeable" in merged.columns:
+        hc = merged[(merged["buy_prob"] >= 0.7) & (merged["tradeable"] == True)]
+    else:
+        hc = merged[merged["buy_prob"] >= 0.7]
 
-        df_hc = merged[mask_tr & (merged["dir_true"].isin([1, -1]))].copy()
-        df_hc = df_hc[df_hc["buy_prob"] >= 0.7]
-        if not df_hc.empty:
-            acc_hc = float((df_hc["dir_pred"] == df_hc["dir_true"]).mean())
-            logger.info(
-                "High-confidence subset (buy_prob>=0.7 & tradeable): n=%d, acc=%.3f",
-                len(df_hc),
-                acc_hc,
-            )
-        else:
-            logger.info("High-confidence subset (buy_prob>=0.7 & tradeable): n=0")
-    except Exception as e:
-        logger.debug("High-confidence summary skipped: %s", e)
+    mask_dir = hc["dir_true"].isin([1, -1])
+    if mask_dir.sum() > 0:
+        acc = float((hc.loc[mask_dir, "dir_pred"] == hc.loc[mask_dir, "dir_true"]).mean())
+        logger.info("High-confidence subset (buy_prob>=0.7 & tradeable): n=%d, acc=%.3f", int(mask_dir.sum()), acc)
+    else:
+        logger.info("High-confidence subset: n=0")
 
 
 if __name__ == "__main__":
