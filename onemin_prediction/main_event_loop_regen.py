@@ -2,16 +2,16 @@
 import asyncio
 import base64
 import json
-import csv
 import math
 import logging
 import os
 import time
-from collections import deque
+from collections import deque, Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple, Mapping
 from contextlib import suppress
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -21,10 +21,113 @@ from core_handler import UnifiedWebSocketHandler as WSHandler
 from feature_pipeline import FeaturePipeline, TA
 from logging_setup import log_every
 from model_pipeline_regen_v2 import create_default_pipeline
+from train_log_utils_v3 import append_jsonl, validate_or_quarantine
+from train_record_v3 import build_train_record_v3
 
 
 logger = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
+
+LABEL_SKIP = "SKIP"
+
+
+def _safe_getenv_bool(key: str, default: bool = False) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return bool(default)
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _log_env_audit(keys: List[str]) -> None:
+    try:
+        parts = []
+        for k in keys:
+            v = os.getenv(k)
+            parts.append(f"{k}={v if v is not None else '<unset>'}")
+        logger.info("[ENV] %s", " ".join(parts))
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------
+# Model-side deadband + flip confirmation (hysteresis)
+# Prevents BUY/SELL churn when p hovers near 0.50 in weak-skill regimes.
+# ---------------------------------------------------------------------
+_MODEL_SIDE_STATE: Dict[str, Dict[str, int]] = {}
+
+def _model_side_from_prob(name: str, buy_prob: Optional[float]) -> int:
+    """Return model side (+1/-1/0) with deadband + flip confirmation."""
+    try:
+        if buy_prob is None:
+            return 0
+        pb = float(np.clip(float(buy_prob), 0.0, 1.0))
+    except Exception:
+        return 0
+
+    # Prefer explicit deadband; fall back to legacy MODEL_SIDE_MIN_DELTA.
+    try:
+        band = os.getenv("MODEL_SIDE_DEADBAND", "").strip()
+        if band:
+            deadband = float(band)
+        else:
+            deadband = float(os.getenv("MODEL_SIDE_MIN_DELTA", "0.02") or "0.02")
+    except Exception:
+        deadband = 0.02
+    deadband = float(np.clip(deadband, 0.0, 0.20))
+
+    try:
+        k = int(os.getenv("MODEL_SIDE_FLIP_CONFIRM", "2") or "2")
+    except Exception:
+        k = 2
+    k = max(1, min(k, 5))
+
+    # Determine instantaneous target outside the deadband
+    if pb >= 0.5 + deadband:
+        target = 1
+    elif pb <= 0.5 - deadband:
+        target = -1
+    else:
+        target = 0
+
+    st = _MODEL_SIDE_STATE.get(name)
+    if not st:
+        st = {"side": 0, "target": 0, "streak": 0}
+        _MODEL_SIDE_STATE[name] = st
+
+    prev_side = int(st.get("side", 0))
+    prev_target = int(st.get("target", 0))
+    streak = int(st.get("streak", 0))
+
+    # Inside deadband: hold previous side, reset flip streak.
+    if target == 0:
+        st["target"] = 0
+        st["streak"] = 0
+        st["side"] = prev_side
+        return prev_side
+
+    # Same as current side: stable, no flip in progress.
+    if target == prev_side:
+        st["target"] = target
+        st["streak"] = 0
+        return prev_side
+
+    # Flip candidate: count confirmations
+    if target == prev_target:
+        streak += 1
+    else:
+        prev_target = target
+        streak = 1
+
+    st["target"] = prev_target
+    st["streak"] = streak
+
+    if streak >= k:
+        st["side"] = target
+        st["streak"] = 0
+        st["target"] = target
+        return target
+
+    # Not enough confirmations yet: keep prior side.
+    return prev_side
 
 
 def _make_trade_outcome_label_live(
@@ -112,7 +215,7 @@ def compute_trade_window_label(
     fallback_atr_mult: float = 0.20,
 ) -> Optional[str]:
     """
-    Return BUY/SELL/FLAT or None if we cannot label.
+    Return BUY/SELL/FLAT or LABEL_SKIP if we cannot label.
 
     Step 1: Path-based TP/SL race over the next `horizon` bars:
         - If only upside TP is hit → BUY
@@ -128,10 +231,10 @@ def compute_trade_window_label(
     try:
         n = int(len(df))
     except Exception:
-        return None
+        return LABEL_SKIP
 
     if n == 0 or idx < 0:
-        return None
+        return LABEL_SKIP
 
     try:
         horizon = max(1, int(horizon))
@@ -140,7 +243,7 @@ def compute_trade_window_label(
 
     end_idx = idx + horizon
     if end_idx >= n:
-        return None
+        return LABEL_SKIP
 
     try:
         close = df["close"].astype(float)
@@ -150,7 +253,7 @@ def compute_trade_window_label(
         try:
             ret = df["close"].iloc[end_idx] / df["close"].iloc[idx] - 1.0
         except Exception:
-            return None
+            return LABEL_SKIP
         if ret > tp_ret:
             return "BUY"
         if ret < -sl_ret:
@@ -159,11 +262,11 @@ def compute_trade_window_label(
 
     entry = float(close.iloc[idx])
     if not np.isfinite(entry) or entry <= 0.0:
-        return None
+        return LABEL_SKIP
 
     window = df.iloc[idx + 1 : end_idx + 1]
     if window.empty:
-        return None
+        return LABEL_SKIP
 
     up_ret = window["high"].astype(float) / entry - 1.0
     dn_ret = window["low"].astype(float) / entry - 1.0
@@ -237,17 +340,17 @@ def compute_tp_sl_direction_label(
       - "SELL" if SELL TP is hit first and BUY TP is not.
       - "FLAT" for ambiguous / no-edge windows (both/no TP or symmetric outcomes).
 
-    Returns None on any hard failure so callers can cleanly skip the row.
+    Returns LABEL_SKIP on any hard failure so callers can cleanly skip the row.
     """
     try:
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            return None
+            return LABEL_SKIP
         n = int(len(df))
         if idx < 0 or idx >= n:
-            return None
+            return LABEL_SKIP
         hb = max(1, int(horizon_bars))
     except Exception:
-        return None
+        return LABEL_SKIP
 
     # Volatility-aware adjustment: derive a single proxy from rv_10 / atr_1t
     vol_proxy = 0.0
@@ -766,104 +869,10 @@ def _time_of_day_features(ts: datetime) -> Dict[str, float]:
     return feats
 
 
-def _append_feature_log_row_csv(path: str, row: dict, fieldnames: List[str]) -> None:
-    """
-    Append a single feature row to CSV with stable headers.
-    """
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    file_exists = os.path.exists(path) and os.path.getsize(path) > 0
-    with open(path, "a", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if not file_exists:
-            w.writeheader()
-        w.writerow(row)
-
-
 # ========== ADAPTIVE CONFIDENCE TUNER ==========
 
-class RollingConfidenceTuner:
-    """
-    Tracks rolling hit-rate & Brier to adjust qmin.
-
-    dir_true:
-      +1  -> BUY label
-      -1  -> SELL label
-       0  -> FLAT (no directional move; we expect p≈0.5)
-    """
-
-    def __init__(self, window: int = 80) -> None:
-        self.window = max(10, int(window))
-        self._hits: Deque[float] = deque(maxlen=self.window)
-        self._briers: Deque[float] = deque(maxlen=self.window)
-
-    def update(self, dir_true: int, buy_prob: float) -> None:
-        """
-        dir_true: +1 (BUY), -1 (SELL), 0 (FLAT)
-        buy_prob: model's BUY probability at decision time.
-        """
-        try:
-            p = float(buy_prob)
-        except Exception:
-            p = 0.5
-        p = max(0.0, min(1.0, p))
-
-        dir_pred = 1 if p > 0.5 else (-1 if p < 0.5 else 0)
-
-        if dir_true in (1, -1):
-            hit = 1.0 if dir_pred == dir_true else 0.0
-            target = 1.0 if dir_true == 1 else 0.0
-            brier = (p - target) ** 2
-        elif dir_true == 0:
-            conf = abs(p - 0.5)
-            hit = 1.0 if conf < 0.10 else 0.0
-            brier = (p - 0.5) ** 2
-        else:
-            return
-
-        self._hits.append(hit)
-        self._briers.append(brier)
-
-    def qmin_delta(self) -> float:
-        """
-        Suggest a small additive adjustment to qmin:
-        - If hit-rate is clearly good (≥0.60) → slightly lower qmin.
-        - If hit-rate is clearly poor (≤0.40) → slightly raise qmin.
-        - Otherwise → no change.
-
-        Returns 0.0 until we have enough samples.
-        """
-        n = len(self._hits)
-        min_active = max(5, int(self.window * 0.5))
-        if n < min_active:
-            return 0.0
-
-        hit_rate = float(sum(self._hits) / n) if n else 0.0
-        brier = float(sum(self._briers) / n) if n else 0.0
-
-        delta = 0.0
-        if hit_rate >= 0.60:
-            delta = -0.01
-        elif hit_rate <= 0.40:
-            delta = +0.01
-
-        logger.info(
-            "[CONF] tuner snapshot: n=%d hit=%.3f brier=%.3f delta=%+.4f",
-            n, hit_rate, brier, delta,
-        )
-        return delta
-
-    def snapshot(self) -> Dict[str, float]:
-        return {
-            "hit_rate": float(np.mean(self._hits)) if self._hits else 0.0,
-            "brier": float(np.mean(self._briers)) if self._briers else 0.0,
-            "n": float(len(self._hits)),
-        }
-
-# ========== FLOW / RULE HIERARCHY HELPERS ==========
-
-def _compute_flow_signal(features: Mapping[str, Any]) -> Tuple[float, int, float, float, float, int]:
-    """
-    Scalper-grade flow signal with explicit VWAP/CVD regime.
+def _compute_flow_signal(features: Mapping[str, Any], *, log: bool = False) -> Tuple[float, int, float, float, float, int]:
+    """    Scalper-grade flow signal with explicit VWAP/CVD regime.
 
     Returns:
         flow_score: signed continuous score
@@ -873,6 +882,32 @@ def _compute_flow_signal(features: Mapping[str, Any]) -> Tuple[float, int, float
         fut_vwap:   sanitized fut_vwap_dev
         vwap_side:  -1 / 0 / 1 (location vs VWAP)
     """
+
+    # Cache: if flow was already computed for this candle, reuse it to avoid
+    # recomputation and duplicate log spam.
+    try:
+        fs = features
+        if all(k in fs for k in (
+            'flow_score', 'flow_side', 'flow_micro_imb', 'flow_fut_cvd', 'flow_fut_vwap_dev', 'flow_vwap_side', 'flow_regime'
+        )):
+            flow_score = float(fs.get('flow_score', 0.0))
+            flow_side = int(fs.get('flow_side', 0))
+            micro_imb = float(fs.get('flow_micro_imb', 0.0))
+            fut_cvd = float(fs.get('flow_fut_cvd', 0.0))
+            fut_vwap = float(fs.get('flow_fut_vwap_dev', 0.0))
+            vwap_side = int(fs.get('flow_vwap_side', 0))
+            regime = str(fs.get('flow_regime', 'CACHED'))
+            fut_vol = float(fs.get('flow_fut_vol', 0.0))
+            if log:
+                logger.debug(
+                    "[FLOW] micro_imb=%.3f fut_cvd=%.6f fut_vwap_dev=%.4f vwap_side=%+d fut_vol=%.3f "
+                    "regime=%s → score=%.3f side=%+d",
+                    micro_imb, fut_cvd, fut_vwap, vwap_side, fut_vol, regime, flow_score, flow_side
+                )
+            return float(flow_score), int(flow_side), float(micro_imb), float(fut_cvd), float(fut_vwap), int(vwap_side)
+    except Exception:
+        pass
+
     def _get(k: str, default: float = 0.0) -> float:
         try:
             v = float(features.get(k, default))
@@ -880,18 +915,18 @@ def _compute_flow_signal(features: Mapping[str, Any]) -> Tuple[float, int, float
         except Exception:
             return float(default)
 
-    micro_imb = _get("micro_imbalance", _get("imbalance", 0.0))
-    fut_cvd = _get("fut_cvd_delta", 0.0)
-    fut_vwap = _get("fut_vwap_dev", 0.0)
-    fut_vol = max(0.0, _get("fut_vol_delta", 0.0))
+    micro_imb = _get('micro_imbalance', _get('imbalance', 0.0))
+    fut_cvd = _get('fut_cvd_delta', 0.0)
+    fut_vwap = _get('fut_vwap_dev', 0.0)
+    fut_vol = max(0.0, _get('fut_vol_delta', 0.0))
 
     # thresholds
     try:
-        vwap_ext = float(os.getenv("FLOW_VWAP_EXT", "0.0020") or "0.0020")  # 20 bps
+        vwap_ext = float(os.getenv('FLOW_VWAP_EXT', '0.0020') or '0.0020')  # 20 bps
     except Exception:
         vwap_ext = 0.0020
     try:
-        cvd_min = float(os.getenv("FLOW_CVD_MIN", "2.5e-05") or "2.5e-05")
+        cvd_min = float(os.getenv('FLOW_CVD_MIN', '2.5e-05') or '2.5e-05')
     except Exception:
         cvd_min = 2.5e-05
 
@@ -904,9 +939,7 @@ def _compute_flow_signal(features: Mapping[str, Any]) -> Tuple[float, int, float
         vwap_side = 0
 
     # --- Regime rules (hard) ---
-    # If extended BELOW VWAP and micro_imb <= 0 and CVD not strongly positive => disallow longs.
     strong_bear_regime = (vwap_side == -1) and (micro_imb <= 0.0) and (fut_cvd <= +cvd_min)
-    # If extended ABOVE VWAP and micro_imb >= 0 and CVD not strongly negative => disallow shorts.
     strong_bull_regime = (vwap_side == +1) and (micro_imb >= 0.0) and (fut_cvd >= -cvd_min)
 
     # CVD term normalized
@@ -920,39 +953,45 @@ def _compute_flow_signal(features: Mapping[str, Any]) -> Tuple[float, int, float
         vwap_term = float(np.tanh(fut_vwap / vwap_ext))
 
     if strong_bear_regime:
-        # hard bearish: micro_imb cannot rescue
         flow_score = -1.0 + min(0.0, micro_imb) + 0.25 * cvd_term
         flow_side = -1
-        regime = "BEAR_LOCK"
+        regime = 'BEAR_LOCK'
     elif strong_bull_regime:
-        # hard bullish: micro_imb cannot rescue shorts
         flow_score = +1.0 + max(0.0, micro_imb) + 0.25 * cvd_term
         flow_side = +1
-        regime = "BULL_LOCK"
+        regime = 'BULL_LOCK'
     else:
-        # balanced blend; VWAP dominates micro_imb when extended
-        flow_score = (
-            0.55 * vwap_term +     # location
-            0.30 * cvd_term +      # futures pressure
-            0.15 * micro_imb       # micro tape (small)
-        )
-        # volume amplifies but never flips sign
+        flow_score = (0.55 * vwap_term) + (0.30 * cvd_term) + (0.15 * micro_imb)
         amp = 1.0 + min(0.75, fut_vol)
         flow_score *= amp
-
         if flow_score > 0:
             flow_side = 1
         elif flow_score < 0:
             flow_side = -1
         else:
             flow_side = 0
-        regime = "BLEND"
+        regime = 'BLEND'
 
-    logger.debug(
-        "[FLOW] micro_imb=%.3f fut_cvd=%.6f fut_vwap_dev=%.4f vwap_side=%+d fut_vol=%.3f "
-        "regime=%s → score=%.3f side=%+d",
-        micro_imb, fut_cvd, fut_vwap, vwap_side, fut_vol, regime, flow_score, flow_side
-    )
+    if log:
+        logger.debug(
+            "[FLOW] micro_imb=%.3f fut_cvd=%.6f fut_vwap_dev=%.4f vwap_side=%+d fut_vol=%.3f "
+            "regime=%s → score=%.3f side=%+d",
+            micro_imb, fut_cvd, fut_vwap, vwap_side, fut_vol, regime, flow_score, flow_side
+        )
+
+    # Persist in dict-like features so downstream calls can reuse without recomputing
+    try:
+        if isinstance(features, dict):
+            features['flow_score'] = float(flow_score)
+            features['flow_side'] = int(flow_side)
+            features['flow_micro_imb'] = float(micro_imb)
+            features['flow_fut_cvd'] = float(fut_cvd)
+            features['flow_fut_vwap_dev'] = float(fut_vwap)
+            features['flow_vwap_side'] = int(vwap_side)
+            features['flow_fut_vol'] = float(fut_vol)
+            features['flow_regime'] = str(regime)
+    except Exception:
+        pass
 
     return float(flow_score), int(flow_side), float(micro_imb), float(fut_cvd), float(fut_vwap), int(vwap_side)
 
@@ -966,39 +1005,41 @@ def _compute_rule_hierarchy(
     is_bear_setup: bool,
     any_setup: bool,
     ambiguous_setup: bool,
-) -> Tuple[str, str]:
+    buy_prob: Optional[float] = None,
+) -> Tuple[str, str, str, List[str]]:
     """
-    Enforce the hierarchy of truth:
+    Enforce the hierarchy of truth (context) while *not* collapsing into NA.
 
       Flow (VWAP+imbalance/CVD) > HTF trend > EMA trend > structure > pattern.
 
-    Behaviour:
-      - Compute a base_dir from rule_sig sign if |rule_sig| >= RULE_MIN_SIG.
-      - Derive context sides: flow_side, htf_side, trend_side, struct_side.
-      - If flow+HTF conflict with trend+structure → NA (flat, no trade).
-      - BUY only if flow_side or htf_side is +1.
-      - SELL only if flow_side or htf_side is -1.
-      - Ambiguous structure (both bull & bear setup) never defines direction.
-
     Returns:
-        rule_dir: "BUY" / "SELL" / "NA"
+        rule_dir: "BUY" / "SELL"  (directional context, always present)
         base_dir: "BUY" / "SELL" / "NA" from rule_sig alone
+        conflict_level: "none" | "yellow" | "red"
+        conflict_reasons: list[str] (machine-readable)
     """
+
     # Base direction from rule_sig magnitude & sign
     try:
         rule_min_sig = float(os.getenv("RULE_MIN_SIG", "0.20") or "0.20")
     except Exception:
         rule_min_sig = 0.20
 
-    if abs(rule_sig) < rule_min_sig:
+    if not np.isfinite(rule_sig) or abs(rule_sig) < rule_min_sig:
         base_dir = "NA"
         base_side = 0
     else:
         base_dir = "BUY" if rule_sig > 0 else "SELL"
         base_side = 1 if base_dir == "BUY" else -1
+    # Model-side as last fallback for "directional context" (never a trade by itself)
+    model_side = _model_side_from_prob(name, buy_prob)
+
+    conflict_level = "none"
+    conflict_reasons: List[str] = []
 
     # Flow & HTF context
     flow_score, flow_side, micro_imb, fut_cvd, fut_vwap, vwap_side = _compute_flow_signal(features_raw)
+    flow_regime = str(features_raw.get("flow_regime", "") or "").upper()
 
     try:
         mtf_cons = float(mtf.get("mtf_consensus", 0.0)) if mtf else 0.0
@@ -1006,17 +1047,24 @@ def _compute_rule_hierarchy(
             mtf_cons = 0.0
     except Exception:
         mtf_cons = 0.0
-    if mtf_cons > 0.1:
+
+    try:
+        htf_min = float(os.getenv("HTF_MIN_CONS", "0.10") or "0.10")
+    except Exception:
+        htf_min = 0.10
+
+    if mtf_cons > htf_min:
         htf_side = 1
-    elif mtf_cons < -0.1:
+    elif mtf_cons < -htf_min:
         htf_side = -1
     else:
         htf_side = 0
+    logger.debug("[HTF] mtf_cons=%.4f threshold=%.4f -> htf_side=%+d", mtf_cons, htf_min, htf_side)
 
     # EMA trend
     ema_trend = 0
     try:
-        ema_fast = float(features_raw.get("ema_8", 0.0))
+        ema_fast = float(features_raw.get("ema_9", features_raw.get("ema_8", 0.0)))
         ema_slow = float(features_raw.get("ema_21", 0.0))
         if np.isfinite(ema_fast) and np.isfinite(ema_slow):
             if ema_fast > ema_slow:
@@ -1025,12 +1073,9 @@ def _compute_rule_hierarchy(
                 ema_trend = -1
     except Exception:
         ema_trend = 0
-    if ema_trend > 0:
-        trend_side = 1
-    elif ema_trend < 0:
-        trend_side = -1
-    else:
-        trend_side = 0
+
+    trend_side = 1 if ema_trend > 0 else (-1 if ema_trend < 0 else 0)
+    logger.debug("[RULE-TREND] ema_fast=%.2f ema_slow=%.2f -> trend_side=%+d", ema_fast, ema_slow, trend_side)
 
     # Structure: ambiguous setups do NOT define direction
     if ambiguous_setup:
@@ -1047,47 +1092,51 @@ def _compute_rule_hierarchy(
     ctx_flow_htf = flow_side or htf_side         # flow first, then HTF
     ctx_trend_struct = trend_side or struct_side # trend first, then structure
 
-    # Hard conflict: flow/HTF vs trend/structure fighting each other
+    # Start with the "best available" directional context.
+    final_side = ctx_flow_htf or ctx_trend_struct or base_side or model_side or 1
+
+    # Conflict: flow/HTF vs trend/structure fighting each other
     if ctx_flow_htf != 0 and ctx_trend_struct != 0 and ctx_flow_htf != ctx_trend_struct:
-        final_side = 0
-        conflict = True
-    else:
-        conflict = False
-        final_side = ctx_flow_htf or ctx_trend_struct or base_side
+        conflict_reasons.append("flow_htf_vs_trend_struct")
 
-    # Enforce flow/HTF approval for entries
-    if final_side > 0:
-        if not (flow_side > 0 or htf_side > 0):
-            final_side = 0
-    elif final_side < 0:
-        if not (flow_side < 0 or htf_side < 0):
-            final_side = 0
+        # Yellow if HTF+trend align and counter-flow looks weak; otherwise red.
+        align_trend_htf = (trend_side != 0 and htf_side != 0 and trend_side == htf_side)
+        weak_counter_flow = (abs(float(flow_score)) < 0.35)
 
-    # If there is no setup and no strong flow/HTF, do not let model-only
-    # direction become a trade; keep it as base_dir only.
+        if align_trend_htf and weak_counter_flow and abs(float(mtf_cons)) >= 0.35:
+            conflict_level = "yellow"
+        else:
+            conflict_level = "red"
+
+        # Prefer higher-quality context for direction (keep direction, don't zero it out)
+        final_side = trend_side or htf_side or flow_side or struct_side or base_side or model_side or 1
+
+    # "Approval" constraints become conflict severity, not NA.
+    if final_side > 0 and not (flow_side > 0 or htf_side > 0):
+        conflict_reasons.append("no_flow_htf_approval")
+        conflict_level = "red" if conflict_level == "none" else conflict_level
+    if final_side < 0 and not (flow_side < 0 or htf_side < 0):
+        conflict_reasons.append("no_flow_htf_approval")
+        conflict_level = "red" if conflict_level == "none" else conflict_level
+
+    # If there is no setup and no strong flow/HTF, do not let model-only become a trade
     if not any_setup and ctx_flow_htf == 0 and base_side != 0:
-        final_side = 0
+        conflict_reasons.append("model_only_no_setup")
+        conflict_level = "red" if conflict_level == "none" else conflict_level
 
-    rule_dir = "BUY" if final_side > 0 else ("SELL" if final_side < 0 else "NA")
+    rule_dir = "BUY" if final_side > 0 else "SELL"
 
-    # Hard scalper veto: don't allow BUY when extended below VWAP and flow isn't bullish,
-    # and don't allow SELL when extended above VWAP and flow isn't bearish.
+    # VWAP veto becomes RED (context preserved; execution blocked later)
     if rule_dir == "BUY" and vwap_side < 0 and flow_side <= 0:
-        logger.info(
-            "[%s] [RULE-HIER] veto BUY (below VWAP + no bullish flow): vwap_side=%+d flow_side=%+d fut_vwap_dev=%.4f",
-            name, vwap_side, flow_side, fut_vwap
-        )
-        rule_dir = "NA"
+        conflict_reasons.append("vwap_veto_buy")
+        conflict_level = "red" if conflict_level == "none" else conflict_level
     if rule_dir == "SELL" and vwap_side > 0 and flow_side >= 0:
-        logger.info(
-            "[%s] [RULE-HIER] veto SELL (above VWAP + no bearish flow): vwap_side=%+d flow_side=%+d fut_vwap_dev=%.4f",
-            name, vwap_side, flow_side, fut_vwap
-        )
-        rule_dir = "NA"
+        conflict_reasons.append("vwap_veto_sell")
+        conflict_level = "red" if conflict_level == "none" else conflict_level
 
     logger.info(
         "[%s] [RULE-HIER] rule_sig=%.3f base_dir=%s flow_side=%+d htf_side=%+d "
-        "trend_side=%+d struct_side=%+d any_setup=%s ambiguous=%s conflict=%s → rule_dir=%s",
+        "trend_side=%+d struct_side=%+d any_setup=%s ambiguous=%s conflict_level=%s reasons=%s → rule_dir=%s",
         name,
         rule_sig,
         base_dir,
@@ -1097,11 +1146,145 @@ def _compute_rule_hierarchy(
         struct_side,
         bool(any_setup),
         bool(ambiguous_setup),
-        bool(conflict),
+        str(conflict_level),
+        ",".join(conflict_reasons) if conflict_reasons else "none",
         rule_dir,
     )
 
-    return rule_dir, base_dir
+    return rule_dir, base_dir, conflict_level, conflict_reasons
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        if np.isfinite(v):
+            return v
+    except Exception:
+        pass
+    return float(default)
+
+
+def _scalper_playbook_line(
+    *,
+    features_raw: Mapping[str, Any],
+    dir_overall: str,
+    tradeable: bool,
+    gate_reasons: List[str],
+    rule_dir: str,
+    model_dir: str,
+    margin: float,
+    conf_bucket: str,
+    p_buy: float,
+    p_sell: float,
+    p_flat: float,
+    struct_setup_side: Optional[int] = None,
+) -> str:
+    """Return a human/scalper friendly one-liner for logs."""
+    o = _safe_float(features_raw.get("open", 0.0))
+    h = _safe_float(features_raw.get("high", 0.0))
+    l = _safe_float(features_raw.get("low", 0.0))
+    close = _safe_float(features_raw.get("close", features_raw.get("last_close", 0.0)))
+    ema_fast = _safe_float(features_raw.get("ema_9", features_raw.get("ema_8", features_raw.get("ema8", 0.0))))
+    ema_mid = _safe_float(features_raw.get("ema_9", features_raw.get("ema_8", 0.0)))
+    ema_slow = _safe_float(features_raw.get("ema_21", features_raw.get("ema21", 0.0)))
+    vwap_dev = _safe_float(features_raw.get("fut_vwap_dev", features_raw.get("vwap_dev", 0.0)))
+
+    flow_score, flow_side, micro_imb, fut_cvd, fut_vwap, vwap_side = _compute_flow_signal(features_raw)
+    struct_score, struct_side = _compute_structure_score(features_raw)
+    if struct_setup_side is None:
+        struct_setup_side = struct_side
+
+    
+    # EMA module fields (computed on candle-synced series)
+    ema_chop = bool(_safe_float(features_raw.get("ema_regime_chop_5t", 0.0)) > 0.5)
+    ema_bias = int(round(_safe_float(features_raw.get("ema_bias_5t", 0.0))))
+    ema_break = int(round(_safe_float(features_raw.get("ema15_break_veto", 0.0))))
+    tag_code = int(round(_safe_float(features_raw.get("ema_entry_tag", 0.0))))
+    tag_map = {0: "NONE", 1: "PULLBACK", 2: "RETEST", 3: "XOVER_CONF"}
+    entry_tag = tag_map.get(tag_code, "NONE")
+
+    # Decision-trend tags (decision TF)
+    uptrend = (ema_mid >= ema_slow) and (close >= ema_mid)
+    downtrend = (ema_mid <= ema_slow) and (close <= ema_mid)
+
+    # 'chop' is primarily HTF chop veto; fall back to local undecided state
+    chop = ema_chop or ((not uptrend) and (not downtrend))
+
+    # Extract flow regime (used for conditional planning logic)
+    flow_regime = str(features_raw.get("flow_regime", "") or "").upper()
+
+    ema15_break_dn = (ema_break < 0)
+    ema15_break_up = (ema_break > 0)
+
+    # Optional breakdown flag: prefer EMA15 breakdown; allow explicit structural flag if present
+    breakdown = bool(ema15_break_dn) or ( _safe_float(features_raw.get("struct_breakdown", 0.0)) > 0.5 ) or ( _safe_float(features_raw.get("breakdown", 0.0)) > 0.5 )
+# Translate into a scalper-style sentence
+
+    # Translate into a scalper-style sentence (action-consistent)
+    if not tradeable:
+        if "ema15_break_veto" in gate_reasons or ema15_break_dn or ema15_break_up:
+            if ema15_break_dn:
+                plan = "EMA15 breakdown veto: bearish momentum shift; avoid longs. Wait for retest/reclaim before acting"
+            elif ema15_break_up:
+                plan = "EMA15 breakout veto: momentum pop; avoid fading. Wait for pullback/hold before acting"
+            else:
+                plan = "EMA15 veto: wait for cleaner alignment"
+        elif "ema_chop_veto" in gate_reasons or chop:
+            if flow_regime == "BEAR_LOCK":
+                plan = "Flow locked bearish; only consider shorts on pullback into EMA9/15 or breakdown-retest. Avoid chasing"
+            elif flow_regime == "BULL_LOCK":
+                plan = "Flow locked bullish; only consider longs on pullback into EMA9/15 or breakout-retest. Avoid chasing"
+            else:
+                plan = "HTF chop: no edge. Wait for trend + structure + flow alignment (A+ only)"
+        elif breakdown:
+            plan = "Breakdown: wait for reclaim/hold before longs; shorts only if flow+structure confirm"
+        else:
+            plan = "WAIT: need confirmation (flow/structure alignment) before committing"
+    else:
+        # Tradeable: keep plan aligned with chosen direction
+        if ema15_break_dn and dir_overall == "BUY":
+            plan = "Long is tradeable but EMA15 breakdown is fresh: consider skipping or demand extra confirmation"
+        elif ema15_break_up and dir_overall == "SELL":
+            plan = "Short is tradeable but EMA15 breakout is fresh: consider skipping or demand extra confirmation"
+        elif entry_tag != "NONE":
+            if entry_tag == "PULLBACK":
+                plan = "Playbook: pullback/bounce near EMA15/EMA21. Take only if flow+structure agree; SL beyond rejection wick"
+            elif entry_tag == "RETEST":
+                plan = "Playbook: break & retest with EMA confluence. Enter on rejection; SL beyond retest extreme"
+            else:
+                plan = "Playbook: crossover-confirmed. Avoid if EMAs flat/tangled; exit if EMAs reconverge"
+        elif downtrend and flow_side <= 0:
+            plan = "Downtrend: prefer shorts on weak bounces; avoid longs until reclaim above EMA15/VWAP"
+        elif uptrend and flow_side >= 0:
+            plan = "Uptrend: take pullbacks, don’t chase. Stay with trend while structure remains clean"
+        else:
+            plan = "Edge: trade small unless flow+structure align strongly"
+
+
+
+    # Compact context string
+    reg_txt = "CHOP" if ema_chop else ("TREND_UP" if ema_bias > 0 else ("TREND_DN" if ema_bias < 0 else "MIXED"))
+    ctx = (
+        f"ctx(flow={flow_side:+d},structBias={struct_side:+d},structSetup={struct_setup_side:+d},"
+        f"vwap={vwap_side:+d},vwapDev={vwap_dev:+.4f},emaReg={reg_txt},emaBias={ema_bias:+d},tag={entry_tag})"
+    )
+    probs = f"p(B/S/F)={p_buy*100:.0f}/{p_sell*100:.0f}/{p_flat*100:.0f}"
+    trad = "TRADE" if tradeable else "WAIT"
+    if tradeable:
+        decision = f"dir={dir_overall} (model={model_dir}, rule={rule_dir}) margin={margin:.3f} {conf_bucket}"
+    else:
+        decision = f"intent={dir_overall} (model={model_dir}, rule={rule_dir}) margin={margin:.3f} {conf_bucket}"
+
+
+    # Gate suffix for logging (kept short)
+    if gate_reasons:
+        max_show = 4
+        shown = ",".join(gate_reasons[:max_show])
+        if len(gate_reasons) > max_show:
+            shown += f",+{len(gate_reasons) - max_show}"
+        gate_txt = f" | gate={shown}"
+    else:
+        gate_txt = ""
+
+    return f"[SCALPER] {trad}: {plan} | {decision} | {probs} | {ctx}{gate_txt}"
 
 
 # ========== HEARTBEAT / WATCHDOG / WS UTILITIES ==========
@@ -1383,132 +1566,498 @@ def _bucket_side_prob(side_prob: float) -> str:
         return "(>1.0)"
     return "unbucketed"
 
-def _gate_trade_decision(
-    buy_prob: float,
-    neutral_prob: Optional[float],
-    cfg,
-    tuner: "RollingConfidenceTuner",
+@dataclass
+class DecisionSnapshot:
+    lane: str
+    intent: str
+    tradeable: bool
+    size_mult: float
+    score: float
+    edge_required: float
+    edge_quantile: float
+    trend_strength: float
+    trend_signals: int
+    conflict: str
+    hard_veto: list
+    soft_penalties: dict
+    muted_only_soft: bool
+
+
+class DecisionState:
+    """Per-connection decision state (rolling edge history + hysteresis + counters)."""
+
+    def __init__(self, name: str, edge_window: int = 300, edge_pctl: float = 0.85, hyst_bars: int = 3, summary_every: int = 50):
+        self.name = str(name)
+        self.edge_window = max(30, int(edge_window))
+        self.edge_pctl = float(edge_pctl)
+        self.hyst_bars = max(0, int(hyst_bars))
+        self.summary_every = max(10, int(summary_every))
+
+        self._edge = {
+            1: deque(maxlen=self.edge_window),
+            -1: deque(maxlen=self.edge_window),
+        }
+        self._trend_hold = 0
+        self._trend_side = 0
+        self._last_lane = 'NONE'
+
+        self._counts = Counter()
+        self._decisions = 0
+        self._session_date = None
+
+    def update_edge(self, side: int, margin: float) -> None:
+        if side not in (1, -1):
+            return
+        try:
+            m = float(margin)
+        except Exception:
+            return
+        if not (m >= 0.0):
+            return
+        self._edge[side].append(m)
+
+    def edge_threshold(self, side: int, *, min_edge: float) -> tuple:
+        """Return (required_edge, quantile_edge)."""
+        min_edge = float(min_edge)
+        hist = self._edge.get(side, None)
+        if not hist or len(hist) < 30:
+            return max(min_edge, 0.0), 0.0
+        try:
+            arr = sorted(float(x) for x in hist if x is not None)
+            if len(arr) < 30:
+                return max(min_edge, 0.0), 0.0
+            # quantile (no numpy dependency here)
+            q = min(0.99, max(0.50, float(self.edge_pctl)))
+            k = int(round(q * (len(arr) - 1)))
+            k = max(0, min(len(arr) - 1, k))
+            thr = float(arr[k])
+            return max(min_edge, thr), thr
+        except Exception:
+            return max(min_edge, 0.0), 0.0
+
+    def bump_counts(self, snap: DecisionSnapshot) -> None:
+        self._decisions += 1
+        self._counts[f"lane:{snap.lane}"] += 1
+        self._counts[f"intent:{snap.intent}"] += 1
+        self._counts[f"tradeable:{int(bool(snap.tradeable))}"] += 1
+        if bool(getattr(snap, 'muted_only_soft', False)):
+            self._counts['muted_only_soft'] += 1
+        for r in (snap.hard_veto or []):
+            self._counts[f"hard:{r}"] += 1
+        for r in (snap.soft_penalties or {}).keys():
+            self._counts[f"soft:{r}"] += 1
+
+    def maybe_log_summary(self, ts: 'datetime') -> None:
+        try:
+            d = ts.date()
+        except Exception:
+            return
+        if self._session_date is None:
+            self._session_date = d
+        if d != self._session_date:
+            self.log_summary(final=True)
+            self._counts.clear()
+            self._decisions = 0
+            self._session_date = d
+
+        if self._decisions > 0 and (self._decisions % self.summary_every == 0):
+            self.log_summary(final=False)
+
+    def log_summary(self, *, final: bool = False) -> None:
+        tag = 'EOD' if final else 'MID'
+        most = self._counts.most_common(12)
+        msg = ", ".join([f"{k}={v}" for k, v in most]) if most else "no_counts"
+        logger.info("[%s] [DECISION-%s] n=%d | %s", self.name, tag, self._decisions, msg)
+
+
+def _decide_trade(
+    *,
+    state: DecisionState,
+    cfg: Any,
     features_raw: Dict[str, float],
     mtf: Dict[str, float],
-    rule_signal: Optional[float] = None,
-) -> Tuple[Optional[bool], float, float, float, float]:
-    """
-    Gate final tradeability using margin, TA-neutrality (structure-aware),
-    MTF consensus, and strong-rule / setup signals.
-    """
+    rule_dir: str,
+    conflict_level: str = 'none',
+    conflict_reasons: Optional[List[str]] = None,
+    buy_prob: float,
+    neutral_prob: Optional[float],
+    is_bull_setup: bool,
+    is_bear_setup: bool,
+    safe_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """Hard/soft veto + lane selection (SETUP vs TREND) + rolling-percentile edge gating."""
+
+    # --- basic sanity / data hard veto ---------------------------------
+    hard: list[str] = []
+    soft: dict[str, float] = {}
+
+    o = _safe_float(features_raw.get('open', float('nan')), float('nan'))
+    h = _safe_float(features_raw.get('high', float('nan')), float('nan'))
+    l = _safe_float(features_raw.get('low', float('nan')), float('nan'))
+    c = _safe_float(features_raw.get('close', float('nan')), float('nan'))
+    if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(l) and np.isfinite(c)):
+        hard.append('data_invalid')
+
+    # Truly invalid data: keep direction undefined and hard-stop.
+    if 'data_invalid' in hard:
+        return {
+            'lane': 'NONE',
+            'intent': 'FLAT',
+            'tradeable': False,
+            'size_mult': 0.0,
+            'score': 0.0,
+            'edge_required': 0.0,
+            'edge_quantile': 0.0,
+            'trend_strength': 0.0,
+            'trend_signals': 0,
+            'conflict': 'na',
+            'tape_conflict_level': str(conflict_level or 'none'),
+            'tape_conflict_reasons': list(conflict_reasons or []),
+            'hard_veto': list(hard),
+            'soft_penalties': {},
+            'gate_reasons': list(hard),
+        }
+
+    # Intent (rule drives direction)
+    intent = str(rule_dir or 'NA').upper()
+    if intent not in ('BUY', 'SELL'):
+        return {
+            'lane': 'NONE',
+            'intent': 'FLAT',
+            'tradeable': False,
+            'size_mult': 0.0,
+            'score': 0.0,
+            'edge_required': 0.0,
+            'edge_quantile': 0.0,
+            'trend_strength': 0.0,
+            'trend_signals': 0,
+            'conflict': 'na',
+            'tape_conflict_level': str(conflict_level or 'none'),
+            'tape_conflict_reasons': list(conflict_reasons or []),
+            'hard_veto': hard + ['no_direction'],
+            'soft_penalties': soft,
+            'gate_reasons': hard + ['no_direction'],
+        }
+
+    side = 1 if intent == 'BUY' else -1
+
+    # Tape conflict coming from rule hierarchy: keep direction, but convert severity into veto/penalty.
+    tape_conflict = str(conflict_level or 'none').lower()
+    if tape_conflict == 'red':
+        hard.append('tape_conflict_red')
+    elif tape_conflict == 'yellow':
+        try:
+            soft['tape_conflict_yellow'] = float(os.getenv('PEN_TAPE_YELLOW', '0.01') or '0.01')
+        except Exception:
+            soft['tape_conflict_yellow'] = 0.01
+
+    # Probabilities
     try:
         p_buy = float(np.clip(buy_prob, 0.0, 1.0))
     except Exception:
         p_buy = 0.5
     p_sell = 1.0 - p_buy
-    raw_margin = abs(p_buy - p_sell)
-    side_sign = 1 if p_buy >= p_sell else -1
+    raw_margin = float(abs(p_buy - p_sell))
+    centered_margin = float(abs(p_buy - 0.5))
 
+    # Update rolling edge hist BEFORE gating (to learn today's distribution)
+    state.update_edge(side, raw_margin)
+
+    # Hysteresis: once TREND lane is active, keep it for a few bars unless a hard conflict appears
+    if getattr(state, '_trend_hold', 0) > 0:
+        try:
+            state._trend_hold = max(0, int(state._trend_hold) - 1)
+        except Exception:
+            state._trend_hold = 0
+
+    # --- Neutral handling (keep conservative, but do not gag strong tape) ---
     try:
-        base_margin_thr = float(os.getenv("GATE_MARGIN_THR", "0.06") or "0.06")
-    except Exception:
-        base_margin_thr = 0.06
-    try:
-        max_neutral = float(os.getenv("GATE_MAX_NEUTRAL", "0.65") or "0.65")
+        max_neutral = float(os.getenv('GATE_MAX_NEUTRAL', '0.65') or '0.65')
     except Exception:
         max_neutral = 0.65
-
-    ta_neutral = _compute_ta_neutral_flag(features_raw)
-
     try:
-        mtf_cons = float(mtf.get("mtf_consensus", 0.0)) if mtf else 0.0
+        neu = float(neutral_prob) if neutral_prob is not None else 0.0
+        neu = float(np.clip(neu, 0.0, 1.0))
+    except Exception:
+        neu = 0.0
+    # If structure+flow are aligned, neutral is treated as soft penalty not a veto
+    neutral_veto = (neutral_prob is not None) and (neu > max_neutral)
+
+    # --- Context signals -----------------------------------------------
+    flow_score, flow_side, micro_imb, fut_cvd, fut_vwap, vwap_side = _compute_flow_signal(features_raw)
+    flow_regime = str(features_raw.get('flow_regime', '') or '').upper()
+    ema_chop = bool(_safe_float(features_raw.get('ema_regime_chop_5t', 0.0)) > 0.5)
+    ema_bias = int(round(_safe_float(features_raw.get('ema_bias_5t', 0.0))))
+    ema_break = int(round(_safe_float(features_raw.get('ema15_break_veto', 0.0))))
+    entry_tag = int(round(_safe_float(features_raw.get('ema_entry_tag', 0.0))))
+    entry_side = int(round(_safe_float(features_raw.get('ema_entry_side', 0.0))))
+    ema15 = _safe_float(features_raw.get('ema_15', features_raw.get('ema15', 0.0)))
+
+    # Trend strength: count aligned signals
+    trend_signals = 0
+    if ema_bias == side:
+        trend_signals += 1
+    if vwap_side == side:
+        trend_signals += 1
+    if flow_side == side and abs(float(flow_score)) >= 0.35:
+        trend_signals += 1
+    try:
+        mtf_cons = float(mtf.get('mtf_consensus', 0.0)) if mtf else 0.0
     except Exception:
         mtf_cons = 0.0
+    if (mtf_cons > 0.35 and side == 1) or (mtf_cons < -0.35 and side == -1):
+        trend_signals += 1
 
-    try:
-        ps_up = bool(features_raw.get("struct_pivot_swipe_up", 0))
-        ps_dn = bool(features_raw.get("struct_pivot_swipe_down", 0))
-        fvg_up = bool(features_raw.get("struct_fvg_up_present", 0))
-        fvg_dn = bool(features_raw.get("struct_fvg_down_present", 0))
-        ob_bull = bool(features_raw.get("struct_ob_bull_present", 0))
-        ob_bear = bool(features_raw.get("struct_ob_bear_present", 0))
-    except Exception:
-        ps_up = ps_dn = fvg_up = fvg_dn = ob_bull = ob_bear = False
+    trend_strength = float(min(1.0, trend_signals / 3.0))
 
-    bull_setup = ps_up or fvg_up or ob_bull
-    bear_setup = ps_dn or fvg_dn or ob_bear
-    any_setup = bull_setup or bear_setup
-    ambiguous_setup = bull_setup and bear_setup
-    one_sided_setup = any_setup and not ambiguous_setup
+    # Trigger: EMA module tags are our first-class trigger (pullback/retest/xover-confirm)
+    trigger = False
+    trigger_name = 'none'
+    if entry_side == side and entry_tag in (1, 2, 3):
+        trigger = True
+        trigger_name = {1: 'pullback', 2: 'retest', 3: 'xover_conf'}.get(entry_tag, 'ema_tag')
 
-    try:
-        strong_mag_thr = float(os.getenv("RULE_STRONG_MIN_MAGNITUDE", "0.7") or "0.7")
-    except Exception:
-        strong_mag_thr = 0.7
+    # Secondary trigger: breakdown/breakout in direction (momentum continuation)
+    if not trigger and ema_break == side:
+        trigger = True
+        trigger_name = 'ema15_break'
 
-    strong_rule = False
-    rule_sign = 0
-    if rule_signal is not None:
+    # --- Lane selection -------------------------------------------------
+    ambiguous_setup = bool(is_bull_setup and is_bear_setup)
+    setup_lane = False
+    if not ambiguous_setup:
+        if side == 1 and is_bull_setup:
+            setup_lane = True
+        if side == -1 and is_bear_setup:
+            setup_lane = True
+
+    lane = 'NONE'
+    continuation = False
+    if setup_lane:
+        lane = 'SETUP'
+    else:
+        # Trend continuation lane unlock
         try:
-            rs = float(rule_signal)
-            rule_sign = 1 if rs > 0 else (-1 if rs < 0 else 0)
-            # "Strong rule" only when:
-            #   - magnitude is high,
-            #   - structure is one-sided (real setup),
-            #   - AND rule direction agrees with model direction (side_sign).
-            if (
-                abs(rs) >= strong_mag_thr
-                and one_sided_setup
-                and (rule_sign != 0 and rule_sign == side_sign)
-            ):
-                strong_rule = True
+            min_sig = int(os.getenv('TREND_MIN_SIGNALS', '2') or '2')
         except Exception:
-            rule_sign = 0
+            min_sig = 2
+        if trend_signals >= min_sig and trigger:
+            lane = 'TREND'
+        else:
+            flow_lock = flow_regime in ('BEAR_LOCK', 'BULL_LOCK')
+            ema_align = (side == 1 and c >= ema15) or (side == -1 and c <= ema15)
+            if flow_lock and vwap_side == side and ema_align:
+                lane = 'TREND'
+                continuation = True
+                soft['trend_continuation'] = float(os.getenv('PEN_TREND_CONT', '0.01') or '0.01')
 
-    eff_margin_thr = base_margin_thr
-    if ambiguous_setup:
-        eff_margin_thr += 0.02
-    if side_sign > 0 and mtf_cons > 0.5:
-        eff_margin_thr = max(0.02, eff_margin_thr - 0.01)
-    elif side_sign < 0 and mtf_cons < -0.5:
-        eff_margin_thr = max(0.02, eff_margin_thr - 0.01)
-    # TA-neutral gentle bump
-    eff_margin_thr = float(np.clip(eff_margin_thr + 0.03 * ta_neutral, 0.0, 1.0))
+    # Hysteresis continuation: if we recently were in TREND for this side, allow TREND even if trigger blips off
+    if lane == 'NONE' and getattr(state, '_trend_hold', 0) > 0 and getattr(state, '_trend_side', 0) == side and trend_signals >= 2:
+        lane = 'TREND'
+        soft['hysteresis_hold'] = float(os.getenv('PEN_HYST', '0.005') or '0.005')
 
-    base_neu = float(neutral_prob) if neutral_prob is not None else 0.0
-    neutral_prob_eff = min(1.0, base_neu + 0.10 * ta_neutral)
-    neutral_veto = neutral_prob_eff > max_neutral
+    # Yellow conflict: hysteresis may keep TREND without trigger; require trigger in that case.
+    if tape_conflict == 'yellow' and lane == 'TREND' and not trigger:
+        hard.append('tape_yellow_need_trigger')
 
-    if strong_rule and neutral_veto and max(p_buy, p_sell) >= 0.55:
-        neutral_veto = False
+    # Hard veto: if no lane, no trade
+    if lane == 'NONE':
+        hard.append('no_lane')
 
-    tradeable = (raw_margin >= eff_margin_thr) and (not neutral_veto)
+    # Hard veto: strong structural/flow conflict (structure says no for real)
+    if side == 1 and (vwap_side < 0 and flow_side <= 0 and abs(fut_vwap) >= float(os.getenv('FLOW_VWAP_EXT', '0.0020') or '0.0020')):
+        hard.append('structure_conflict')
+    if side == -1 and (vwap_side > 0 and flow_side >= 0 and abs(fut_vwap) >= float(os.getenv('FLOW_VWAP_EXT', '0.0020') or '0.0020')):
+        hard.append('structure_conflict')
 
-    if strong_rule and not tradeable:
-        if side_sign == rule_sign and raw_margin >= max(0.0, eff_margin_thr - 0.02):
-            tradeable = True
+    # Chop: soft by default, hard only when no trend strength
+    if ema_chop:
+        soft['ema_chop_veto'] = float(os.getenv('PEN_CHOP', '0.02') or '0.02')
+        if lane == 'TREND' and trend_signals < 2:
+            hard.append('chop_no_trend')
 
-    logger.info(
-        "[GATE] p_buy=%.4f p_sell=%.4f margin=%.4f eff_thr=%.4f neutral=%.3f "
-        "mtf_cons=%.3f strong_rule=%s side_sign=%d rule_sign=%d "
-        "bull_setup=%s bear_setup=%s ambiguous=%s tradeable=%s",
-        p_buy,
-        p_sell,
-        raw_margin,
-        eff_margin_thr,
-        neutral_prob_eff,
-        mtf_cons,
-        strong_rule,
-        side_sign,
-        rule_sign,
-        bull_setup,
-        bear_setup,
-        ambiguous_setup,
-        tradeable,
+    # Require-setup becomes soft penalty (only meaningful when TREND lane is active)
+    require_setup = _safe_getenv_bool('REQUIRE_SETUP', default=True)
+    if require_setup and lane == 'TREND':
+        soft['require_setup_no_setup'] = float(os.getenv('PEN_NO_SETUP', '0.015') or '0.015')
+
+    # Neutral: veto only if lane is NONE (already hard) else penalty
+    if neutral_veto:
+        soft['neutral_high'] = float(os.getenv('PEN_NEUTRAL', '0.02') or '0.02')
+
+    # Model conflict: rule drives, model filters
+    # Strong opposite model => require extra edge + smaller size
+    conflict = 'none'
+    try:
+        strong_p = float(os.getenv('CONFLICT_STRONG_P', '0.65') or '0.65')
+        weak_p = float(os.getenv('CONFLICT_WEAK_P', '0.56') or '0.56')
+    except Exception:
+        strong_p, weak_p = 0.65, 0.56
+    model_side = _model_side_from_prob(getattr(state, 'name', 'global'), p_buy)
+    if model_side != 0 and model_side != side:
+        p_opp = p_buy if model_side == 1 else (1.0 - p_buy)
+        if p_opp >= strong_p:
+            conflict = 'strong'
+            soft['rule_conflict'] = float(os.getenv('PEN_CONFLICT_STRONG', '0.03') or '0.03')
+        elif p_opp >= weak_p:
+            conflict = 'weak'
+            soft['rule_conflict'] = float(os.getenv('PEN_CONFLICT_WEAK', '0.015') or '0.015')
+        else:
+            conflict = 'weak'
+            soft['rule_conflict'] = float(os.getenv('PEN_CONFLICT_WEAK', '0.015') or '0.015')
+
+    # Edge threshold: rolling percentile + absolute floor
+    try:
+        min_edge = float(os.getenv('GATE_MARGIN_THR', '0.06') or '0.06')
+    except Exception:
+        min_edge = 0.06
+
+    edge_required, edge_q = state.edge_threshold(side, min_edge=min_edge)
+
+    # If conflict is strong, demand a bit more edge
+    if conflict == 'strong':
+        edge_required = float(min(1.0, edge_required + float(os.getenv('CONFLICT_EDGE_BONUS', '0.03') or '0.03')))
+
+    # Score: margin plus small bonuses minus penalties
+    score = float(raw_margin)
+    if lane == 'SETUP':
+        score += float(os.getenv('BONUS_SETUP', '0.02') or '0.02')
+    if lane == 'TREND':
+        score += float(os.getenv('BONUS_TREND', '0.01') or '0.01')
+    if flow_side == side:
+        score += float(os.getenv('BONUS_FLOW', '0.01') or '0.01')
+    if vwap_side == side:
+        score += float(os.getenv('BONUS_VWAP', '0.005') or '0.005')
+    score -= float(sum(float(v) for v in soft.values()))
+
+    # Tradeable: hard-veto free, lane present, edge satisfied
+    would_trade_wo_soft = (len(hard) == 0) and (lane != 'NONE') and (raw_margin >= edge_required)
+
+    tradeable = would_trade_wo_soft and (score >= edge_required)
+
+    # If strong conflict and no trigger (shouldn't happen), block
+    if conflict == 'strong' and lane == 'TREND' and not trigger:
+        hard.append('conflict_no_trigger')
+        tradeable = False
+
+    # Refresh trend hold when TREND is active
+    if lane == 'TREND':
+        try:
+            state._trend_hold = int(getattr(state, 'hyst_bars', 0) or 0)
+        except Exception:
+            state._trend_hold = 0
+        state._trend_side = side
+    state._last_lane = lane
+
+    # Size multiplier
+    if lane == 'SETUP':
+        size_mult = 1.0
+    elif lane == 'TREND':
+        try:
+            size_mult = float(os.getenv('TREND_LANE_SIZE_MULT', '0.5') or '0.5')
+        except Exception:
+            size_mult = 0.5
+    else:
+        size_mult = 0.0
+
+    if lane == 'TREND' and continuation:
+        try:
+            cont_mult = float(os.getenv('TREND_CONT_SIZE_MULT', '0.35') or '0.35')
+        except Exception:
+            cont_mult = 0.35
+        size_mult *= float(np.clip(cont_mult, 0.05, 1.0))
+
+    # Activate hysteresis hold when TREND lane is engaged
+    if lane == 'TREND':
+        try:
+            state._trend_hold = int(getattr(state, 'hyst_bars', 0) or 0)
+        except Exception:
+            state._trend_hold = 0
+        state._trend_side = int(side)
+    else:
+        state._trend_hold = 0
+        state._trend_side = 0
+
+    if conflict == 'weak':
+        size_mult *= float(os.getenv('CONFLICT_SIZE_WEAK', '0.80') or '0.80')
+    elif conflict == 'strong':
+        size_mult *= float(os.getenv('CONFLICT_SIZE_STRONG', '0.50') or '0.50')
+
+    # Tape conflict sizing
+    if tape_conflict == 'yellow':
+        try:
+            size_mult *= float(os.getenv('TAPE_YELLOW_SIZE_MULT', '0.60') or '0.60')
+        except Exception:
+            size_mult *= 0.60
+    elif tape_conflict == 'red':
+        size_mult = 0.0
+
+    # EMA15 opposite break: treat as soft, but if very fresh against us, block unless SETUP
+    if ema_break == -side:
+        soft['ema15_break_veto'] = float(os.getenv('PEN_EMA_BREAK', '0.02') or '0.02')
+        if lane != 'SETUP' and raw_margin < (edge_required + 0.05):
+            hard.append('ema15_break_against')
+            tradeable = False
+
+    gate_reasons = []
+    gate_reasons.extend(hard)
+    gate_reasons.extend(list(soft.keys()))
+    if lane == 'TREND':
+        gate_reasons.append('lane_trend')
+    elif lane == 'SETUP':
+        gate_reasons.append('lane_setup')
+
+    # Update hysteresis state
+    try:
+        state._last_lane = lane
+    except Exception:
+        pass
+    if lane == 'TREND' and trigger and trend_signals >= 2:
+        try:
+            state._trend_side = side
+            state._trend_hold = max(int(getattr(state, 'hyst_bars', 0) or 0), int(getattr(state, '_trend_hold', 0) or 0))
+        except Exception:
+            pass
+
+    snap = DecisionSnapshot(
+        lane=lane,
+        intent=intent,
+        tradeable=bool(tradeable),
+        size_mult=float(size_mult),
+        score=float(score),
+        edge_required=float(edge_required),
+        edge_quantile=float(edge_q),
+        trend_strength=float(trend_strength),
+        trend_signals=int(trend_signals),
+        conflict=str(conflict),
+        hard_veto=list(hard),
+        soft_penalties=dict(soft),
+        muted_only_soft=bool(would_trade_wo_soft and (not tradeable) and (len(soft) > 0) and (len(hard) == 0)),
     )
+    state.bump_counts(snap)
 
-    qmin_eff = eff_margin_thr
-    q_delta = 0.0
-    q_adj = 0.0
-    q_ctx = 0.0
-
-    return tradeable, qmin_eff, q_delta, q_adj, q_ctx
-
+    return {
+        'lane': lane,
+        'intent': intent,
+        'tradeable': bool(tradeable),
+        'size_mult': float(size_mult),
+        'score': float(score),
+        'edge_required': float(edge_required),
+        'edge_quantile': float(edge_q),
+        'trend_strength': float(trend_strength),
+        'trend_signals': int(trend_signals),
+        'tape_conflict_level': str(tape_conflict),
+        'tape_conflict_reasons': list(conflict_reasons or []),
+        'conflict': str(conflict),
+        'trigger': bool(trigger),
+        'trigger_name': str(trigger_name),
+        'raw_margin': float(raw_margin),
+        'centered_margin': float(centered_margin),
+        'would_trade_without_soft': bool(would_trade_wo_soft),
+        'hard_veto': list(hard),
+        'soft_penalties': dict(soft),
+        'gate_reasons': gate_reasons,
+    }
 
 def _bucket_buy_prob(buy_prob: float) -> str:
     """
@@ -1551,6 +2100,15 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
     logger.info("=" * 60)
     logger.info("STARTING PROBABILITIES-ONLY MAIN EVENT LOOP")
     logger.info("=" * 60)
+    _log_env_audit([
+        "MODEL_SIDE_DEADBAND", "MODEL_SIDE_MIN_DELTA", "MODEL_SIDE_FLIP_CONFIRM",
+        "HTF_MIN_CONS", "RULE_MIN_SIG", "FLOW_VWAP_EXT",
+        "CALIB_MIN_N", "CALIB_MIN_SLOPE", "CALIB_MIN_AUC", "CALIB_WEAK_DAMP",
+        "GATE_MAX_NEUTRAL", "TREND_MIN_SIGNALS", "TREND_LANE_SIZE_MULT",
+        "TAPE_YELLOW_SIZE_MULT", "REQUIRE_SETUP", "LEGACY_TRAIN_CSV",
+        "ENABLE_INDICATOR_MODULATION", "IND_MOD_SCALE",
+        "ENABLE_PATTERN_MODULATION", "PAT_MOD_SCALE",
+    ])
 
     # Normalize connections (single connection default)
     connections: List[Tuple[str, Any]] = []
@@ -1586,26 +2144,32 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
     logger.info(f"Feature log path: {feature_log_path}")
 
     # NEW: dedicated training log (avoid schema mixing with legacy feature_log.csv)
-    train_log_path = getattr(config, "train_log_path", None) or os.getenv("TRAIN_LOG_PATH", "").strip() or "train_log_v2.jsonl"
-    logger.info(f"Training log path: {train_log_path}")
+    train_log_path = getattr(config, "train_log_path", None) or os.getenv("TRAIN_LOG_PATH", "").strip()
+    if not train_log_path:
+        logger.error("TRAIN_LOG_PATH missing; training will be disabled.")
+    else:
+        logger.info(f"Training log path: {train_log_path}")
 
     # Background online trainer (kept)
     trainer_task = None
     try:
-        from online_trainer_regen_v2 import background_trainer_loop
+        from online_trainer_regen_v2_bundle import background_trainer_loop
         xgb_out = os.getenv("XGB_PATH", "trained_models/production/xgb_model.json")
         neutral_out = os.getenv("NEUTRAL_PATH", "trained_models/production/neutral_model.pkl")
         Path(Path(xgb_out).parent or ".").mkdir(parents=True, exist_ok=True)
         Path(Path(neutral_out).parent or ".").mkdir(parents=True, exist_ok=True)
-        trainer_task = asyncio.create_task(background_trainer_loop(
-            feature_log_path=train_log_path,
-            xgb_out_path=xgb_out,
-            neutral_out_path=neutral_out,
-            pipeline_ref=model_pipe,
-            interval_sec=int(getattr(config, "trainer_interval_sec", 300)) if hasattr(config, "trainer_interval_sec") else 300,
-            min_rows=int(getattr(config, "trainer_min_rows", 100)) if hasattr(config, "trainer_min_rows") else 100
-        ))
-        logger.info("Online trainer task started")
+        if train_log_path:
+            trainer_task = asyncio.create_task(background_trainer_loop(
+                feature_log_path=train_log_path,
+                xgb_out_path=xgb_out,
+                neutral_out_path=neutral_out,
+                pipeline_ref=model_pipe,
+                interval_sec=int(getattr(config, "trainer_interval_sec", 300)) if hasattr(config, "trainer_interval_sec") else 300,
+                min_rows=int(getattr(config, "trainer_min_rows", 100)) if hasattr(config, "trainer_min_rows") else 100
+            ))
+            logger.info("Online trainer task started")
+        else:
+            logger.error("Online trainer not started: TRAIN_LOG_PATH missing")
     except Exception as e:
         logger.warning(f"Online trainer not started: {e}")
 
@@ -1614,14 +2178,17 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
     try:
         from calibrator import background_calibrator_loop
         calib_out = os.getenv("CALIB_PATH", "trained_models/production/platt_calibration.json")
-        calib_task = asyncio.create_task(background_calibrator_loop(
-            feature_log_path=train_log_path,
-            calib_out_path=calib_out,
-            pipeline_ref=model_pipe,
-            interval_sec=int(getattr(config, "calib_interval_sec", 1200)) if hasattr(config, "calib_interval_sec") else 1200,
-            min_dir_rows=int(getattr(config, "calib_min_rows", 120)) if hasattr(config, "calib_min_rows") else 120
-        ))
-        logger.info(f"[CALIB] Calibrator task started → {calib_out}")
+        if train_log_path:
+            calib_task = asyncio.create_task(background_calibrator_loop(
+                feature_log_path=train_log_path,
+                calib_out_path=calib_out,
+                pipeline_ref=model_pipe,
+                interval_sec=int(getattr(config, "calib_interval_sec", 1200)) if hasattr(config, "calib_interval_sec") else 1200,
+                min_dir_rows=int(getattr(config, "calib_min_rows", 120)) if hasattr(config, "calib_min_rows") else 120
+            ))
+            logger.info(f"[CALIB] Calibrator task started → {calib_out}")
+        else:
+            logger.error("[CALIB] Calibrator not started: TRAIN_LOG_PATH missing")
     except Exception as e:
         logger.warning(f"[CALIB] Calibrator not started: {e}")
 
@@ -1673,14 +2240,18 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
     rule_weight_ind = float(os.getenv("RULE_WEIGHT_IND", "0.50"))
     rule_weight_mtf = float(os.getenv("RULE_WEIGHT_MTF", "0.35"))
     rule_weight_pat = float(os.getenv("RULE_WEIGHT_PAT", "0.15"))
-    
-    # Normalize to sum to 1.0
-    total_weight = rule_weight_ind + rule_weight_mtf + rule_weight_pat
+    rule_weight_ta  = float(os.getenv("RULE_WEIGHT_TA",  "0.00"))
+
+    # Normalize to sum to 1.0 (include TA weight if provided)
+    total_weight = rule_weight_ind + rule_weight_mtf + rule_weight_pat + rule_weight_ta
     if total_weight > 0:
         rule_weight_ind /= total_weight
         rule_weight_mtf /= total_weight
         rule_weight_pat /= total_weight
-    logger.info(f"Rule weights: IND={rule_weight_ind:.3f} MTF={rule_weight_mtf:.3f} PAT={rule_weight_pat:.3f}")
+        rule_weight_ta  /= total_weight
+    logger.info(
+        f"Rule weights: IND={rule_weight_ind:.3f} MTF={rule_weight_mtf:.3f} PAT={rule_weight_pat:.3f} TA={rule_weight_ta:.3f}"
+    )
 
     # Per-connection tasks and state
     stop_events: Dict[str, asyncio.Event] = {}
@@ -1693,8 +2264,13 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
 
             ob_ring = deque(maxlen=10)
             staged_map: Dict[datetime, Dict[str, Any]] = {}   # features staged per reference candle start (2-min horizon)
-            tuner = RollingConfidenceTuner(
-                window=int(os.getenv("ROLLING_CONF_WINDOW", "50") or "50"),
+
+            decision_state = DecisionState(
+                name=name,
+                edge_window=int(os.getenv('EDGE_WINDOW', '300') or '300'),
+                edge_pctl=float(os.getenv('EDGE_PCTL', '0.85') or '0.85'),
+                hyst_bars=int(os.getenv('TREND_HYST_BARS', '3') or '3'),
+                summary_every=int(os.getenv('DECISION_SUMMARY_EVERY', '50') or '50'),
             )
             setup_ready_at: Optional[datetime] = None  # setup READY timestamp for delayed entry
 
@@ -1712,6 +2288,7 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
             # ---------- PRE-CLOSE: STAGE FEATURES AT CURRENT CANDLE START (2-MIN HORIZON) ----------
             async def _on_preclose_cb(preview_df: pd.DataFrame, full_df: pd.DataFrame):
                 try:
+                    gate_meta: Dict[str, Any] = {}
                     nonlocal setup_ready_at
                     if preview_df is None or preview_df.empty:
                         return
@@ -1729,22 +2306,87 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                     ref_start = current_bucket_start
                     # Target close candle start (for logging only)
                     target_start = current_bucket_start + timedelta(minutes=horizon_min)
+                    # --- Candle-synced EMA/TA base (no tick-EMA) -----------------
+                    # We compute EMAs on the SAME candle series whose open/close is used later,
+                    # to avoid tick-vs-candle mismatches.
+                    interval_sec = int(getattr(cfg, 'candle_interval_seconds', 60))
+                    base_min = max(1, int(interval_sec // 60))
 
-                    # Gather prices for TA/indicator scaling
-                    try:
-                        prices = ws_handler.get_prices(last_n=200) if hasattr(ws_handler, 'get_prices') else []
-                    except Exception:
-                        prices = []
-                    if not prices or len(prices) < 2:
+                    # Determine timeframes (overrideable by env)
+                    # Note: base candles are built at cfg.candle_interval_seconds (default 300s = 5T in run_main.py),
+                    # so the safe default is decision_tf == base TF. If you want a 1T decision TF, set
+                    # CANDLE_INTERVAL_SECONDS=60 so the candle builder actually produces 1T bars.
+                    def _tf_to_min(_tf: str) -> int:
+                        try:
+                            s = (_tf or "").strip().lower()
+                            if not s:
+                                return 0
+                            if s.endswith("t"):
+                                return int(s[:-1])
+                            if s.endswith("min"):
+                                return int(s[:-3])
+                            return int(s)
+                        except Exception:
+                            return 0
+
+                    decision_tf = (os.getenv("EMA_DECISION_TF", "") or "").strip()
+                    filter_tf = (os.getenv("EMA_FILTER_TF", "") or "").strip()
+
+                    if not decision_tf:
+                        decision_tf = f"{base_min}T"
+                    if not filter_tf:
+                        # If base is 1T, default filter is 5T, else filter==decision (stable)
+                        filter_tf = "5T" if base_min == 1 else decision_tf
+
+                    # Safety clamps: do not "upsample" EMAs to a smaller TF than the base candle builder.
+                    # Resampling 5T candles to 1T does NOT create new information and can confuse break/entry logic.
+                    dec_min = _tf_to_min(decision_tf)
+                    fil_min = _tf_to_min(filter_tf)
+                    if dec_min and dec_min < base_min:
+                        logger.warning(f"[{name}] EMA_DECISION_TF={decision_tf} < base TF {base_min}T; clamping to {base_min}T")
+                        decision_tf = f"{base_min}T"
+                        dec_min = base_min
+                    if fil_min and fil_min < dec_min:
+                        logger.warning(f"[{name}] EMA_FILTER_TF={filter_tf} < decision TF {decision_tf}; clamping to {decision_tf}")
+                        filter_tf = decision_tf
+
+
+                    # Merge preview candle into full candle stream (preclose preview is near-final)
+                    base_df = full_df.tail(1200).copy() if isinstance(full_df, pd.DataFrame) else pd.DataFrame()
+                    if isinstance(preview_df, pd.DataFrame) and not preview_df.empty:
+                        try:
+                            idx = preview_df.index[-1]
+                            row = preview_df.iloc[-1]
+                            for col in ("open", "high", "low", "close", "volume", "tick_count"):
+                                if col in preview_df.columns:
+                                    base_df.loc[idx, col] = row.get(col)
+                        except Exception:
+                            pass
+
+                    # Decision TF candles (same series used for body/wick logic)
+                    decision_df = base_df if decision_tf == f"{base_min}T" else FeaturePipeline.resample_ohlc(base_df, decision_tf)
+                    filter_df = base_df if filter_tf == decision_tf else FeaturePipeline.resample_ohlc(base_df, filter_tf)
+
+                    if decision_df is None or decision_df.empty or "close" not in decision_df.columns:
                         return
 
-                    # Recent candles for MTF patterns and SR bundle
-                    safe_df = full_df.tail(500) if isinstance(full_df, pd.DataFrame) and not full_df.empty else pd.DataFrame()
+                    # --- Price series used by microstructure features ---
+                    try:
+                        prices = pd.to_numeric(decision_df["close"], errors="coerce").dropna().astype(float).tolist()
+                    except Exception:
+                        prices = []
+
+                    if not prices:
+                        return  # nothing to compute safely
+
+                    last_px = float(prices[-1])
+# Recent candles for MTF patterns and SR bundle
+                    safe_df = decision_df.tail(500) if isinstance(decision_df, pd.DataFrame) and not decision_df.empty else pd.DataFrame()
 
                     # TA/EMA
-                    ema_feats = FeaturePipeline.compute_emas(prices)
+                    ema_feats = FeaturePipeline.compute_emas(prices[-200:])
                     try:
-                        candle_df_ta = safe_df if not safe_df.empty else pd.DataFrame({"close": pd.Series(prices)})
+                        candle_df_ta = safe_df if not safe_df.empty else decision_df.tail(200)
                         ta = TA.compute_ta_bundle(candle_df_ta, ema_feats)
                     except Exception:
                         ta = {}
@@ -1787,8 +2429,6 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                     except Exception:
                         order_books = []
                     ofd = FeaturePipeline.order_flow_dynamics(order_books)
-
-                    last_px = float(prices[-1]) if prices else 0.0
                     try:
                         micro_ctx = ws_handler.get_micro_features()
                         px_arr = np.asarray(prices[-64:], dtype=float)
@@ -1908,13 +2548,30 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                             "vwap_reversion_flag": float(vwap_rev),
                         },
                     )
+                    # --- EMA module (regime/bias/entry-tag/veto) ---------------
+                    ema_module_feats, ema_meta = FeaturePipeline.compute_ema_module(
+                        decision_df=decision_df,
+                        filter_df=filter_df,
+                        decision_tf=decision_tf,
+                        filter_tf=filter_tf,
+                    )
+
 
                     ta_feats = ta or {}
                     pat_feats = pattern_features or {}
                     mtf_feats = mtf or {}
 
+                    try:
+                        last_candle_dict = last_candle if isinstance(last_candle, dict) else (last_candle.to_dict() if last_candle is not None else {})
+                    except Exception:
+                        last_candle_dict = {}
+
+                    # Backward-compatible alias (older code used `last`)
+                    last = last_candle_dict
+
                     features_raw = {
                         **ema_feats,
+                        **(ema_module_feats or {}),
                         **ta_feats,
                         **pat_feats,
                         **mtf_feats,
@@ -1938,6 +2595,10 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         "wick_extreme_down": float(wick_down),
                         "vwap_reversion_flag": float(vwap_rev),
                         "cvd_divergence": float(cvd_div),
+                        "open": float(last_candle_dict.get("open", np.nan)) if "open" in last_candle_dict else float(np.nan),
+                        "high": float(last_candle_dict.get("high", np.nan)) if "high" in last_candle_dict else float(np.nan),
+                        "low": float(last_candle_dict.get("low", np.nan)) if "low" in last_candle_dict else float(np.nan),
+                        "close": float(last_candle_dict.get("close", np.nan)) if "close" in last_candle_dict else float(np.nan),
                     }
                     # Setup flags (pivot/FVG/OB)
                     is_pivot_swipe_up = bool(features_raw.get("struct_pivot_swipe_up", 0))
@@ -1994,6 +2655,9 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                     features_raw["is_bull_setup"] = int(is_bull_setup)
                     features_raw["is_bear_setup"] = int(is_bear_setup)
                     features_raw["is_any_setup"] = int(is_any_setup)
+
+                    # Compute flow once (and log once). Downstream modules reuse cached values.
+                    _compute_flow_signal(features_raw, log=True)
                     features_raw.update(rev_cross_feats)
                     features = FeaturePipeline.normalize_features(features_raw, scale=scale)
 
@@ -2086,7 +2750,10 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                     ta_rule = _compute_ta_rule_signal(features_raw)
 
                     # Combined rule signal: indicators + MTF + patterns + TA
-                    rule_sig = ind_score + mtf_cons + pat_adj + ta_rule
+                    rule_sig = (rule_weight_ind * ind_score) + (rule_weight_mtf * mtf_cons) + (rule_weight_pat * pat_adj) + (rule_weight_ta * ta_rule)
+
+                    # Precompute flow once (cached in features_raw) to avoid recomputation/log spam
+                    _compute_flow_signal(features_raw, log=True)
 
                     # Hierarchy-based rule direction (flow/HTF > EMA trend > structure)
                     is_bull_setup = bool(features_raw.get("is_bull_setup", 0))
@@ -2094,7 +2761,7 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                     ambiguous_setup = is_bull_setup and is_bear_setup
                     any_setup = is_bull_setup or is_bear_setup
 
-                    rule_dir, base_dir = _compute_rule_hierarchy(
+                    rule_dir, base_dir, tape_conflict_level, tape_conflict_reasons = _compute_rule_hierarchy(
                         name=name,
                         rule_sig=rule_sig,
                         features_raw=features_raw,
@@ -2103,27 +2770,58 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         is_bear_setup=is_bear_setup,
                         any_setup=any_setup,
                         ambiguous_setup=ambiguous_setup,
+                        buy_prob=buy_prob,
+                    )
+                    decision = _decide_trade(
+                        state=decision_state,
+                        cfg=cfg,
+                        features_raw=features_raw,
+                        mtf=mtf,
+                        rule_dir=rule_dir,
+                        conflict_level=tape_conflict_level,
+                        conflict_reasons=tape_conflict_reasons,
+                        buy_prob=buy_prob,
+                        neutral_prob=neutral_for_gate,
+                        is_bull_setup=bool(is_bull_setup),
+                        is_bear_setup=bool(is_bear_setup),
+                        safe_df=safe_df,
                     )
 
-                    require_setup = str(os.getenv("REQUIRE_SETUP", "1")).lower() in ("1", "true", "yes")
-                    if require_setup and not is_any_setup:
-                        suggest_tradeable = False
-                        qmin_eff = 0.0
-                        q_delta = 0.0
-                        q_adj = 0.0
-                        q_ctx = 0.0
-                    else:
-                        suggest_tradeable, qmin_eff, q_delta, q_adj, q_ctx = _gate_trade_decision(
-                            buy_prob=buy_prob,
-                            neutral_prob=neutral_for_gate,
-                            cfg=cfg,
-                            tuner=tuner,
-                            features_raw=features_raw,
-                            mtf=mtf,
-                            rule_signal=rule_sig,
-                        )
+                    suggest_tradeable = bool(decision.get('tradeable', False))
+                    tradeable_flag = bool(suggest_tradeable)
+                    gate_meta = {'reasons': list(decision.get('gate_reasons', []))}
+                    lane = str(decision.get('lane', 'NONE'))
+                    size_mult = float(decision.get('size_mult', 0.0))
+                    # Structured decision log (machine-readable)
+                    logger.info(
+                        "[%s] [DECISION] lane=%s intent=%s tradeable=%s size=%.2f score=%.3f edge_req=%.3f edge_q=%.3f "
+                        "mrg_center=%.3f mrg_raw=%.3f trend_sig=%d trend_str=%.2f trigger=%s(%s) tape=%s conflict=%s "
+                        "would_trade_wo_soft=%s hard=%s soft=%s",
+                        name,
+                        lane,
+                        str(decision.get('intent', 'NA')),
+                        bool(decision.get('tradeable', False)),
+                        float(size_mult),
+                        float(decision.get('score', 0.0)),
+                        float(decision.get('edge_required', 0.0)),
+                        float(decision.get('edge_quantile', 0.0)),
+                        float(decision.get('centered_margin', 0.0)),
+                        float(decision.get('raw_margin', 0.0)),
+                        int(decision.get('trend_signals', 0)),
+                        float(decision.get('trend_strength', 0.0)),
+                        bool(decision.get('trigger', False)),
+                        str(decision.get('trigger_name', 'none')),
+                        str(decision.get('tape_conflict_level', 'none')),
+                        str(decision.get('conflict', 'na')),
+                        bool(decision.get('would_trade_without_soft', False)),
+                        list(decision.get('hard_veto', [])),
+                        list((decision.get('soft_penalties', {}) or {}).keys()),
+                    )
 
-                    tradeable_flag = bool(suggest_tradeable) if (suggest_tradeable is not None) else True
+                    try:
+                        decision_state.maybe_log_summary(current_bucket_start)
+                    except Exception:
+                        pass
 
                     # --- Model-based direction (for debugging only) ---
                     if buy_prob > 0.5:
@@ -2132,11 +2830,15 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         dir_model = "SELL"
                     else:
                         dir_model = "NEUTRAL"
-
                     # --- Setup state and optional delayed entry ---
                     setup_state = "NONE"
-                    if is_any_setup:
+                    if lane == "SETUP":
                         setup_state = "READY" if tradeable_flag else "BUILDING"
+                    elif is_any_setup and lane != "SETUP":
+                        # structure present but we are using non-setup logic (or blocked)
+                        setup_state = "BUILDING" if not tradeable_flag else "READY"
+                    elif lane == "TREND":
+                        setup_state = "BYPASS"
 
                     entry_delay_min = int(os.getenv("SETUP_ENTRY_DELAY_MIN", "0") or "0")
                     if not is_any_setup:
@@ -2193,7 +2895,7 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
 
                         reason = "+".join(reason_parts) if reason_parts else "rule_signal"
                         logger.info(
-                            "[%s] [RULE] candidate_override: model=%s vs rule_dir=%s (reason=%s)",
+                            "[%s] [RULE] candidate_override: raw_dir=%s -> rule_dir=%s (reason=%s)",
                             name,
                             dir_model,
                             rule_dir,
@@ -2233,71 +2935,9 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         raw_dir = "SELL"
                     else:
                         raw_dir = "FLAT"
-
-                    # Override rule:
-                    # Only override when:
-                    #   - rule_dir is not NA, AND
-                    #   - (sign(rule) == sign(model)) OR (model margin is small "coin flip")
-                    # Additionally:
-                    #   - never override a very confident model with opposite rule
-                    override_ok = (rule_dir != "NA") and (dir_model in ("BUY", "SELL")) and (rule_dir in ("BUY", "SELL"))
-
-                    override_vetoed = False
-
-                    # Treat "coin flip zone" as margin below this threshold
-                    try:
-                        margin_soft = float(os.getenv("RULE_OVERRIDE_MAX_MARGIN", "0.15") or "0.15")
-                    except Exception:
-                        margin_soft = 0.15
-
-                    same_sign = (override_ok and (rule_dir == dir_model))
-                    coinflip = (override_ok and (margin_val <= margin_soft))
-
-                    if override_ok and not (same_sign or coinflip):
-                        logger.info(
-                            "[%s] [OVERRIDE] veto: strong model vs opposing rule "
-                            "(model=%s rule=%s margin=%.3f thr=%.3f)",
-                            name,
-                            dir_model,
-                            rule_dir,
-                            margin_val,
-                            margin_soft,
-                        )
-                        override_ok = False
-                        override_vetoed = True
-                    else:
-                        logger.info(
-                            "[%s] [OVERRIDE] allow=%s (same_sign=%s coinflip=%s) model=%s rule=%s margin=%.3f thr=%.3f",
-                            name,
-                            bool(override_ok),
-                            bool(same_sign),
-                            bool(coinflip),
-                            dir_model,
-                            rule_dir,
-                            margin_val,
-                            margin_soft,
-                        )
-
-                    # TYPE-C: hard neutral veto unless strong (and allowed) setup
-                    if (neu_val > 0.90) and (not override_ok):
-                        dir_overall = "FLAT"
-                    else:
-                        if override_ok:
-                            dir_overall = rule_dir
-                        elif rule_dir == "NA":
-                            # TYPE-B: ambiguous / no clear setup; respect neutral
-                            if neu_val < 0.70:
-                                dir_overall = raw_dir
-                            else:
-                                dir_overall = "FLAT"
-                        else:
-                            # Rule exists but override was vetoed (strong opposing model).
-                            # Do NOT force rule_dir. Fall back to the model direction, but keep neutral discipline.
-                            if neu_val < 0.70:
-                                dir_overall = raw_dir
-                            else:
-                                dir_overall = "FLAT"
-
+                    # --- Final direction: tape (rule_dir) decides; model only filters entries ---
+                    intent = str(decision.get('intent', 'FLAT')) if isinstance(decision, dict) else 'FLAT'
+                    dir_overall = intent if intent in ("BUY", "SELL") else "FLAT"
                     if dir_overall in ("NEUTRAL", "FLAT"):
                         tradeable_flag = False
 
@@ -2309,6 +2949,13 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         "sell_prob": float(1.0 - buy_prob),
                         "alpha": None,
                         "neutral_prob": float(neutral_prob) if neutral_prob is not None else None,
+                        "ema_decision_tf": (ema_meta or {}).get("decision_tf"),
+                        "ema_filter_tf": (ema_meta or {}).get("filter_tf"),
+                        "ema_regime": (ema_meta or {}).get("regime"),
+                        "ema_bias": (ema_meta or {}).get("bias"),
+                        "ema_entry_tag": (ema_meta or {}).get("entry_tag"),
+                        "ema_entry_side": (ema_meta or {}).get("entry_side"),
+                        "ema15_break": (ema_meta or {}).get("ema15_break"),
                         "mtf_consensus": float(mtf.get("mtf_consensus", 0.0)) if mtf else 0.0,
                         "indicator_score": float(indicator_score) if indicator_score is not None else None,
                         "pattern_adj": float(pattern_features.get('probability_adjustment', 0.0)) if pattern_features else 0.0,
@@ -2318,6 +2965,10 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         "rule_direction": rule_dir,
                         "direction": dir_overall,
                         "tradeable": tradeable_flag,
+                        "lane": lane,
+                        "size_mult": float(size_mult),
+                        "edge_required": float(decision.get('edge_required', 0.0)) if isinstance(decision, dict) else None,
+                        "score": float(decision.get('score', 0.0)) if isinstance(decision, dict) else None,
                         "is_bull_setup": bool(is_bull_setup),
                         "is_bear_setup": bool(is_bear_setup),
                         "is_any_setup": bool(is_any_setup),
@@ -2347,32 +2998,13 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         conf_bucket = "LOW"
 
                     rule_dir_display = rule_dir or "n/a"
-
                     gate_reasons: List[str] = []
-                    if suggest_tradeable is None:
-                        gate_reasons.append("gate_disabled")
-                    else:
-                        if not suggest_tradeable:
-                            gate_reasons.append("edge_low")
-
-                        if override_vetoed:
-                            gate_reasons.append("override_veto")
-
-                        # If you enable RULE_VETO_ENABLE, explicitly flag rule conflicts
-                        if rule_sig is not None:
-                            model_sign = 1.0 if (buy_prob - 0.5) > 0 else (-1.0 if (buy_prob - 0.5) < 0 else 0.0)
-                            rule_sign = 1.0 if rule_sig > 0 else (-1.0 if rule_sig < 0 else 0.0)
-                            if (
-                                not tradeable_flag
-                                and model_sign != 0.0
-                                and rule_sign != 0.0
-                                and model_sign != rule_sign
-                            ):
-                                gate_reasons.append("rule_conflict")
-
+                    if isinstance(decision, dict):
+                        for r in decision.get('gate_reasons', []) or []:
+                            if r and str(r) not in gate_reasons:
+                                gate_reasons.append(str(r))
                     if tradeable_flag and not gate_reasons:
-                        gate_reasons.append("pass")
-
+                        gate_reasons.append('pass')
                     gate_reason_str = ",".join(gate_reasons) if gate_reasons else "n/a"
 
                     interval_min = max(
@@ -2380,10 +3012,30 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         int(getattr(cfg, "candle_interval_seconds", 60) // 60),
                     )
 
+                    scalper_line = _scalper_playbook_line(
+                        features_raw=features_raw,
+                        dir_overall=dir_overall,
+                        tradeable=tradeable_flag,
+                        gate_reasons=gate_reasons,
+                        rule_dir=rule_dir_display,
+                        model_dir=dir_model,
+                        margin=margin_val,
+                        conf_bucket=conf_bucket,
+                        p_buy=float(p_buy_tri),
+                        p_sell=float(p_sell_tri),
+                        p_flat=float(p_flat),
+                        struct_setup_side=(
+                            1 if (is_bull_setup and not is_bear_setup)
+                            else (-1 if (is_bear_setup and not is_bull_setup) else 0)
+                        ),
+                    )
+                    logger.info(f"[{name}] {interval_min}-min {scalper_line}")
+
+
                     logger.info(
                         f"[{name}] {interval_min}-min view: "
                         f"BUY={p_buy_tri*100:.1f}% | SELL={p_sell_tri*100:.1f}% | FLAT={p_flat*100:.1f}% | "
-                        f"dir={dir_overall} (rule_dir={rule_dir_display}, raw_dir={raw_dir}, override_ok={override_ok}) | margin={margin_val:.3f} ({conf_bucket}) | "
+                        f"dir={dir_overall} (rule_dir={rule_dir_display}, raw_dir={raw_dir}) | margin={margin_val:.3f} ({conf_bucket}) | "
                         f"model={dir_model} | tradeable={tradeable_flag} "
                         f"| gate={gate_reason_str}"
                     )
@@ -2397,10 +3049,6 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                     features_for_log = dict(features)
                     p_raw = getattr(model_pipe, "last_p_xgb_raw", None)
                     p_cal = getattr(model_pipe, "last_p_xgb_calib", None)
-                    if p_raw is not None:
-                        features_for_log["meta_p_xgb_raw"] = float(p_raw)
-                    if p_cal is not None:
-                        features_for_log["meta_p_xgb_calib"] = float(p_cal)
 
                     # FIX #1: Cleanup old staged entries (memory leak prevention)
                     if len(staged_map) > 100:
@@ -2416,6 +3064,12 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         "buy_prob": float(buy_prob),
                         "alpha": 0.0,
                         "tradeable": tradeable_flag,
+                        "lane": lane,
+                        "size_mult": float(size_mult),
+                        "edge_required": float(decision.get('edge_required', 0.0)) if isinstance(decision, dict) else None,
+                        "score": float(decision.get('score', 0.0)) if isinstance(decision, dict) else None,
+                        "meta_p_xgb_raw": float(p_raw) if p_raw is not None else None,
+                        "meta_p_xgb_calib": float(p_cal) if p_cal is not None else None,
                     }
 
                 except Exception as e:
@@ -2449,7 +3103,9 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                     candle_interval_min = max(1.0, interval_sec / 60.0)
                     horizon_bars = max(1, int(round(horizon_min / candle_interval_min)))
 
-                    ref_ts = idx_ts - timedelta(minutes=horizon_min)
+                    # Align reference timestamp to candle grid using horizon_bars
+                    ref_minutes = int(round(horizon_bars * candle_interval_min))
+                    ref_ts = idx_ts - timedelta(minutes=ref_minutes)
 
                     if not isinstance(full_df, pd.DataFrame) or full_df.empty:
                         logger.info(
@@ -2458,13 +3114,27 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         )
                         return
 
+                    idx_ref = None
+
+                    # Prefer stepping back from the actual idx_ts position to stay on-grid.
                     try:
-                        idx_ref = full_df.index.get_loc(ref_ts)
-                        if isinstance(idx_ref, np.ndarray):
-                            idx_ref = int(idx_ref[0])
-                        idx_ref = int(idx_ref)
+                        idx_ts_loc = full_df.index.get_loc(idx_ts)
+                        if isinstance(idx_ts_loc, np.ndarray):
+                            idx_ts_loc = int(idx_ts_loc[0])
+                        idx_ts_loc = int(idx_ts_loc)
+                        idx_ref = idx_ts_loc - horizon_bars
                     except Exception:
-                        idx_ref = len(full_df) - horizon_bars - 1
+                        idx_ref = None
+
+                    # Fallback: try locating ref_ts directly (may fail if timestamps are missing)
+                    if idx_ref is None:
+                        try:
+                            idx_ref = full_df.index.get_loc(ref_ts)
+                            if isinstance(idx_ref, np.ndarray):
+                                idx_ref = int(idx_ref[0])
+                            idx_ref = int(idx_ref)
+                        except Exception:
+                            idx_ref = len(full_df) - horizon_bars - 1
 
                     if idx_ref is None or idx_ref < 0:
                         logger.info(
@@ -2482,6 +3152,73 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                     alpha = float((staged or {}).get("alpha", 0.0))
                     tradeable = bool((staged or {}).get("tradeable", True))
                     features_for_log = dict((staged or {}).get("features", {}))
+
+                    # Fallback: recompute features from full_df at ref_start when staging is missing.
+                    if not features_for_log:
+                        try:
+                            ref_df = full_df.loc[:ref_start] if isinstance(full_df, pd.DataFrame) else pd.DataFrame()
+                            if not ref_df.empty:
+                                ref_df = ref_df.tail(max(300, horizon_bars + 5))
+
+                            close_ser = (
+                                ref_df["close"].astype(float).dropna()
+                                if (not ref_df.empty and "close" in ref_df.columns)
+                                else pd.Series(dtype=float)
+                            )
+
+                            # Scale from close diffs, NaN-safe
+                            if close_ser.size >= 3:
+                                diffs = np.diff(close_ser.values)
+                                scale = float(np.nanstd(diffs))
+                            else:
+                                scale = 1.0
+                            if not np.isfinite(scale) or scale <= 0:
+                                scale = 1.0
+                            scale = max(1e-6, scale)
+
+                            ema_feats = FeaturePipeline.compute_emas(close_ser.tolist())
+                            vol_feats = _compute_vol_features(ref_df) if not ref_df.empty else {}
+                            tod_feats = _time_of_day_features(ref_start)
+
+                            last_price = float(close_ser.iloc[-1]) if close_ser.size else 0.0
+
+                            # last_zscore, NaN-safe
+                            arr = close_ser.values
+                            if arr.size:
+                                tail = arr[-32:] if arr.size >= 32 else arr
+                                mu = float(np.nanmean(tail))
+                                std = float(np.nanstd(tail))
+                                last_z = (float(arr[-1]) - mu) / max(1e-9, std) if np.isfinite(std) and std > 0 else 0.0
+                            else:
+                                last_z = 0.0
+
+                            raw_fallback = {
+                                **ema_feats,
+                                **vol_feats,
+                                **tod_feats,
+                                "last_price": last_price,
+                                "last_zscore": float(np.clip(last_z, -6.0, 6.0)),
+                            }
+
+                            features_norm = FeaturePipeline.normalize_features(raw_fallback, scale=scale)
+
+                            schema_cols = list(getattr(model_pipe, "feature_schema_names", []) or [])
+                            if schema_cols:
+                                features_for_log = {
+                                    k: float(np.nan_to_num(features_norm.get(k, 0.0), nan=0.0, posinf=0.0, neginf=0.0))
+                                    for k in schema_cols
+                                }
+                            else:
+                                features_for_log = {
+                                    k: float(np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0))
+                                    for k, v in features_norm.items()
+                                }
+
+                            logger.info("[%s] [TRAIN] Recomputed features for %s (staged missing)", name, str(ref_start))
+
+                        except Exception as e:
+                            logger.warning(f"[{name}] [TRAIN] Fallback feature recompute failed: {e}")
+                            features_for_log = features_for_log or {}
 
                     # Vol proxies from features (optional)
                     rv10 = features_for_log.get("rv_10")
@@ -2503,7 +3240,7 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
 
                     # Fallback: if no clear setup, still label the price path,
                     # but with lower weight so we don't drown the model in chop.
-                    if label is None:
+                    if label in (None, LABEL_SKIP):
                         label_source = "window"
                         try:
                             tp_ret = float(getattr(cfg, "trade_tp_pct", float(os.getenv("TRADE_TP_PCT", "0.0005") or "0.0005")))
@@ -2527,7 +3264,7 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                             fallback_atr_mult=fb_atr,
                         )
 
-                        if label is None:
+                        if label in (None, LABEL_SKIP):
                             logger.info(
                                 f"[{name}] [TRAIN] Label skipped for {idx_ts.strftime('%H:%M:%S')} (no setup + cannot label window)"
                             )
@@ -2560,18 +3297,6 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                         buy_prob,
                     )
 
-                    # Update rolling confidence tuner for directional labels
-                    try:
-                        dir_true = (
-                            1
-                            if label == "BUY"
-                            else (-1 if label == "SELL" else (0 if label == "FLAT" else None))
-                        )
-                        if dir_true is not None:
-                            tuner.update(dir_true=dir_true, buy_prob=buy_prob)
-                    except Exception as e:
-                        logger.debug(f"[CONF] tuner update failed (ignored): {e}")
-
                     
                     # Sample weight: teach the model harder on clean setups, softer on generic window labels.
                     if label_source == "setup":
@@ -2592,70 +3317,88 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
                     except Exception:
                         pass
 
-                    # Write training record (JSONL) to avoid schema drift.
-                    record = {
-                        "ts_target_close": idx_ts.isoformat(),
-                        "ts_ref_start": pd.to_datetime(ref_start).isoformat() if ref_start is not None else None,
-                        "symbol": str(name),
-                        "decision": "USER",
-                        "label": str(label),
-                        "label_source": str(label_source),
-                        "label_weight": float(label_weight),
-                        "buy_prob": float(buy_prob),
-                        "alpha": float(alpha),
-                        "tradeable": bool(tradeable),
-                        "is_flat": bool(is_flat),
-                        "tick_count": int(row_t2.get("tick_count", 0)),
-                        "features": {k: float(v) for k, v in features_for_log.items() if isinstance(v, (int, float)) and np.isfinite(float(v))},
-                    }
+                    # Write training record (JSONL) with v3 contract + validation.
+                    if not train_log_path:
+                        logger.error("[%s] [TRAIN] TRAIN_LOG_PATH missing; record not written", name)
+                        return
 
+                    schema_cols: List[str] = []
                     try:
-                        Path(Path(train_log_path).parent or ".").mkdir(parents=True, exist_ok=True)
-                        with open(train_log_path, "a", encoding="utf-8") as jf:
-                            jf.write(json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n")
-                    except Exception as e:
-                        logger.warning(f"[{name}] [TRAIN] Failed to write train_log: {e}")
+                        schema_cols = list(getattr(model_pipe, "feature_schema_names", []) or [])
+                    except Exception:
+                        schema_cols = []
 
-                    # Optional legacy CSV writer (off by default to prevent mixed schemas)
-                    if os.getenv("LEGACY_TRAIN_CSV", "0").lower() in ("1", "true", "yes"):
-                        schema_cols: List[str] = []
+                    if not schema_cols:
                         try:
-                            schema_cols = list(getattr(pipeline, "feature_schema_names", []) or [])
+                            sp = os.getenv("FEATURE_SCHEMA_COLS_PATH", "").strip()
+                            if sp:
+                                obj = json.loads(open(sp, "r", encoding="utf-8").read())
+                                schema_cols = obj["columns"] if isinstance(obj, dict) else list(obj)
                         except Exception:
                             schema_cols = []
 
-                        if not schema_cols:
-                            try:
-                                sp = os.getenv("FEATURE_SCHEMA_COLS_PATH", "trained_models/production/feature_schema_cols.json")
-                                obj = json.loads(open(sp, "r", encoding="utf-8").read())
-                                schema_cols = obj["columns"] if isinstance(obj, dict) else list(obj)
-                            except Exception:
-                                schema_cols = []
+                    if not schema_cols:
+                        logger.error("[%s] [TRAIN] Missing schema cols; record skipped", name)
+                        return
 
-                        meta_cols = ["ts", "decision", "label", "buy_prob", "alpha", "tradeable", "is_flat", "ticks"]
-                        fieldnames = meta_cols + schema_cols
+                    features_schema = {k: features_for_log.get(k) for k in schema_cols if k in features_for_log}
+                    meta = {
+                        "meta_p_xgb_raw": (staged or {}).get("meta_p_xgb_raw"),
+                        "meta_p_xgb_calib": (staged or {}).get("meta_p_xgb_calib"),
+                        "aux_ret_main": features_for_log.get("aux_ret_main"),
+                        "aux_ret_short": features_for_log.get("aux_ret_short"),
+                        "aux_label_short": features_for_log.get("aux_label_short"),
+                        "record_source": "online",
+                    }
 
-                        row_out: Dict[str, Any] = {
-                            "ts": idx_ts.isoformat(),
-                            "decision": "USER",
-                            "label": label,
-                            "buy_prob": float(buy_prob),
-                            "alpha": float(alpha),
-                            "tradeable": bool(tradeable),
-                            "is_flat": bool(is_flat),
-                            "ticks": int(row_t2.get("tick_count", 0)),
+                    schema_version = os.getenv("SCHEMA_VERSION", "schema_v3")
+                    label_version = os.getenv("LABEL_VERSION", "label_v3")
+                    pipeline_version = os.getenv("PIPELINE_VERSION", "pipeline_v3")
+
+                    bar_min = int(max(1, round(candle_interval_min)))
+
+                    record, errors = build_train_record_v3(
+                        schema_cols=schema_cols,
+                        schema_version=schema_version,
+                        label_version=label_version,
+                        pipeline_version=pipeline_version,
+                        symbol=str(name),
+                        bar_min=bar_min,
+                        horizon_min=horizon_min,
+                        ts_ref_start=ref_start,
+                        ts_target_close=idx_ts,
+                        label=str(label),
+                        label_source=str(label_source),
+                        label_weight=float(label_weight),
+                        buy_prob=float(buy_prob),
+                        alpha=float(alpha),
+                        tradeable=bool(tradeable),
+                        is_flat=bool(is_flat),
+                        tick_count=int(row_t2.get("tick_count", 0)),
+                        features=features_schema,
+                        meta=meta,
+                    )
+
+                    if errors or record is None:
+                        qrec = {
+                            "record_version": "v3",
+                            "errors": errors,
+                            "record": {
+                                "symbol": str(name),
+                                "ts_target_close": str(idx_ts),
+                                "label": str(label),
+                                "features": features_schema,
+                                "meta": meta,
+                            },
                         }
+                        append_jsonl(train_log_path.replace(".jsonl", "_quarantine.jsonl"), qrec)
+                        logger.warning("[%s] [TRAIN] Record quarantined: %s", name, ",".join(errors))
+                        return
 
-                        for c in schema_cols:
-                            v = features_for_log.get(c)
-                            try:
-                                v_float = float(v)
-                                row_out[c] = v_float if np.isfinite(v_float) else ""
-                            except Exception:
-                                row_out[c] = ""
-
-                        feature_log_path = os.getenv("FEATURE_LOG", "runtime/feature_log.csv")
-                        _append_feature_log_row_csv(feature_log_path, row_out, fieldnames)
+                    if validate_or_quarantine(record, schema_cols=schema_cols, train_log_path=train_log_path):
+                        append_jsonl(train_log_path, record)
+                    else:
+                        logger.warning("[%s] [TRAIN] Record failed validation; quarantined", name)
 
                     logger.info(
                         f"[{name}] [TRAIN] Logged 2-min features for ref={pd.to_datetime(ref_start).strftime('%H:%M:%S')} "
@@ -2711,7 +3454,7 @@ async def main_loop(config, xgb, train_features, token_b64, chat_id, neutral_mod
 
             await asyncio.sleep(max(0.0, (roll_ts - datetime.now(IST)).total_seconds()))
             try:
-                if os.getenv("ENABLE_EOD_ROLL", "0").lower() not in ("1", "true", "yes"):
+                if not _safe_getenv_bool("ENABLE_EOD_ROLL", default=False):
                     logger.info("[EOD] Feature-log roll disabled (set ENABLE_EOD_ROLL=1 to enable).")
                 else:
                     hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")

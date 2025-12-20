@@ -27,6 +27,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+from train_record_v3 import build_train_record_v3
+from train_log_utils_v3 import append_jsonl
 
 def _resample_ohlcv(df1: pd.DataFrame, bar_min: int) -> pd.DataFrame:
     rule = f"{bar_min}min"
@@ -198,6 +200,7 @@ def build_trainlog_from_cache(
 
     out_path = Path(out_jsonl)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    quarantine_path = str(out_path.with_name(out_path.stem + "_quarantine.jsonl"))
 
     n_written = 0
 
@@ -253,10 +256,12 @@ def build_trainlog_from_cache(
                 df[k] = 0.0
             df["last_price"] = df["close"]
 
-            # ensure schema keys exist
+            # ensure schema keys exist (imputed zeros flagged in meta)
+            imputed_cols: List[str] = []
             for k in schema:
                 if k not in df.columns:
                     df[k] = 0.0
+                    imputed_cols.append(k)
 
             df = df.dropna(subset=["atr14","ta_rsi14","ema_8","ema_21","ema_50"], how="any")
 
@@ -279,25 +284,54 @@ def build_trainlog_from_cache(
                     except Exception:
                         v = 0.0
                     feats[k] = v
-                feats["aux_ret_main"] = float(aux_ret_main)
+                schema_version = os.getenv("SCHEMA_VERSION", "schema_v3")
+                label_version = os.getenv("LABEL_VERSION", "label_v3")
+                pipeline_version = os.getenv("PIPELINE_VERSION", "pipeline_v3")
 
-                rec = {
-                    "ts_ref_start": ts_ref.isoformat(sep=" "),
-                    "ts_target_close": ts_tgt.isoformat(sep=" "),
-                    "symbol": symbol,
-                    "decision": "NA",
-                    "label": label,
-                    "label_source": "cache_bootstrap",
-                    "label_weight": 1.0 if label != "FLAT" else 0.7,
-                    "buy_prob": 0.5,
-                    "alpha": 0.0,
-                    "tradeable": True,
-                    "is_flat": (label == "FLAT"),
-                    "tick_count": 0,
-                    "features": feats,
+                meta = {
+                    "record_source": "backfill",
+                    "feature_imputed": imputed_cols,
+                    "aux_ret_main": float(aux_ret_main),
                 }
 
-                f_out.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                record, errors = build_train_record_v3(
+                    schema_cols=schema,
+                    schema_version=schema_version,
+                    label_version=label_version,
+                    pipeline_version=pipeline_version,
+                    symbol=symbol,
+                    bar_min=bar_min,
+                    horizon_min=horizon_min,
+                    ts_ref_start=ts_ref,
+                    ts_target_close=ts_tgt,
+                    label=label,
+                    label_source="cache_bootstrap",
+                    label_weight=1.0 if label != "FLAT" else 0.7,
+                    buy_prob=0.5,
+                    alpha=0.0,
+                    tradeable=True,
+                    is_flat=(label == "FLAT"),
+                    tick_count=0,
+                    features=feats,
+                    meta=meta,
+                )
+
+                if record is None or errors:
+                    qrec = {
+                        "record_version": "v3",
+                        "errors": errors,
+                        "record": {
+                            "symbol": symbol,
+                            "ts_target_close": str(ts_tgt),
+                            "label": label,
+                            "features": feats,
+                            "meta": meta,
+                        },
+                    }
+                    append_jsonl(quarantine_path, qrec)
+                    continue
+
+                f_out.write(json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n")
                 n_written += 1
 
     return n_written

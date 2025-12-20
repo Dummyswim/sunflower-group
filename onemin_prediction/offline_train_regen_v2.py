@@ -2,7 +2,7 @@
 """
 offline_train_regen_v2.py
 
-Offline trainer that trains from TRAIN_LOG_PATH (JSONL recommended) and promotes a
+Offline trainer that trains from TRAIN_LOG_PATH (v3 JSONL required) and promotes a
 versioned bundle via symlink:
 
 trained_models/
@@ -16,12 +16,12 @@ trained_models/
   production -> bundles/<timestamp>
 
 Env:
-- TRAIN_LOG_PATH (default: data/train_log_v2.jsonl)
+- TRAIN_LOG_PATH (required; v3 JSONL)
 - OFFLINE_MIN_ROWS (default: 5000)
 - TRAIN_MAX_ROWS (default: 200000)
 - MODEL_BUNDLES_DIR (default: trained_models/bundles)
 - MODEL_PRODUCTION_LINK (default: trained_models/production)
-- FEATURE_SCHEMA_COLS_PATH (optional)
+- FEATURE_SCHEMA_COLS_PATH (required)
 - CALIB_PATH (optional carry-forward into bundle)
 """
 
@@ -43,13 +43,16 @@ from model_bundle import (
     promote_bundle_symlink,
 )
 
-from online_trainer_regen_v2 import (
-    load_train_log,
+from online_trainer_regen_v2_bundle import (
     build_directional_dataset,
     build_neutral_dataset,
     train_xgb_dir,
     train_neutral,
 )
+from train_log_utils_v3 import load_train_log_v3, summarize_sources, data_range
+from pretrain_validator import validate_pretrain
+from eval_before_promotion import evaluate_holdout
+from schema_contract import SchemaResolutionError
 
 
 def _load_schema_cols(path: Path) -> Optional[List[str]]:
@@ -102,22 +105,26 @@ def _load_schema_from_env_or_production(production_link: Path) -> Optional[List[
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--log", default=os.getenv("TRAIN_LOG_PATH", "data/train_log_v2.jsonl"))
+    ap.add_argument("--log", default=os.getenv("TRAIN_LOG_PATH", ""))
     ap.add_argument("--min_rows", type=int, default=int(os.getenv("OFFLINE_MIN_ROWS", "5000")))
     ap.add_argument("--max_rows", type=int, default=int(os.getenv("TRAIN_MAX_ROWS", "200000")))
     args = ap.parse_args()
 
-    rows = load_train_log(args.log, max_rows=args.max_rows)
+    production_link = Path(os.getenv("MODEL_PRODUCTION_LINK", "trained_models/production"))
+    schema = _load_schema_from_env_or_production(production_link)
+    if not schema:
+        raise SchemaResolutionError("FEATURE_SCHEMA_COLS_PATH missing or invalid; schema inference disabled")
+
+    if not args.log:
+        raise SystemExit("TRAIN_LOG_PATH missing; --log is required")
+
+    rows = load_train_log_v3(args.log, max_rows=args.max_rows, schema_cols=list(schema))
     if len(rows) < args.min_rows:
         raise SystemExit(f"Not enough rows: {len(rows)} < {args.min_rows}")
 
-    production_link = Path(os.getenv("MODEL_PRODUCTION_LINK", "trained_models/production"))
-    schema = _load_schema_from_env_or_production(production_link)
-
-    if not schema:
-        feats = (rows[-1].get("features") or {})
-        schema = [k for k in feats.keys() if k != "aux_ret_main"]
-        schema.sort()
+    ok, report = validate_pretrain(rows, schema_cols=list(schema))
+    if not ok:
+        raise SystemExit(f"pretrain validation failed: {report.get('reasons')}")
 
     dir_data = build_directional_dataset(rows, schema_cols=schema)
     neu_data = build_neutral_dataset(rows, schema_cols=schema)
@@ -128,6 +135,10 @@ def main() -> None:
     neu_model = train_neutral(neu_data)
     if xgb_model is None or neu_model is None:
         raise SystemExit("training failed (model None)")
+
+    eval_ok, eval_report = evaluate_holdout(rows, list(schema), xgb_model)
+    if not eval_ok:
+        raise SystemExit(f"eval gate failed: {eval_report}")
 
     bundles_dir = Path(os.getenv("MODEL_BUNDLES_DIR", "trained_models/bundles"))
     bundle_dir = make_bundle_dir(bundles_dir)
@@ -166,7 +177,12 @@ def main() -> None:
             "rows": len(rows),
             "dir_rows": int(dir_data.y.size),
             "neu_rows": int(neu_data.y.size),
+            "pretrain_report": report,
+            "eval_report": eval_report,
         },
+        data_range=data_range(rows),
+        source_counts=summarize_sources(rows),
+        validation_report={"pretrain": report, "eval": eval_report},
     )
 
     # Promote symlink atomically

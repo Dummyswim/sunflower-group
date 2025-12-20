@@ -14,13 +14,13 @@ This prevents:
 - half-written artifacts inside production
 
 Env (important):
-- TRAIN_LOG_PATH: JSONL file (stable schema) OR legacy CSV
+- TRAIN_LOG_PATH: JSONL file (v3 train records only)
 - MODEL_BUNDLES_DIR: default 'trained_models/bundles'
 - MODEL_PRODUCTION_LINK: default 'trained_models/production'
 - XGB_OUT_PATH / NEUTRAL_OUT_PATH are still accepted for compatibility.
 
 Notes:
-- If TRAIN_LOG_PATH is a legacy CSV, we parse best-effort. JSONL is recommended.
+- TRAIN_LOG_PATH must contain v3 train records; legacy CSV is not supported.
 """
 
 from __future__ import annotations
@@ -59,13 +59,12 @@ from model_bundle import (
     validate_bundle_feature_counts,
     promote_bundle_symlink,
 )
+from train_log_utils_v3 import load_train_log_v3, summarize_sources, data_range
+from pretrain_validator import validate_pretrain
+from eval_before_promotion import evaluate_holdout
+from schema_contract import SchemaResolutionError
 
 logger = logging.getLogger(__name__)
-
-
-def _is_jsonl_line(s: str) -> bool:
-    s = (s or "").strip()
-    return s.startswith("{") and s.endswith("}")
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -76,42 +75,6 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
     except Exception:
         pass
     return float(default)
-
-
-def _parse_legacy_csv(path: str, max_rows: int) -> List[Dict[str, Any]]:
-    """
-    Best-effort parser for old feature_log.csv formats. Not perfect.
-    Prefer JSONL.
-    """
-    if pd is None:
-        return []
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return []
-
-    if max_rows > 0 and len(df) > max_rows:
-        df = df.tail(max_rows)
-
-    # If it already has a 'label' column and some features, keep it
-    rows: List[Dict[str, Any]] = []
-    if "label" in df.columns:
-        feature_cols = [c for c in df.columns if c not in ("label", "ts_ref_start", "ts_target_close", "symbol", "decision", "label_weight")]
-        for _, r in df.iterrows():
-            feats = {c: _safe_float(r.get(c)) for c in feature_cols}
-            rows.append({
-                "ts_ref_start": str(r.get("ts_ref_start", "")),
-                "ts_target_close": str(r.get("ts_target_close", "")),
-                "symbol": str(r.get("symbol", "")),
-                "decision": str(r.get("decision", "")),
-                "label": str(r.get("label", "FLAT")),
-                "label_weight": _safe_float(r.get("label_weight", 1.0), 1.0),
-                "features": feats,
-            })
-        return rows
-
-    return []
-
 
 
 def _parse_feature_csv(path: str, min_rows: int = 200):
@@ -140,35 +103,8 @@ def _parse_feature_csv(path: str, min_rows: int = 200):
     return df
 
 
-def load_train_log(path: str, max_rows: int = 50000) -> List[Dict[str, Any]]:
-    p = Path(path)
-    if not p.exists():
-        return []
-    rows: List[Dict[str, Any]] = []
-
-    # JSONL: fastest + stable
-    try:
-        with p.open("r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                if _is_jsonl_line(line):
-                    try:
-                        rows.append(json.loads(line))
-                    except Exception:
-                        continue
-                # Stop early if huge
-                if max_rows > 0 and len(rows) >= max_rows:
-                    break
-    except Exception:
-        rows = []
-
-    if rows:
-        return rows[-max_rows:] if max_rows > 0 else rows
-
-    # Fallback legacy CSV
-    return _parse_legacy_csv(str(p), max_rows=max_rows)
+def load_train_log(path: str, max_rows: int = 50000, schema_cols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    return load_train_log_v3(path, schema_cols=schema_cols, max_rows=max_rows)
 
 
 @dataclass
@@ -233,7 +169,14 @@ def build_directional_dataset(rows: List[Dict[str, Any]], schema_cols: List[str]
     # optional recycle
     eps = float(os.getenv("FLAT_RECYCLE_EPS", "0.0008"))
     flip_weight = float(os.getenv("FLAT_RECYCLE_WEIGHT", "0.35"))
-    aux = np.array([_safe_float((r.get("features") or {}).get("aux_ret_main", 0.0), 0.0) for r in rows], dtype=np.float32)
+    aux_vals = []
+    for r in rows:
+        feats = r.get("features") or {}
+        aux_val = feats.get("aux_ret_main")
+        if aux_val is None:
+            aux_val = (r.get("meta") or {}).get("aux_ret_main")
+        aux_vals.append(_safe_float(aux_val, 0.0))
+    aux = np.array(aux_vals, dtype=np.float32)
     _recycle_flat_to_dir(labels, aux, eps=eps, flip_weight=flip_weight, weights=w)
 
     y = np.array([1 if lab == "BUY" else 0 for lab in labels if lab in ("BUY","SELL")], dtype=np.int32)
@@ -301,6 +244,9 @@ def _write_bundle_and_promote(
     neutral_model,
     schema_cols: List[str],
     notes: Dict[str, Any],
+    data_range: Optional[Dict[str, Any]] = None,
+    source_counts: Optional[Dict[str, Any]] = None,
+    validation_report: Optional[Dict[str, Any]] = None,
     xgb_out_path: str,
     neutral_out_path: str,
 ) -> Path:
@@ -338,7 +284,14 @@ def _write_bundle_and_promote(
         raise RuntimeError(f"bundle validation failed: {reason}")
 
     # Manifest
-    write_manifest(bp.manifest_path, schema_cols=schema_cols, notes=notes)
+    write_manifest(
+        bp.manifest_path,
+        schema_cols=schema_cols,
+        notes=notes,
+        data_range=data_range,
+        source_counts=source_counts,
+        validation_report=validation_report,
+    )
 
     # Promote symlink atomically
     promote_bundle_symlink(bundle_dir, production_link)
@@ -355,6 +308,89 @@ def _write_bundle_and_promote(
         pass
 
     return bundle_dir
+
+
+def _train_and_promote_sync(
+    feature_log_path: str,
+    xgb_out_path: str,
+    neutral_out_path: str,
+    min_rows: int,
+    max_rows: int,
+    pipeline_ref=None,
+) -> Dict[str, Any]:
+    schema = _get_schema_from_pipeline(pipeline_ref)
+    if not schema:
+        schema_path = Path(os.getenv("FEATURE_SCHEMA_COLS_PATH", "")).expanduser()
+        if schema_path and schema_path.exists():
+            try:
+                schema = json.loads(schema_path.read_text(encoding="utf-8")).get("columns")
+            except Exception:
+                schema = None
+
+    if not schema:
+        raise SchemaResolutionError("FEATURE_SCHEMA_COLS_PATH missing or pipeline schema unavailable")
+
+    rows = load_train_log(feature_log_path, max_rows=max_rows, schema_cols=list(schema))
+    if len(rows) < int(min_rows):
+        return {"status": "wait", "rows": len(rows)}
+
+    ok, report = validate_pretrain(rows, schema_cols=list(schema))
+    if not ok:
+        return {"status": "error", "reason": "pretrain_validation_failed", "report": report}
+
+    dir_data = build_directional_dataset(rows, schema_cols=schema)
+    neu_data = build_neutral_dataset(rows, schema_cols=schema)
+
+    xgb_model = train_xgb_dir(dir_data)
+    neu_model = train_neutral(neu_data)
+
+    if xgb_model is None or neu_model is None:
+        return {
+            "status": "skip",
+            "rows": len(rows),
+            "dir_rows": int(dir_data.y.size),
+            "neu_rows": int(neu_data.y.size),
+            "cols": len(schema),
+        }
+
+    eval_ok, eval_report = evaluate_holdout(rows, list(schema), xgb_model)
+    if not eval_ok:
+        return {"status": "error", "reason": "eval_gate_failed", "report": eval_report}
+
+    notes = {
+        "trainer": "online_trainer_regen_v3",
+        "rows": len(rows),
+        "dir_rows": int(dir_data.y.size),
+        "neu_rows": int(neu_data.y.size),
+        "min_rows": int(min_rows),
+        "pretrain_report": report,
+        "eval_report": eval_report,
+    }
+    src_counts = summarize_sources(rows)
+    drange = data_range(rows)
+
+    bundle_dir = _write_bundle_and_promote(
+        xgb_model=xgb_model,
+        neutral_model=neu_model,
+        schema_cols=list(schema),
+        notes=notes,
+        data_range=drange,
+        source_counts=src_counts,
+        validation_report={"pretrain": report, "eval": eval_report},
+        xgb_out_path=xgb_out_path,
+        neutral_out_path=neutral_out_path,
+    )
+
+    return {
+        "status": "ok",
+        "bundle_dir": bundle_dir,
+        "xgb_model": xgb_model,
+        "neu_model": neu_model,
+        "rows": len(rows),
+        "dir_rows": int(dir_data.y.size),
+        "neu_rows": int(neu_data.y.size),
+        "cols": len(schema),
+    }
 
 
 async def background_trainer_loop(
@@ -385,71 +421,61 @@ async def background_trainer_loop(
                     continue
 
                 max_rows = int(os.getenv("TRAIN_MAX_ROWS", "50000"))
-                rows = load_train_log(str(p), max_rows=max_rows)
-
-                if len(rows) < int(min_rows):
-                    logger.info("[TRAIN] waiting: rows=%d (<%d)", len(rows), int(min_rows))
-                    last_mtime = mtime
-                    await asyncio.sleep(interval_sec)
-                    continue
-
-                schema = _get_schema_from_pipeline(pipeline_ref)
-                if not schema:
-                    # fall back to schema file next to out path
-                    schema_path = Path(os.getenv("FEATURE_SCHEMA_COLS_PATH", "")) or Path(xgb_out_path).with_name("feature_schema_cols.json")
-                    try:
-                        schema = json.loads(Path(schema_path).read_text(encoding="utf-8")).get("columns")
-                    except Exception:
-                        schema = None
-
-                if not schema:
-                    # last resort: infer keys from first row (dangerous but better than crash)
-                    feats = (rows[-1].get("features") or {})
-                    schema = [k for k in feats.keys() if k != "aux_ret_main"]
-                    schema.sort()
-
-                dir_data = build_directional_dataset(rows, schema_cols=schema)
-                neu_data = build_neutral_dataset(rows, schema_cols=schema)
-
-                logger.info("[TRAIN] rows=%d dir=%d neu=%d cols=%d", len(rows), int(dir_data.y.size), int(neu_data.y.size), len(schema))
-
-                xgb_model = train_xgb_dir(dir_data)
-                neu_model = train_neutral(neu_data)
-
-                if xgb_model is None or neu_model is None:
-                    logger.warning("[TRAIN] training skipped (models None). xgb=%s neu=%s", bool(xgb_model), bool(neu_model))
-                    last_mtime = mtime
-                    await asyncio.sleep(interval_sec)
-                    continue
-
-                notes = {
-                    "trainer": "online_trainer_regen_v3",
-                    "rows": len(rows),
-                    "dir_rows": int(dir_data.y.size),
-                    "neu_rows": int(neu_data.y.size),
-                    "min_rows": int(min_rows),
-                }
-
-                bundle_dir = _write_bundle_and_promote(
-                    xgb_model=xgb_model,
-                    neutral_model=neu_model,
-                    schema_cols=list(schema),
-                    notes=notes,
-                    xgb_out_path=xgb_out_path,
-                    neutral_out_path=neutral_out_path,
+                result = await asyncio.to_thread(
+                    _train_and_promote_sync,
+                    str(p),
+                    xgb_out_path,
+                    neutral_out_path,
+                    int(min_rows),
+                    int(max_rows),
+                    pipeline_ref,
                 )
-                logger.info("[TRAIN] promoted bundle → %s", str(bundle_dir))
+
+                status = result.get("status")
+                if status == "wait":
+                    logger.info("[TRAIN] waiting: rows=%d (<%d)", int(result.get("rows", 0)), int(min_rows))
+                    last_mtime = mtime
+                    await asyncio.sleep(interval_sec)
+                    continue
+
+                if status == "skip":
+                    logger.warning("[TRAIN] training skipped (models None). xgb=%s neu=%s", False, False)
+                    last_mtime = mtime
+                    await asyncio.sleep(interval_sec)
+                    continue
+
+                if status == "error":
+                    logger.error("[TRAIN] error: %s", str(result.get("reason", "unknown")))
+                    last_mtime = mtime
+                    await asyncio.sleep(interval_sec)
+                    continue
+
+                if status != "ok":
+                    last_mtime = mtime
+                    await asyncio.sleep(interval_sec)
+                    continue
+
+                logger.info(
+                    "[TRAIN] rows=%d dir=%d neu=%d cols=%d",
+                    int(result.get("rows", 0)),
+                    int(result.get("dir_rows", 0)),
+                    int(result.get("neu_rows", 0)),
+                    int(result.get("cols", 0)),
+                )
+                logger.info("[TRAIN] promoted bundle → %s", str(result.get("bundle_dir")))
 
                 # hot-swap into live pipeline if possible
                 try:
                     if pipeline_ref is not None and hasattr(pipeline_ref, "replace_models"):
-                        pipeline_ref.replace_models(xgb=xgb_model, neutral=neu_model)
+                        pipeline_ref.replace_models(xgb=result.get("xgb_model"), neutral=result.get("neu_model"))
                         logger.info("[TRAIN] pipeline_ref models replaced")
                 except Exception as e:
                     logger.warning("[TRAIN] pipeline hot-swap failed: %s", e)
 
                 last_mtime = mtime
 
+        except SchemaResolutionError as e:
+            logger.error("[TRAIN] schema resolution failed: %s", e)
         except Exception as e:
             logger.warning("[TRAIN] loop error: %s", e)
 

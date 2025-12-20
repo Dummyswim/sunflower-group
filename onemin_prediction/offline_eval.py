@@ -20,7 +20,7 @@ from typing import Optional, Tuple, List, Dict, Any
 import numpy as np
 import pandas as pd
 
-from online_trainer_regen_v2 import _parse_feature_csv, load_train_log  # shim must re-export
+from online_trainer_regen_v2_bundle import _parse_feature_csv, load_train_log
 
 
 logger = logging.getLogger(__name__)
@@ -70,11 +70,15 @@ def _labels_from_trainlog(train_log_path: str, max_rows: int = 300000) -> Option
         lbl = r.get("label")
         if ts is None or lbl is None:
             continue
+        aux_short = r.get("aux_label_short")
+        if aux_short is None:
+            aux_short = (r.get("meta") or {}).get("aux_label_short")
+
         out.append({
             "ts": str(ts),
             "label": str(lbl),
             "tradeable": bool(r.get("tradeable")) if "tradeable" in r else None,
-            "aux_label_short": r.get("aux_label_short"),
+            "aux_label_short": aux_short,
         })
 
     if not out:

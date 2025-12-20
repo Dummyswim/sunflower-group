@@ -1,0 +1,22 @@
+{
+  "feature_names": [
+    "atr_1t",
+    "cvd_divergence",
+    "ema_21",
+    "ema_50",
+    "ema_8",
+    "last_zscore",
+    "mean_drift_pct",
+    "micro_imbalance",
+    "micro_slope",
+    "rv_10",
+    "ta_rsi14",
+    "tod_cos",
+    "tod_sin",
+    "vwap_reversion_flag",
+    "wick_extreme_down",
+    "wick_extreme_up"
+  ],
+  "num_features": 16,
+  "written_at": "2025-12-10T06:01:49.400676+00:00"
+}

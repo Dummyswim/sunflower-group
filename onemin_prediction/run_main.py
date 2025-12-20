@@ -67,8 +67,8 @@ config = SimpleNamespace(
     
      
     # Pre-close
-    preclose_lead_seconds=1,
-    preclose_completion_buffer_sec=1,
+    preclose_lead_seconds=10,
+    preclose_completion_buffer_sec=2,
 
     # Patterns
     pattern_timeframes=["1T", "3T", "5T"],
@@ -241,7 +241,13 @@ def bootstrap_feature_log(hist_path: str, daily_path: str, dir_threshold: int = 
 if __name__ == "__main__":
     from logging_setup import setup_logging2 as setup_logging, start_dynamic_level_watcher, stop_dynamic_level_watcher
 
-    _high_verbose = os.getenv("LOG_HIGH_VERBOSITY", "1").lower() in ("1", "true", "yes")
+    def _safe_getenv_bool(key: str, default: bool = False) -> bool:
+        val = os.getenv(key)
+        if val is None:
+            return bool(default)
+        return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+    _high_verbose = _safe_getenv_bool("LOG_HIGH_VERBOSITY", default=True)
     _console_level = logging.DEBUG if _high_verbose else logging.INFO
     _file_level = logging.DEBUG if _high_verbose else logging.INFO
 
@@ -263,7 +269,7 @@ if __name__ == "__main__":
     if _high_verbose:
         try:
             for mod in ("main_event_loop_regen", "core_handler", "feature_pipeline",
-                        "model_pipeline_regen_v2", "online_trainer_regen_v2", "calibrator"):
+                        "model_pipeline_regen_v2", "online_trainer_regen_v2_bundle", "calibrator"):
                 logging.getLogger(mod).setLevel(logging.DEBUG)
             logging.info("[LOG] Forced DEBUG level for core modules (LOG_HIGH_VERBOSITY=1)")
         except Exception as e:
@@ -289,7 +295,7 @@ if __name__ == "__main__":
 
 
     # Bootstrap daily feature log from historical when directional rows are below threshold
-    if os.getenv("BOOTSTRAP_FEATURE_LOG", "0").lower() in ("1", "true", "yes"):
+    if _safe_getenv_bool("BOOTSTRAP_FEATURE_LOG", default=False):
         try:
             hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
             daily_path = config.feature_log_path

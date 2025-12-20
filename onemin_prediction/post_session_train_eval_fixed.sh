@@ -5,7 +5,10 @@ PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Documents/sunflower-group_2/onemin_predictio
 cd "$PROJECT_ROOT"
 
 # --- inputs ---
-TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-data/train_log_v2.jsonl}"
+if [ -z "${TRAIN_LOG_PATH:-}" ]; then
+  echo "[POST][ERROR] TRAIN_LOG_PATH is required."
+  exit 1
+fi
 
 # --- runtime artifacts (keep logs out of bundles) ---
 mkdir -p runtime
@@ -22,12 +25,10 @@ export FEATURE_SCHEMA_COLS_PATH="${FEATURE_SCHEMA_COLS_PATH:-trained_models/prod
 
 # --- pick offline trainer ---
 TRAINER=""
-if [ -f "offline_train_regen_v2_bundle.py" ]; then
-  TRAINER="offline_train_regen_v2_bundle.py"
-elif [ -f "offline_train_regen_v2.py" ]; then
+if [ -f "offline_train_regen_v2.py" ]; then
   TRAINER="offline_train_regen_v2.py"
 else
-  echo "[POST][ERROR] No offline trainer found. Expected offline_train_regen_v2_bundle.py or offline_train_regen_v2.py"
+  echo "[POST][ERROR] No offline trainer found. Expected offline_train_regen_v2.py"
   ls -la | sed -n '1,200p'
   exit 1
 fi

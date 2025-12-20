@@ -149,11 +149,17 @@ def write_manifest(
     *,
     schema_cols: List[str],
     notes: Dict[str, Any],
+    data_range: Optional[Dict[str, Any]] = None,
+    source_counts: Optional[Dict[str, Any]] = None,
+    validation_report: Optional[Dict[str, Any]] = None,
 ) -> None:
     manifest = {
         "schema_cols_n": len(schema_cols),
         "schema_hash": compute_schema_hash(schema_cols),
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "data_range": data_range or {},
+        "source_counts": source_counts or {},
+        "validation_report": validation_report or {},
         "notes": notes or {},
     }
     atomic_write_json(manifest_path, manifest)
