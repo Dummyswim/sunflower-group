@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Merge v3 train logs into a canonical file with deterministic sort/dedupe."""
+"""Merge SignalContext logs into a canonical file with deterministic sort/dedupe."""
 from __future__ import annotations
 
 import argparse
 
-from train_log_utils_v3 import merge_train_logs_v3
+from signal_log_utils import merge_signal_logs
 
 
 def main() -> None:
@@ -23,18 +23,11 @@ def main() -> None:
     if not sources:
         raise SystemExit("no sources provided")
 
-    stats = merge_train_logs_v3(sources, out_path=args.out)
+    stats = merge_signal_logs(sources, out_path=args.out)
     print(
-        "merged_rows_in={rows_in} merged_rows_valid={rows_valid} merged_rows_out={rows_out} "
-        "merged_rows_dupe={rows_dupe} bad_version={rows_bad_version} parse_err={rows_parse_err} "
-        "out_of_order={out_of_order} out={out}".format(out=args.out, **stats)
+        "merged_rows_in={total_in} merged_rows_valid={total_valid} merged_rows_dupe={total_dupe} "
+        "merged_rows_out={total_out} out={out}".format(out=args.out, **stats)
     )
-    for name, s in (stats.get("source_stats") or {}).items():
-        print(
-            f"source={name} in={s.get('in', 0)} kept={s.get('kept', 0)} "
-            f"dupe={s.get('dupe', 0)} invalid={s.get('invalid', 0)} "
-            f"parse_err={s.get('parse_err', 0)}"
-        )
 
 
 if __name__ == "__main__":

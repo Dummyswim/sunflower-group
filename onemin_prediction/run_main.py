@@ -1,7 +1,7 @@
 # run_main.py
 """
-Runner script for probabilities-only 5-minute directional predictor.
-Emits p(BUY)/p(SELL) for a 5-minute horizon; user decides what to trade.
+Runner script for probabilities-only 5-minute predictor.
+Emits policy success probability for teacher-defined direction.
 """
 
 from types import SimpleNamespace
@@ -10,14 +10,9 @@ import base64
 import numpy as np
 import logging, os
 from main_event_loop_regen import main_loop
-from collections import deque
+from policy_pipeline import load_policy_models
 
 
-try:
-    import joblib
-except ImportError:
-    joblib = None
-    logging.warning("[MODELS] joblib not available; neutrality model cannot be loaded (NEUTRAL_PATH is required)")
 
 # ========== CONFIGURATION ==========
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
@@ -45,6 +40,7 @@ config = SimpleNamespace(
     emit_prob_only=True,                 # NEW: probabilities-only mode
     suggest_tradeable_from_Q=True,       # optional UI hint
     signals_path="trained_models/production/signals.jsonl",
+    train_log_path=os.getenv("TRAIN_LOG_PATH", "data/train_log_v3_canonical.jsonl"),
 
     # Timekeeping
     use_arrival_time=True,
@@ -99,143 +95,56 @@ train_features = {
     'last_zscore': np.random.normal(size=500).tolist()
 }
 
-def _load_models():
-    xgb_model = None
-    neutral_model = None
+if not os.getenv("FEATURE_SCHEMA_COLS_PATH"):
+    os.environ["FEATURE_SCHEMA_COLS_PATH"] = "data/feature_schema_cols.json"
+if not os.getenv("POLICY_SCHEMA_COLS_PATH"):
+    os.environ["POLICY_SCHEMA_COLS_PATH"] = "trained_models/production/policy_schema_cols.json"
 
-    xgb_default = "trained_models/production/xgb_5min_trade_window.json"
-    neutral_default = "trained_models/production/neutral_5min.pkl"
+def _load_policy_pipeline():
+    buy_default = "trained_models/production/policy_buy.json"
+    sell_default = "trained_models/production/policy_sell.json"
+    schema_default = "trained_models/production/policy_schema_cols.json"
+    calib_buy_default = "trained_models/production/calib_buy.json"
+    calib_sell_default = "trained_models/production/calib_sell.json"
 
-    xgb_path = (os.getenv("XGB_PATH", "") or xgb_default).strip()
-    neutral_path = (os.getenv("NEUTRAL_PATH", "") or neutral_default).strip()
+    buy_path = (os.getenv("POLICY_BUY_PATH", "") or buy_default).strip()
+    sell_path = (os.getenv("POLICY_SELL_PATH", "") or sell_default).strip()
+    schema_path = (os.getenv("POLICY_SCHEMA_COLS_PATH", "") or schema_default).strip()
+    calib_buy_path = (os.getenv("CALIB_BUY_PATH", "") or calib_buy_default).strip()
+    calib_sell_path = (os.getenv("CALIB_SELL_PATH", "") or calib_sell_default).strip()
 
-    # XGB required
-    if not xgb_path or not os.path.exists(xgb_path):
-        logging.critical("XGB_PATH is required and must exist. Set XGB_PATH to a valid model file.")
+    if not buy_path or not os.path.exists(buy_path):
+        logging.critical("POLICY_BUY_PATH is required and must exist.")
+        raise SystemExit(2)
+    if not sell_path or not os.path.exists(sell_path):
+        logging.critical("POLICY_SELL_PATH is required and must exist.")
+        raise SystemExit(2)
+    if not schema_path or not os.path.exists(schema_path):
+        logging.critical("POLICY_SCHEMA_COLS_PATH is required and must exist.")
         raise SystemExit(2)
 
-    try:
-        import xgboost as xgb
-        booster = xgb.Booster()
-        booster.load_model(xgb_path)
+    pipe = load_policy_models(
+        buy_path=buy_path,
+        sell_path=sell_path,
+        schema_path=schema_path,
+        calib_buy_path=calib_buy_path,
+        calib_sell_path=calib_sell_path,
+    )
+    return pipe
 
-        class _BoosterWrapper:
-            def __init__(self, booster):
-                self.booster = booster
-                self.is_dummy = False
-                self.name = "XGBBooster"
-            def predict_proba(self, X):
-                dm = xgb.DMatrix(X)
-                p = self.booster.predict(dm)
-                import numpy as np
-                if p.ndim == 1:
-                    p = np.clip(p, 1e-9, 1 - 1e-9)
-                    return np.stack([1 - p, p], axis=1)
-                return p
-
-        xgb_model = _BoosterWrapper(booster)
-        logging.info(f"[MODELS] XGB loaded from {xgb_path}")
-    except Exception as e:
-        logging.critical(f"Failed to load XGB model at {xgb_path}: {e}")
-        raise SystemExit(2)
-
-    # Neutrality required
-    if not neutral_path or not os.path.exists(neutral_path):
-        logging.critical("NEUTRAL_PATH is required and must exist. Set NEUTRAL_PATH to a valid model file.")
-        raise SystemExit(3)
-
-    if joblib is None:
-        logging.critical("joblib is required to load NEUTRAL_PATH")
-        raise SystemExit(3)
-    try:
-        neutral_model = joblib.load(neutral_path)
-        logging.info(f"[MODELS] Neutrality model loaded from {neutral_path}")
-    except Exception as e:
-        logging.critical(f"Failed to load Neutrality model at {neutral_path}: {e}")
-        raise SystemExit(3)
-
-    return xgb_model, neutral_model
 
 # Globals for main()
-global xgb_model, neutral_model
-xgb_model, neutral_model = _load_models()
+global policy_pipe
+policy_pipe = _load_policy_pipeline()
 
 async def main():
     await main_loop(
         config=config,
-        xgb=xgb_model,
+        policy_pipe=policy_pipe,
         train_features=train_features,
         token_b64=base64.b64encode(TELEGRAM_BOT_TOKEN.encode()).decode(),
         chat_id=TELEGRAM_CHAT_ID,
-        neutral_model=neutral_model,
     )
-
-
-def _tail_lines(path: str, n: int = 2000) -> list[str]:
-    try:
-        dq = deque(maxlen=max(1, n))
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    dq.append(line.rstrip("\n"))
-        return list(dq)
-    except Exception:
-        return []
-
-def _count_directionals(path: str, max_lines: int = 200000) -> int:
-    try:
-        n = 0
-        with open(path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
-                if not line.strip():
-                    continue
-                parts = line.split(",", 3)
-                if len(parts) >= 3:
-                    label = parts[2].strip()
-                    if label in ("BUY", "SELL"):
-                        n += 1
-        return n
-    except Exception:
-        return 0
-
-
-def bootstrap_feature_log(hist_path: str, daily_path: str, dir_threshold: int = 500, tail_rows: int = 2000) -> None:
-    try:
-        if not os.path.exists(hist_path):
-            return
-        if not os.path.exists(daily_path):
-            lines = _tail_lines(hist_path, n=tail_rows)
-            if lines:
-                with open(daily_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(lines) + "\n")
-                logging.info("[BOOT] Bootstrapped %s from %s (%d rows)", daily_path, hist_path, len(lines))
-            return
-        
-        dir_count = _count_directionals(daily_path)
-        if dir_count >= dir_threshold:
-            logging.info("[BOOT] Daily feature log already has %d directional rows (>= %d); no bootstrap merge", dir_count, dir_threshold)
-            return
-        
-        with open(daily_path, "r", encoding="utf-8") as f:
-            daily_lines = [ln.strip() for ln in f if ln.strip()]
-        
-        hist_tail = _tail_lines(hist_path, n=tail_rows)
-        merged, seen = [], set()
-        for ln in hist_tail + daily_lines:
-            ts = ln.split(",", 1)[0].strip()
-            if ts and ts not in seen:
-                seen.add(ts)
-                merged.append(ln)
-        
-        with open(daily_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(merged) + "\n")
-        logging.info("[BOOT] Merged %s with tail of %s. Rows=%d (dir before=%d, threshold=%d)", 
-                     daily_path, hist_path, len(merged), dir_count, dir_threshold)
-    except Exception as e:
-        logging.warning("[BOOT] Bootstrap skipped: %s", e)
-
 
 
 if __name__ == "__main__":
@@ -269,7 +178,7 @@ if __name__ == "__main__":
     if _high_verbose:
         try:
             for mod in ("main_event_loop_regen", "core_handler", "feature_pipeline",
-                        "model_pipeline_regen_v2", "online_trainer_regen_v2_bundle", "calibrator"):
+                        "policy_pipeline", "online_trainer_regen_v2_bundle", "calibrator"):
                 logging.getLogger(mod).setLevel(logging.DEBUG)
             logging.info("[LOG] Forced DEBUG level for core modules (LOG_HIGH_VERBOSITY=1)")
         except Exception as e:
@@ -282,29 +191,19 @@ if __name__ == "__main__":
     except Exception as e:
         logging.debug(f"[LOG] Log watcher not started: {e}")
 
-    logging.info("XGB_PATH=%s | NEUTRAL_PATH=%s",
-                os.getenv("XGB_PATH","") or "(not set)",
-                os.getenv("NEUTRAL_PATH","") or "(not set)")
-    logging.info("CALIB_PATH=%s (env -- model_pipeline will auto-load if present)",
-                os.getenv("CALIB_PATH","") or "(not set)")
+    logging.info("POLICY_BUY_PATH=%s | POLICY_SELL_PATH=%s",
+                os.getenv("POLICY_BUY_PATH","") or "(not set)",
+                os.getenv("POLICY_SELL_PATH","") or "(not set)")
+    logging.info("CALIB_BUY_PATH=%s | CALIB_SELL_PATH=%s",
+                os.getenv("CALIB_BUY_PATH","") or "(not set)",
+                os.getenv("CALIB_SELL_PATH","") or "(not set)")
+    logging.info("FEATURE_SCHEMA_COLS_PATH=%s | POLICY_SCHEMA_COLS_PATH=%s",
+                os.getenv("FEATURE_SCHEMA_COLS_PATH","") or "(not set)",
+                os.getenv("POLICY_SCHEMA_COLS_PATH","") or "(not set)")
 
     # Reduce third-party chatter
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.WARNING)
-
-
-
-    # Bootstrap daily feature log from historical when directional rows are below threshold
-    if _safe_getenv_bool("BOOTSTRAP_FEATURE_LOG", default=False):
-        try:
-            hist_path = os.getenv("FEATURE_LOG_HIST", "trained_models/production/feature_log_hist.csv")
-            daily_path = config.feature_log_path
-            dir_threshold = int(getattr(config, "calib_min_rows", 300))
-            bootstrap_feature_log(hist_path, daily_path, dir_threshold=dir_threshold, tail_rows=2000)
-        except Exception as e:
-            logging.debug(f"[BOOT] Bootstrap failed (ignored): {e}")
-    else:
-        logging.info("[BOOT] Bootstrap disabled (set BOOTSTRAP_FEATURE_LOG=1 to enable).")
 
 
 

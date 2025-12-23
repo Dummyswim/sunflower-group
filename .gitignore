@@ -12,4 +12,7 @@ images/
 images/*.png
 charts/
 __pycache__/
-backup
+backuponemin_prediction/trained_models/bundles/
+*.jsonl
+onemin_prediction/trained_models/bundles/
+*.jsonl

@@ -20,8 +20,9 @@ export SIGNALS_PATH="${SIGNALS_PATH:-runtime/signals.jsonl}"
 export MODEL_BUNDLES_DIR="${MODEL_BUNDLES_DIR:-trained_models/bundles}"
 export MODEL_PRODUCTION_LINK="${MODEL_PRODUCTION_LINK:-trained_models/production}"
 
-# Schema path (used by trainer if needed)
-export FEATURE_SCHEMA_COLS_PATH="${FEATURE_SCHEMA_COLS_PATH:-trained_models/production/feature_schema_cols.json}"
+# Schema paths (base + policy)
+export FEATURE_SCHEMA_COLS_PATH="${FEATURE_SCHEMA_COLS_PATH:-data/feature_schema_cols.json}"
+export POLICY_SCHEMA_COLS_PATH="${POLICY_SCHEMA_COLS_PATH:-trained_models/production/policy_schema_cols.json}"
 
 # --- pick offline trainer ---
 TRAINER=""
@@ -58,44 +59,37 @@ from pathlib import Path
 import xgboost as xgb
 
 prod = Path("trained_models/production")
-xgb_path = prod / "xgb_model.json"
-schema_path = prod / "feature_schema_cols.json"
-neutral_path = prod / "neutral_model.pkl"
+buy_path = prod / "policy_buy.json"
+sell_path = prod / "policy_sell.json"
+schema_path = prod / "policy_schema_cols.json"
 
-if not xgb_path.exists():
-    raise SystemExit(f"[POST][ERROR] Missing: {xgb_path}")
+if not buy_path.exists():
+    raise SystemExit(f"[POST][ERROR] Missing: {buy_path}")
+if not sell_path.exists():
+    raise SystemExit(f"[POST][ERROR] Missing: {sell_path}")
 if not schema_path.exists():
     raise SystemExit(f"[POST][ERROR] Missing: {schema_path}")
 
 obj = json.loads(schema_path.read_text(encoding="utf-8"))
 cols = obj.get("columns") or obj.get("feature_names") or obj.get("features") or obj
 if not isinstance(cols, list):
-    raise SystemExit("[POST][ERROR] feature_schema_cols.json has unexpected format (expected list under 'columns').")
+    raise SystemExit("[POST][ERROR] policy_schema_cols.json has unexpected format (expected list under 'columns').")
 
-b = xgb.Booster()
-b.load_model(str(xgb_path))
+b_buy = xgb.Booster()
+b_buy.load_model(str(buy_path))
+b_sell = xgb.Booster()
+b_sell.load_model(str(sell_path))
 
-print("[POST] XGB num_features:", b.num_features())
+print("[POST] BUY num_features:", b_buy.num_features())
+print("[POST] SELL num_features:", b_sell.num_features())
 print("[POST] Schema cols:", len(cols))
 
-if b.num_features() != len(cols):
-    raise SystemExit("[POST][ERROR] XGB/schema mismatch. Refusing to continue.")
+if b_buy.num_features() != len(cols):
+    raise SystemExit("[POST][ERROR] BUY/schema mismatch. Refusing to continue.")
+if b_sell.num_features() != len(cols):
+    raise SystemExit("[POST][ERROR] SELL/schema mismatch. Refusing to continue.")
 
-# Neutral model feature check (if sklearn model exposes n_features_in_)
-if neutral_path.exists():
-    try:
-        import joblib
-        neu = joblib.load(neutral_path)
-        n_in = getattr(neu, "n_features_in_", None)
-        print("[POST] Neutral n_features_in_:", n_in)
-        if n_in is not None and int(n_in) != len(cols):
-            raise SystemExit("[POST][ERROR] Neutral/schema mismatch. Refusing to continue.")
-    except Exception as e:
-        raise SystemExit(f"[POST][ERROR] Failed loading/checking neutral model: {e}")
-else:
-    print("[POST] Neutral model missing (neutral_model.pkl). Skipping neutral feature check.")
-
-print("[POST] Model/schema OK ✅")
+print("[POST] Policy models/schema OK ✅")
 PY
 
 # --- offline eval (non-fatal, but useful) ---

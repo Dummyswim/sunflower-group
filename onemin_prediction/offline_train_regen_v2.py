@@ -1,30 +1,21 @@
 #!/usr/bin/env python3
 """
-offline_train_regen_v2.py
+Offline trainer for policy BUY/SELL models using SignalContext logs.
 
-Offline trainer that trains from TRAIN_LOG_PATH (v3 JSONL required) and promotes a
-versioned bundle via symlink:
-
+Promotes a versioned bundle via symlink:
 trained_models/
   bundles/<timestamp>/
-    xgb_model.json
-    neutral_model.pkl
-    calibrator.json (optional carry-forward)
+    policy_buy.json
+    policy_sell.json
+    calib_buy.json (optional carry-forward)
+    calib_sell.json (optional carry-forward)
+    policy_schema_cols.json
+    policy_schema_cols.txt
     feature_schema_cols.json
     feature_schema_cols.txt
     manifest.json
   production -> bundles/<timestamp>
-
-Env:
-- TRAIN_LOG_PATH (required; v3 JSONL)
-- OFFLINE_MIN_ROWS (default: 5000)
-- TRAIN_MAX_ROWS (default: 200000)
-- MODEL_BUNDLES_DIR (default: trained_models/bundles)
-- MODEL_PRODUCTION_LINK (default: trained_models/production)
-- FEATURE_SCHEMA_COLS_PATH (required)
-- CALIB_PATH (optional carry-forward into bundle)
 """
-
 from __future__ import annotations
 
 import argparse
@@ -33,6 +24,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+from eval_before_promotion import evaluate_holdout
 from model_bundle import (
     make_bundle_dir,
     bundle_paths,
@@ -42,17 +34,11 @@ from model_bundle import (
     validate_bundle_feature_counts,
     promote_bundle_symlink,
 )
-
-from online_trainer_regen_v2_bundle import (
-    build_directional_dataset,
-    build_neutral_dataset,
-    train_xgb_dir,
-    train_neutral,
-)
-from train_log_utils_v3 import load_train_log_v3, summarize_sources, data_range
+from online_trainer_regen_v2_bundle import build_policy_dataset, train_policy_model
 from pretrain_validator import validate_pretrain
-from eval_before_promotion import evaluate_holdout
 from schema_contract import SchemaResolutionError
+from signal_log_utils import load_signal_log, summarize_sources, data_range
+from signal_context import compose_policy_schema
 
 
 def _load_schema_cols(path: Path) -> Optional[List[str]]:
@@ -67,7 +53,6 @@ def _load_schema_cols(path: Path) -> Optional[List[str]]:
         cols = data.get("columns") or data.get("feature_names") or data.get("features")
         if isinstance(cols, list) and all(isinstance(x, str) for x in cols) and cols:
             return list(cols)
-        # dict mapping feature->idx
         if "columns" in data and isinstance(data["columns"], dict):
             return list(data["columns"].keys())
 
@@ -77,15 +62,17 @@ def _load_schema_cols(path: Path) -> Optional[List[str]]:
     return None
 
 
-def _load_schema_from_env_or_production(production_link: Path) -> Optional[List[str]]:
-    # 1) explicit env file
+def _load_base_schema(production_link: Path) -> Optional[List[str]]:
     sp = os.getenv("FEATURE_SCHEMA_COLS_PATH", "").strip()
     if sp:
         cols = _load_schema_cols(Path(sp))
         if cols:
             return cols
 
-    # 2) schema inside current production bundle (if symlink exists)
+    cols = _load_schema_cols(Path("data/feature_schema_cols.json"))
+    if cols:
+        return cols
+
     try:
         if production_link.exists():
             resolved = production_link.resolve()
@@ -95,8 +82,30 @@ def _load_schema_from_env_or_production(production_link: Path) -> Optional[List[
     except Exception:
         pass
 
-    # 3) schema next to production link (rare)
     cols = _load_schema_cols(production_link.parent / "feature_schema_cols.json")
+    if cols:
+        return cols
+
+    return None
+
+
+def _load_policy_schema(production_link: Path) -> Optional[List[str]]:
+    sp = os.getenv("POLICY_SCHEMA_COLS_PATH", "").strip()
+    if sp:
+        cols = _load_schema_cols(Path(sp))
+        if cols:
+            return cols
+
+    try:
+        if production_link.exists():
+            resolved = production_link.resolve()
+            cols = _load_schema_cols(resolved / "policy_schema_cols.json")
+            if cols:
+                return cols
+    except Exception:
+        pass
+
+    cols = _load_schema_cols(production_link.parent / "policy_schema_cols.json")
     if cols:
         return cols
 
@@ -111,32 +120,38 @@ def main() -> None:
     args = ap.parse_args()
 
     production_link = Path(os.getenv("MODEL_PRODUCTION_LINK", "trained_models/production"))
-    schema = _load_schema_from_env_or_production(production_link)
-    if not schema:
-        raise SchemaResolutionError("FEATURE_SCHEMA_COLS_PATH missing or invalid; schema inference disabled")
+    base_schema = _load_base_schema(production_link)
+    if not base_schema:
+        raise SchemaResolutionError("FEATURE_SCHEMA_COLS_PATH missing or invalid; base schema required")
+
+    policy_schema = _load_policy_schema(production_link)
+    if not policy_schema:
+        policy_schema = compose_policy_schema(list(base_schema))
 
     if not args.log:
         raise SystemExit("TRAIN_LOG_PATH missing; --log is required")
 
-    rows = load_train_log_v3(args.log, max_rows=args.max_rows, schema_cols=list(schema))
+    rows = load_signal_log(args.log, max_rows=args.max_rows, schema_cols=list(base_schema))
     if len(rows) < args.min_rows:
         raise SystemExit(f"Not enough rows: {len(rows)} < {args.min_rows}")
 
-    ok, report = validate_pretrain(rows, schema_cols=list(schema))
+    ok, report = validate_pretrain(rows, schema_cols=list(policy_schema))
     if not ok:
         raise SystemExit(f"pretrain validation failed: {report.get('reasons')}")
 
-    dir_data = build_directional_dataset(rows, schema_cols=schema)
-    neu_data = build_neutral_dataset(rows, schema_cols=schema)
+    buy_data = build_policy_dataset(rows, schema_cols=policy_schema, teacher_dir="BUY")
+    sell_data = build_policy_dataset(rows, schema_cols=policy_schema, teacher_dir="SELL")
 
-    print(f"[OFFLINE] rows={len(rows)} dir={dir_data.y.size} neu={neu_data.y.size} cols={len(schema)}")
+    print(
+        f"[OFFLINE] rows={len(rows)} buy_rows={buy_data.n_rows} sell_rows={sell_data.n_rows} cols={len(policy_schema)}"
+    )
 
-    xgb_model = train_xgb_dir(dir_data)
-    neu_model = train_neutral(neu_data)
-    if xgb_model is None or neu_model is None:
+    buy_model = train_policy_model(buy_data)
+    sell_model = train_policy_model(sell_data)
+    if buy_model is None or sell_model is None:
         raise SystemExit("training failed (model None)")
 
-    eval_ok, eval_report = evaluate_holdout(rows, list(schema), xgb_model)
+    eval_ok, eval_report = evaluate_holdout(rows, list(policy_schema), buy_model, sell_model)
     if not eval_ok:
         raise SystemExit(f"eval gate failed: {eval_report}")
 
@@ -144,39 +159,47 @@ def main() -> None:
     bundle_dir = make_bundle_dir(bundles_dir)
     bp = bundle_paths(bundle_dir)
 
-    # Save artifacts
-    xgb_model.save_model(str(bp.xgb_path))
-    import joblib
-    joblib.dump(neu_model, str(bp.neutral_path))
+    buy_model.save_model(str(bp.policy_buy_path))
+    sell_model.save_model(str(bp.policy_sell_path))
 
-    # Save schema (atomic)
-    atomic_write_json(bp.schema_cols_json, {"columns": list(schema)})
-    atomic_write_text(bp.schema_cols_txt, "\n".join(schema))
+    atomic_write_json(bp.schema_cols_json, {"columns": list(policy_schema)})
+    atomic_write_text(bp.schema_cols_txt, "\n".join(policy_schema))
+    atomic_write_json(bp.base_schema_cols_json, {"columns": list(base_schema)})
+    atomic_write_text(bp.base_schema_cols_txt, "\n".join(base_schema))
 
-    # Carry-forward calibrator (optional)
-    calib_env = os.getenv("CALIB_PATH", "").strip()
-    if calib_env:
+    calib_buy = os.getenv("CALIB_BUY_PATH", "").strip()
+    calib_sell = os.getenv("CALIB_SELL_PATH", "").strip()
+    if calib_buy:
         try:
-            csrc = Path(calib_env)
+            csrc = Path(calib_buy)
             if csrc.exists():
-                bp.calib_path.write_bytes(csrc.read_bytes())
+                bp.calib_buy_path.write_bytes(csrc.read_bytes())
+        except Exception:
+            pass
+    if calib_sell:
+        try:
+            csrc = Path(calib_sell)
+            if csrc.exists():
+                bp.calib_sell_path.write_bytes(csrc.read_bytes())
         except Exception:
             pass
 
-    # Validate feature counts match schema
-    ok, reason = validate_bundle_feature_counts(bp.xgb_path, list(schema), neutral_path=bp.neutral_path)
+    ok, reason = validate_bundle_feature_counts(
+        bp.policy_buy_path,
+        bp.policy_sell_path,
+        list(policy_schema),
+    )
     if not ok:
         raise SystemExit(f"bundle validation failed: {reason}")
 
-    # Manifest
     write_manifest(
         bp.manifest_path,
-        schema_cols=list(schema),
+        schema_cols=list(policy_schema),
         notes={
-            "trainer": "offline_train_regen_v2",
+            "trainer": "offline_train_policy",
             "rows": len(rows),
-            "dir_rows": int(dir_data.y.size),
-            "neu_rows": int(neu_data.y.size),
+            "buy_rows": int(buy_data.n_rows),
+            "sell_rows": int(sell_data.n_rows),
             "pretrain_report": report,
             "eval_report": eval_report,
         },
@@ -185,7 +208,6 @@ def main() -> None:
         validation_report={"pretrain": report, "eval": eval_report},
     )
 
-    # Promote symlink atomically
     promote_bundle_symlink(bundle_dir, production_link)
     print("[OFFLINE] promoted bundle:", bundle_dir)
     print("[OFFLINE] production ->", production_link.resolve())

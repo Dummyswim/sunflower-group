@@ -1,6 +1,6 @@
 # model_bundle.py
 """
-Model bundle utilities: versioned model artifacts + atomic promotion via symlink.
+Model bundle utilities: versioned policy artifacts + atomic promotion via symlink.
 
 Goal:
 - Never serve a model whose schema doesn't match.
@@ -11,9 +11,12 @@ Layout:
 trained_models/
   bundles/
     20251212_144857/
-      xgb_model.json
-      neutral_model.pkl
-      calibrator.json (optional)
+      policy_buy.json
+      policy_sell.json
+      calib_buy.json
+      calib_sell.json
+      policy_schema_cols.json
+      policy_schema_cols.txt
       feature_schema_cols.json
       feature_schema_cols.txt
       manifest.json
@@ -74,11 +77,14 @@ def load_schema_cols(schema_path: Path) -> List[str]:
 @dataclass
 class BundlePaths:
     bundle_dir: Path
-    xgb_path: Path
-    neutral_path: Path
-    calib_path: Path
+    policy_buy_path: Path
+    policy_sell_path: Path
+    calib_buy_path: Path
+    calib_sell_path: Path
     schema_cols_json: Path
     schema_cols_txt: Path
+    base_schema_cols_json: Path
+    base_schema_cols_txt: Path
     manifest_path: Path
 
 
@@ -103,43 +109,46 @@ def make_bundle_dir(
 def bundle_paths(bundle_dir: Path) -> BundlePaths:
     return BundlePaths(
         bundle_dir=bundle_dir,
-        xgb_path=bundle_dir / "xgb_model.json",
-        neutral_path=bundle_dir / "neutral_model.pkl",
-        calib_path=bundle_dir / "calibrator.json",
-        schema_cols_json=bundle_dir / "feature_schema_cols.json",
-        schema_cols_txt=bundle_dir / "feature_schema_cols.txt",
+        policy_buy_path=bundle_dir / "policy_buy.json",
+        policy_sell_path=bundle_dir / "policy_sell.json",
+        calib_buy_path=bundle_dir / "calib_buy.json",
+        calib_sell_path=bundle_dir / "calib_sell.json",
+        schema_cols_json=bundle_dir / "policy_schema_cols.json",
+        schema_cols_txt=bundle_dir / "policy_schema_cols.txt",
+        base_schema_cols_json=bundle_dir / "feature_schema_cols.json",
+        base_schema_cols_txt=bundle_dir / "feature_schema_cols.txt",
         manifest_path=bundle_dir / "manifest.json",
     )
 
 
 def validate_bundle_feature_counts(
-    xgb_path: Path,
+    policy_buy_path: Path,
+    policy_sell_path: Path,
     schema_cols: List[str],
-    neutral_path: Optional[Path] = None,
 ) -> Tuple[bool, str]:
     """
     Returns (ok, reason). Does not raise unless file is missing.
     """
     import xgboost as xgb  # local import
 
-    if not xgb_path.exists():
-        return False, f"missing xgb model: {xgb_path}"
-    booster = xgb.Booster()
-    booster.load_model(str(xgb_path))
-    n_model = int(booster.num_features())
-    n_schema = int(len(schema_cols))
-    if n_model != n_schema:
-        return False, f"xgb expects {n_model} but schema has {n_schema}"
+    if not policy_buy_path.exists():
+        return False, f"missing policy buy model: {policy_buy_path}"
+    if not policy_sell_path.exists():
+        return False, f"missing policy sell model: {policy_sell_path}"
 
-    if neutral_path is not None and neutral_path.exists():
-        try:
-            import joblib
-            neu = joblib.load(str(neutral_path))
-            n_neu = int(getattr(neu, "n_features_in_", -1))
-            if n_neu not in (-1, n_schema):
-                return False, f"neutral expects {n_neu} but schema has {n_schema}"
-        except Exception as e:
-            return False, f"neutral load/validate failed: {e}"
+    booster_buy = xgb.Booster()
+    booster_buy.load_model(str(policy_buy_path))
+    n_buy = int(booster_buy.num_features())
+
+    booster_sell = xgb.Booster()
+    booster_sell.load_model(str(policy_sell_path))
+    n_sell = int(booster_sell.num_features())
+
+    n_schema = int(len(schema_cols))
+    if n_buy != n_schema:
+        return False, f"policy_buy expects {n_buy} but schema has {n_schema}"
+    if n_sell != n_schema:
+        return False, f"policy_sell expects {n_sell} but schema has {n_schema}"
 
     return True, "ok"
 

@@ -9,10 +9,14 @@ LIVE_ONLY_FEATURES = [
     "micro_slope",
     "fut_cvd_delta",
     "fut_vwap_dev",
+    "fut_session_vwap",
+    "fut_vol_delta",
     "flow_score",
     "flow_side",
     "flow_fut_cvd",
     "flow_fut_vwap_dev",
+    "flow_fut_vol",
+    "flow_vwap_side",
     "flow_micro_imb",
     "indicator_score",
 ]
@@ -51,8 +55,11 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 
 def _record_source(row: Dict[str, Any]) -> str:
-    meta = row.get("meta") or {}
-    src = meta.get("record_source_primary") or meta.get("record_source")
+    prov = row.get("provenance") or {}
+    src = prov.get("record_source_primary") or prov.get("record_source")
+    if src is None:
+        meta = row.get("meta") or {}
+        src = meta.get("record_source_primary") or meta.get("record_source")
     return str(src or "").lower()
 
 
