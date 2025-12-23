@@ -12,7 +12,9 @@ images/
 images/*.png
 charts/
 __pycache__/
-backuponemin_prediction/trained_models/bundles/
-*.jsonl
+test/
+# Ignore all log files
+*.log
+*.txt
+*.*bak
 onemin_prediction/trained_models/bundles/
-*.jsonl
