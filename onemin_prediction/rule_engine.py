@@ -125,8 +125,29 @@ def compute_structure_score(features: Mapping[str, Any]) -> Tuple[float, int]:
     ob_bull = bool(features.get("struct_ob_bull_present", 0))
     ob_bear = bool(features.get("struct_ob_bear_present", 0))
 
-    bull = ps_up or fvg_up or ob_bull
-    bear = ps_dn or fvg_dn or ob_bear
+    ob_bull_valid = bool(features.get("struct_ob_bull_valid", 0))
+    ob_bear_valid = bool(features.get("struct_ob_bear_valid", 0))
+    if not (ob_bull_valid or ob_bear_valid):
+        try:
+            last_px = _safe_float(features.get("close", features.get("last_price", 0.0)), 0.0)
+            atr = _safe_float(features.get("atr_1t", features.get("atr_3t", 0.0)), 0.0)
+            max_pct = float(os.getenv("OB_RELEVANCE_MAX_PCT", "0.0020") or "0.0020")
+            max_atr_mult = float(os.getenv("OB_RELEVANCE_ATR_MULT", "0.35") or "0.35")
+        except Exception:
+            last_px = 0.0
+            atr = 0.0
+            max_pct = 0.0020
+            max_atr_mult = 0.35
+        max_rel = max_pct
+        if last_px > 0.0 and atr > 0.0:
+            max_rel = min(max_pct, (max_atr_mult * atr) / last_px)
+        bull_dist = abs(_safe_float(features.get("struct_ob_bull_dist", 0.0), 0.0))
+        bear_dist = abs(_safe_float(features.get("struct_ob_bear_dist", 0.0), 0.0))
+        ob_bull_valid = bool(ob_bull and (bull_dist <= max_rel) and (ps_up or fvg_up))
+        ob_bear_valid = bool(ob_bear and (bear_dist <= max_rel) and (ps_dn or fvg_dn))
+
+    bull = ps_up or fvg_up or ob_bull_valid
+    bear = ps_dn or fvg_dn or ob_bear_valid
 
     if bull and not bear:
         return 1.0, 1
@@ -232,7 +253,7 @@ def compute_rule_hierarchy(
     any_setup: bool,
     ambiguous_setup: bool,
 ) -> Tuple[str, str, str, List[str]]:
-    """Flow > HTF trend > EMA trend > structure > pattern."""
+    """Flow trigger with HTF veto and structure context."""
     try:
         rule_min_sig = float(os.getenv("RULE_MIN_SIG", "0.20") or "0.20")
     except Exception:
@@ -258,16 +279,33 @@ def compute_rule_hierarchy(
         mtf_cons = 0.0
 
     try:
-        htf_min = float(os.getenv("HTF_MIN_CONS", "0.10") or "0.10")
+        flow_strong_min = float(os.getenv("FLOW_STRONG_MIN", "0.50") or "0.50")
     except Exception:
-        htf_min = 0.10
+        flow_strong_min = 0.50
+    try:
+        htf_neutral_min = float(os.getenv("HTF_NEUTRAL_MIN", "0.35") or "0.35")
+    except Exception:
+        htf_neutral_min = 0.35
+    try:
+        htf_strong_veto_min = float(os.getenv("HTF_STRONG_VETO_MIN", "0.60") or "0.60")
+    except Exception:
+        htf_strong_veto_min = 0.60
 
-    if mtf_cons > htf_min:
-        htf_side = 1
-    elif mtf_cons < -htf_min:
-        htf_side = -1
-    else:
-        htf_side = 0
+    flow_dir = 0
+    if abs(float(flow_score)) >= flow_strong_min:
+        flow_dir = 1 if flow_score > 0 else -1
+    allow_rule_fallback = _safe_getenv_bool("ALLOW_RULE_SIG_FALLBACK", default=False)
+    if flow_dir == 0 and allow_rule_fallback and base_side != 0:
+        flow_dir = base_side
+        conflict_reasons.append("flow_not_strong_rule_sig_fallback")
+
+    htf_side = 0
+    htf_veto = 0
+    if abs(float(mtf_cons)) >= htf_strong_veto_min:
+        htf_side = 1 if mtf_cons > 0 else -1
+        htf_veto = htf_side
+    elif abs(float(mtf_cons)) >= htf_neutral_min:
+        htf_side = 1 if mtf_cons > 0 else -1
 
     ema_trend = 0
     try:
@@ -293,47 +331,37 @@ def compute_rule_hierarchy(
         else:
             struct_side = 0
 
-    ctx_flow_htf = flow_side or htf_side
-    ctx_trend_struct = trend_side or struct_side
-
-    final_side = ctx_flow_htf or ctx_trend_struct or base_side or 0
-
-    if ctx_flow_htf != 0 and ctx_trend_struct != 0 and ctx_flow_htf != ctx_trend_struct:
-        conflict_reasons.append("flow_htf_vs_trend_struct")
-        align_trend_htf = (trend_side != 0 and htf_side != 0 and trend_side == htf_side)
-        weak_counter_flow = (abs(float(flow_score)) < 0.35)
-
-        if align_trend_htf and weak_counter_flow and abs(float(mtf_cons)) >= 0.35:
-            conflict_level = "yellow"
-        else:
-            conflict_level = "red"
-
-        final_side = trend_side or htf_side or flow_side or struct_side or base_side or 0
-
-    if final_side > 0 and not (flow_side > 0 or htf_side > 0):
-        conflict_reasons.append("no_flow_htf_approval")
-        conflict_level = "red" if conflict_level == "none" else conflict_level
-    if final_side < 0 and not (flow_side < 0 or htf_side < 0):
-        conflict_reasons.append("no_flow_htf_approval")
-        conflict_level = "red" if conflict_level == "none" else conflict_level
-
-    if not any_setup and ctx_flow_htf == 0 and base_side != 0:
-        conflict_reasons.append("rule_sig_only_no_setup")
-        conflict_level = "red" if conflict_level == "none" else conflict_level
-
-    if final_side > 0:
-        rule_dir = "BUY"
-    elif final_side < 0:
-        rule_dir = "SELL"
-    else:
+    if flow_dir == 0:
         rule_dir = "FLAT"
-
-    if rule_dir == "BUY" and vwap_side < 0 and flow_side <= 0:
-        conflict_reasons.append("vwap_veto_buy")
-        conflict_level = "red" if conflict_level == "none" else conflict_level
-    if rule_dir == "SELL" and vwap_side > 0 and flow_side >= 0:
-        conflict_reasons.append("vwap_veto_sell")
-        conflict_level = "red" if conflict_level == "none" else conflict_level
+        conflict_reasons.append("flow_not_strong")
+    else:
+        if htf_veto != 0 and htf_veto != flow_dir:
+            rule_dir = "FLAT"
+            conflict_level = "red"
+            conflict_reasons.append("htf_veto")
+        elif struct_side != 0 and struct_side != flow_dir:
+            try:
+                struct_flow_min = float(os.getenv("STRUCT_OPPOSE_FLOW_MIN", "0.70") or "0.70")
+            except Exception:
+                struct_flow_min = 0.70
+            try:
+                vwap_ext = float(os.getenv("FLOW_VWAP_EXT", "0.0020") or "0.0020")
+            except Exception:
+                vwap_ext = 0.0020
+            strong_flow_override = (abs(float(flow_score)) >= struct_flow_min) and (abs(float(fut_vwap)) >= vwap_ext)
+            if strong_flow_override:
+                rule_dir = "BUY" if flow_dir > 0 else "SELL"
+                conflict_level = "yellow"
+                conflict_reasons.append("struct_opposition_override")
+            else:
+                rule_dir = "FLAT"
+                conflict_level = "red"
+                conflict_reasons.append("struct_opposition")
+        else:
+            rule_dir = "BUY" if flow_dir > 0 else "SELL"
+            if htf_side != 0 and htf_side != flow_dir:
+                conflict_level = "yellow"
+                conflict_reasons.append("htf_against")
 
     logger.info(
         "[%s] [RULE-HIER] rule_sig=%.3f base_dir=%s flow_side=%+d htf_side=%+d "
@@ -389,6 +417,7 @@ class DecisionState:
         self._trend_hold = 0
         self._trend_side = 0
         self._last_lane = 'NONE'
+        self._ambig_bars = 0
 
         self._counts = Counter()
         self._decisions = 0
@@ -467,6 +496,7 @@ def decide_trade(
     rule_dir: str,
     conflict_level: str = 'none',
     conflict_reasons: Optional[List[str]] = None,
+    tape_valid: bool = True,
     teacher_strength: float,
     is_bull_setup: bool,
     is_bear_setup: bool,
@@ -497,10 +527,14 @@ def decide_trade(
             'conflict': 'na',
             'tape_conflict_level': str(conflict_level or 'none'),
             'tape_conflict_reasons': list(conflict_reasons or []),
+            'tape_valid': bool(tape_valid),
             'hard_veto': list(hard),
             'soft_penalties': {},
             'gate_reasons': list(hard),
         }
+
+    if _safe_getenv_bool('TAPE_REQUIRED_FOR_TRADING', default=False) and (not tape_valid):
+        hard.append('tape_required_invalid')
 
     intent = str(rule_dir or 'NA').upper()
     if intent not in ('BUY', 'SELL'):
@@ -529,10 +563,12 @@ def decide_trade(
             min_edge = float(os.getenv('BACKFILL_MIN_SIG', '0.10') or '0.10')
         except Exception:
             min_edge = 0.10
-        tape_conflict = str(conflict_level or 'none').lower()
-        backfill_allow = {'no_flow_htf_approval', 'rule_sig_only_no_setup'}
-        if tape_conflict == 'red' and set(conflict_reasons or []).issubset(backfill_allow):
-            tape_conflict = 'none'
+    tape_conflict = str(conflict_level or 'none').lower()
+    if not tape_valid:
+        tape_conflict = 'invalid'
+    backfill_allow = {'no_flow_htf_approval', 'rule_sig_only_no_setup'}
+    if tape_conflict == 'red' and set(conflict_reasons or []).issubset(backfill_allow):
+        tape_conflict = 'none'
         tradeable = bool(abs(float(teacher_strength)) >= min_edge and tape_conflict != 'red')
         lane = 'SETUP' if (is_bull_setup or is_bear_setup) else 'TREND'
         gate_reasons = []
@@ -553,6 +589,7 @@ def decide_trade(
             'tape_conflict_level': str(tape_conflict),
             'tape_conflict_reasons': list(conflict_reasons or []),
             'conflict': str(tape_conflict),
+            'tape_valid': bool(tape_valid),
             'trigger': False,
             'trigger_name': 'backfill',
             'raw_strength': float(abs(float(teacher_strength))),
@@ -564,6 +601,8 @@ def decide_trade(
         }
 
     tape_conflict = str(conflict_level or 'none').lower()
+    if not tape_valid:
+        tape_conflict = 'invalid'
     if tape_conflict == 'red':
         hard.append('tape_conflict_red')
     elif tape_conflict == 'yellow':
@@ -643,6 +682,21 @@ def decide_trade(
     momentum_override = bool(ema_break == side and flow_side == side and abs(float(indicator_score)) >= mom_min)
 
     ambiguous_setup = bool(is_bull_setup and is_bear_setup)
+    try:
+        ambig_persist = int(os.getenv('AMBIG_PERSIST_BARS', '2') or '2')
+    except Exception:
+        ambig_persist = 2
+    if ambiguous_setup:
+        try:
+            state._ambig_bars = max(0, int(getattr(state, '_ambig_bars', 0))) + 1
+        except Exception:
+            state._ambig_bars = 1
+    else:
+        state._ambig_bars = 0
+    if state._ambig_bars >= ambig_persist:
+        hard.append('setup_ambiguous')
+    elif ambiguous_setup:
+        soft['setup_ambiguous'] = float(os.getenv('PEN_AMBIG', '0.02') or '0.02')
     setup_lane = False
     if not ambiguous_setup:
         if side == 1 and is_bull_setup:
@@ -825,6 +879,11 @@ def decide_trade(
             hard.append('ema15_break_against')
             tradeable = False
 
+    rev_risk = bool(ema_bias == side and ema_break == -side)
+    if rev_risk and lane in ('TREND', 'BREAKOUT') and not setup_lane:
+        hard.append('reversal_risk')
+        tradeable = False
+
     gate_reasons = []
     gate_reasons.extend(hard)
     gate_reasons.extend(list(soft.keys()))
@@ -876,6 +935,7 @@ def decide_trade(
         'tape_conflict_level': str(tape_conflict),
         'tape_conflict_reasons': list(conflict_reasons or []),
         'conflict': str(conflict),
+        'tape_valid': bool(tape_valid),
         'trigger': bool(trigger),
         'trigger_name': str(trigger_name),
         'raw_strength': float(raw_strength),

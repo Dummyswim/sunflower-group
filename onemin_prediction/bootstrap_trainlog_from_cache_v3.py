@@ -331,7 +331,7 @@ def build_trainlog_from_cache(
             df["tod_cos"] = np.cos(ang)
 
             # not derivable from pure OHLCV: set neutral (per-row overrides may update)
-            for k in (
+            neutral_cols = (
                 "micro_imbalance", "micro_slope", "imbalance",
                 "mean_drift", "std_dltp_short", "price_range_tightness",
                 "cvd_divergence", "vwap_reversion_flag",
@@ -346,16 +346,16 @@ def build_trainlog_from_cache(
                 "rev_cross_upper_wick_cvd", "rev_cross_upper_wick_vwap",
                 "rev_cross_lower_wick_cvd", "rev_cross_lower_wick_vwap",
                 "spread",
-            ):
-                df[k] = 0.0
+            )
+            df.loc[:, list(neutral_cols)] = 0.0
             df["last_price"] = df["close"]
 
             # ensure schema keys exist (imputed zeros flagged in meta)
             imputed_cols: List[str] = []
-            for k in schema:
-                if k not in df.columns:
-                    df[k] = 0.0
-                    imputed_cols.append(k)
+            missing_cols = [k for k in schema if k not in df.columns]
+            if missing_cols:
+                df = df.assign(**{k: 0.0 for k in missing_cols})
+                imputed_cols.extend(missing_cols)
 
             df = df.dropna(subset=["atr14","ta_rsi14","ema_8","ema_21","ema_50"], how="any")
 

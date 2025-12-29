@@ -87,6 +87,8 @@ def _load_calibrator(path: str) -> Optional[Dict[str, Any]]:
 class PolicyModel:
     booster: Any
     name: str
+    feature_names: Optional[List[str]] = None
+    num_features: Optional[int] = None
 
     def predict_success(self, X: np.ndarray) -> float:
         if xgb is None:
@@ -122,7 +124,13 @@ class PolicyPipeline:
         self.last_p_success_calib: Optional[float] = None
         self.last_teacher_dir: Optional[str] = None
 
-    def _align_features(self, feature_names: Optional[List[str]], feature_values: List[float]) -> np.ndarray:
+    def _align_features(
+        self,
+        feature_names: Optional[List[str]],
+        feature_values: List[float],
+        *,
+        model: PolicyModel,
+    ) -> np.ndarray:
         if not self.feature_schema_names:
             raise RuntimeError("feature schema is empty")
 
@@ -130,7 +138,34 @@ class PolicyPipeline:
             raise RuntimeError("feature names mismatch")
 
         incoming = {str(k): _safe_float(v, 0.0) for k, v in zip(feature_names, feature_values)}
-        aligned = [incoming.get(k, 0.0) for k in self.feature_schema_names]
+        if model.feature_names:
+            if model.num_features is not None and len(model.feature_names) != int(model.num_features):
+                logger.warning(
+                    "[POLICY] model %s feature_names=%d num_features=%s mismatch; aligning by feature_names",
+                    model.name,
+                    len(model.feature_names),
+                    str(model.num_features),
+                )
+            aligned = [incoming.get(k, 0.0) for k in model.feature_names]
+        else:
+            aligned = [incoming.get(k, 0.0) for k in self.feature_schema_names]
+            if model.num_features is not None:
+                if len(aligned) > model.num_features:
+                    logger.warning(
+                        "[POLICY] model %s expects %s features; truncating from %d schema cols",
+                        model.name,
+                        str(model.num_features),
+                        len(aligned),
+                    )
+                    aligned = aligned[: int(model.num_features)]
+                elif len(aligned) < model.num_features:
+                    logger.warning(
+                        "[POLICY] model %s expects %s features; padding from %d schema cols",
+                        model.name,
+                        str(model.num_features),
+                        len(aligned),
+                    )
+                    aligned.extend([0.0] * (int(model.num_features) - len(aligned)))
         X = np.asarray(aligned, dtype=float).reshape(1, -1)
         if np.isnan(X).any() or np.isinf(X).any():
             X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
@@ -191,7 +226,17 @@ class PolicyPipeline:
                 booster = model
             if booster is None:
                 return None
-            return PolicyModel(booster=booster, name=name)
+            feature_names = None
+            num_features = None
+            try:
+                feature_names = list(getattr(booster, "feature_names", None) or []) or None
+            except Exception:
+                feature_names = None
+            try:
+                num_features = int(booster.num_features())
+            except Exception:
+                num_features = None
+            return PolicyModel(booster=booster, name=name, feature_names=feature_names, num_features=num_features)
 
         updated = False
         bm = _wrap(buy_model, "policy_buy")
@@ -219,8 +264,8 @@ class PolicyPipeline:
             self.last_p_success_calib = None
             return None, None
 
-        X = self._align_features(feature_names, feature_values)
         model = self.buy_model if teacher_dir == "BUY" else self.sell_model
+        X = self._align_features(feature_names, feature_values, model=model)
         p_raw = model.predict_success(X)
         calib = self._calib_buy if teacher_dir == "BUY" else self._calib_sell
         p_cal = self._apply_calibration(p_raw, calib)
@@ -253,6 +298,22 @@ def load_policy_models(
     booster_buy.load_model(buy_path)
     booster_sell = xgb.Booster()
     booster_sell.load_model(sell_path)
+    try:
+        buy_feat_names = list(getattr(booster_buy, "feature_names", None) or []) or None
+    except Exception:
+        buy_feat_names = None
+    try:
+        sell_feat_names = list(getattr(booster_sell, "feature_names", None) or []) or None
+    except Exception:
+        sell_feat_names = None
+    try:
+        buy_num = int(booster_buy.num_features())
+    except Exception:
+        buy_num = None
+    try:
+        sell_num = int(booster_sell.num_features())
+    except Exception:
+        sell_num = None
 
     if not schema_path:
         schema_path = os.getenv("POLICY_SCHEMA_COLS_PATH", "").strip() or os.getenv("FEATURE_SCHEMA_COLS_PATH", "").strip()
@@ -264,8 +325,8 @@ def load_policy_models(
         raise RuntimeError("POLICY_SCHEMA_COLS_PATH is required for policy models")
 
     pipe = PolicyPipeline(
-        buy_model=PolicyModel(booster=booster_buy, name="policy_buy"),
-        sell_model=PolicyModel(booster=booster_sell, name="policy_sell"),
+        buy_model=PolicyModel(booster=booster_buy, name="policy_buy", feature_names=buy_feat_names, num_features=buy_num),
+        sell_model=PolicyModel(booster=booster_sell, name="policy_sell", feature_names=sell_feat_names, num_features=sell_num),
         schema_cols=schema_cols,
         calib_buy_path=calib_buy_path,
         calib_sell_path=calib_sell_path,

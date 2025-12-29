@@ -619,6 +619,12 @@ class FuturesVWAPCVDClient:
             except asyncio.CancelledError:
                 self.log.info("[VWAP-CVD] Run cancelled; exiting main loop.")
                 break
+            except (
+                websockets.exceptions.InvalidHandshake,
+                websockets.exceptions.InvalidMessage,
+                websockets.exceptions.InvalidStatusCode,
+            ) as e:
+                self.log.warning("[VWAP-CVD] WS handshake failed: %s", e)
             except websockets.exceptions.ConnectionClosed as e:
                 self.log.warning("[VWAP-CVD] WS connection closed: %s", e)
             except Exception as e:

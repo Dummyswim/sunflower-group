@@ -1120,7 +1120,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
     logger.info("STARTING RULE-AS-TEACHER MAIN EVENT LOOP")
     logger.info("=" * 60)
     _log_env_audit([
-        "HTF_MIN_CONS", "RULE_MIN_SIG", "FLOW_VWAP_EXT",
+        "HTF_MIN_CONS", "RULE_MIN_SIG", "FLOW_VWAP_EXT", "FLOW_STRONG_MIN", "STRUCT_OPPOSE_FLOW_MIN",
         "POLICY_MIN_SUCCESS", "POLICY_BUY_PATH", "POLICY_SELL_PATH",
         "POLICY_VETO_STRICT", "POLICY_MIN_SIZE_MULT",
         "CALIB_BUY_PATH", "CALIB_SELL_PATH",
@@ -1199,12 +1199,22 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
         calib_buy_out = os.getenv("CALIB_BUY_PATH", "trained_models/production/calib_buy.json")
         calib_sell_out = os.getenv("CALIB_SELL_PATH", "trained_models/production/calib_sell.json")
         if train_log_path:
+            try:
+                calib_max_bytes = int(os.getenv("CALIB_MAX_BYTES", "6000000") or "6000000")
+            except Exception:
+                calib_max_bytes = 6_000_000
+            try:
+                calib_max_rows = int(os.getenv("CALIB_MAX_ROWS", "50000") or "50000")
+            except Exception:
+                calib_max_rows = 50_000
             calib_task = asyncio.create_task(background_calibrator_loop(
                 feature_log_path=train_log_path,
                 calib_buy_out_path=calib_buy_out,
                 calib_sell_out_path=calib_sell_out,
                 interval_sec=int(getattr(config, "calib_interval_sec", 1200)) if hasattr(config, "calib_interval_sec") else 1200,
-                min_dir_rows=int(getattr(config, "calib_min_rows", 120)) if hasattr(config, "calib_min_rows") else 120
+                min_dir_rows=int(getattr(config, "calib_min_rows", 120)) if hasattr(config, "calib_min_rows") else 120,
+                max_bytes=calib_max_bytes,
+                max_rows=calib_max_rows,
             ))
             logger.info(f"[CALIB] Calibrator task started → buy={calib_buy_out} sell={calib_sell_out}")
         else:
@@ -1630,8 +1640,50 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     is_ob_bull = bool(features_raw.get("struct_ob_bull_present", 0))
                     is_ob_bear = bool(features_raw.get("struct_ob_bear_present", 0))
 
-                    is_bull_setup = is_pivot_swipe_up or is_fvg_up or is_ob_bull
-                    is_bear_setup = is_pivot_swipe_down or is_fvg_down or is_ob_bear
+                    try:
+                        ob_max_pct = float(os.getenv("OB_RELEVANCE_MAX_PCT", "0.0020") or "0.0020")
+                        ob_max_atr_mult = float(os.getenv("OB_RELEVANCE_ATR_MULT", "0.35") or "0.35")
+                    except Exception:
+                        ob_max_pct = 0.0020
+                        ob_max_atr_mult = 0.35
+                    try:
+                        last_close = float(features_raw.get("close", features_raw.get("last_price", 0.0)) or 0.0)
+                        atr = float(features_raw.get("atr_1t", features_raw.get("atr_3t", 0.0)) or 0.0)
+                    except Exception:
+                        last_close = 0.0
+                        atr = 0.0
+                    max_rel = ob_max_pct
+                    if last_close > 0.0 and atr > 0.0:
+                        max_rel = min(ob_max_pct, (ob_max_atr_mult * atr) / last_close)
+                    bull_dist = abs(float(features_raw.get("struct_ob_bull_dist", 0.0) or 0.0))
+                    bear_dist = abs(float(features_raw.get("struct_ob_bear_dist", 0.0) or 0.0))
+                    ob_bull_valid = bool(is_ob_bull and (bull_dist <= max_rel) and (is_pivot_swipe_up or is_fvg_up))
+                    ob_bear_valid = bool(is_ob_bear and (bear_dist <= max_rel) and (is_pivot_swipe_down or is_fvg_down))
+                    try:
+                        ob_decay = int(os.getenv("OB_DECAY_BARS", "8") or "8")
+                    except Exception:
+                        ob_decay = 8
+                    if ob_bull_valid:
+                        decision_state._ob_bull_age = 0
+                    elif is_ob_bull:
+                        decision_state._ob_bull_age = int(getattr(decision_state, "_ob_bull_age", 0)) + 1
+                    else:
+                        decision_state._ob_bull_age = 0
+                    if ob_bear_valid:
+                        decision_state._ob_bear_age = 0
+                    elif is_ob_bear:
+                        decision_state._ob_bear_age = int(getattr(decision_state, "_ob_bear_age", 0)) + 1
+                    else:
+                        decision_state._ob_bear_age = 0
+                    if int(getattr(decision_state, "_ob_bull_age", 0)) >= ob_decay:
+                        ob_bull_valid = False
+                    if int(getattr(decision_state, "_ob_bear_age", 0)) >= ob_decay:
+                        ob_bear_valid = False
+                    features_raw["struct_ob_bull_valid"] = int(ob_bull_valid)
+                    features_raw["struct_ob_bear_valid"] = int(ob_bear_valid)
+
+                    is_bull_setup = is_pivot_swipe_up or is_fvg_up or ob_bull_valid
+                    is_bear_setup = is_pivot_swipe_down or is_fvg_down or ob_bear_valid
 
                     # --- scalper filter: structure becomes *directional setup* only if flow+VWAP allow it ---
                     flow_score0, flow_side0, micro0, fut_cvd0, fut_vwap0, vwap_side0 = compute_flow_signal(features_raw)
@@ -1681,6 +1733,23 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     features_raw["is_bear_setup"] = int(is_bear_setup)
                     features_raw["is_any_setup"] = int(is_any_setup)
                     features_raw["fast_setup_ready"] = int(fast_setup_ready)
+                    try:
+                        tape_valid = bool(float(features_raw.get("volume", 0.0) or 0.0) > 0.0)
+                    except Exception:
+                        tape_valid = False
+                    if (not tape_valid) and _safe_getenv_bool("TAPE_VALID_USE_TICKS", default=False):
+                        try:
+                            tape_valid = bool(float(features_raw.get("tick_count", 0.0) or 0.0) > 0.0)
+                        except Exception:
+                            tape_valid = False
+                    if (not tape_valid) and _safe_getenv_bool("TAPE_VALID_USE_FUTURES", default=False):
+                        try:
+                            fut_vol_delta = float(features_raw.get("fut_vol_delta", 0.0) or 0.0)
+                            fut_cvd_delta = float(features_raw.get("fut_cvd_delta", 0.0) or 0.0)
+                            tape_valid = bool(abs(fut_vol_delta) > 0.0 or abs(fut_cvd_delta) > 0.0)
+                        except Exception:
+                            tape_valid = False
+                    features_raw["tape_valid"] = int(tape_valid)
 
                     # Compute flow once (and log once). Downstream modules reuse cached values.
                     compute_flow_signal(features_raw, log=True)
@@ -1746,6 +1815,9 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         any_setup=any_setup,
                         ambiguous_setup=ambiguous_setup,
                     )
+                    if not tape_valid:
+                        tape_conflict_level = "invalid"
+                        tape_conflict_reasons = list(tape_conflict_reasons or []) + ["tape_invalid_data"]
                     teacher_strength = float(abs(rule_sig)) if np.isfinite(rule_sig) else 0.0
                     decision = decide_trade(
                         state=decision_state,
@@ -1755,6 +1827,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         rule_dir=rule_dir,
                         conflict_level=tape_conflict_level,
                         conflict_reasons=tape_conflict_reasons,
+                        tape_valid=bool(tape_valid),
                         teacher_strength=teacher_strength,
                         is_bull_setup=bool(is_bull_setup),
                         is_bear_setup=bool(is_bear_setup),
@@ -1769,19 +1842,22 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     size_mult = float(decision.get('size_mult', 0.0))
                     gates = {
                         "lane": lane,
-                        "tape_conflict_level": str(tape_conflict_level),
-                        "tape_conflict_reasons": list(tape_conflict_reasons or []),
+                        "tape_conflict_level": str(decision.get('tape_conflict_level', tape_conflict_level)),
+                        "tape_conflict_reasons": list(decision.get('tape_conflict_reasons', tape_conflict_reasons or [])),
                         "gate_reasons": list(gate_reasons_teacher),
                     }
 
                     # Policy success probability (BUY/SELL model) refines teacher decision
                     policy_min = float(os.getenv("POLICY_MIN_SUCCESS", "0.52") or "0.52")
                     policy_min = float(np.clip(policy_min, 0.0, 0.99))
-                    policy_veto_strict = _safe_getenv_bool("POLICY_VETO_STRICT", default=True)
                     try:
-                        policy_min_size = float(os.getenv("POLICY_MIN_SIZE_MULT", "0.15") or "0.15")
+                        policy_override_ratio = float(os.getenv("OVERRIDE_MIN_SUCCESS_RATIO", "0.92") or "0.92")
                     except Exception:
-                        policy_min_size = 0.15
+                        policy_override_ratio = 0.92
+                    try:
+                        policy_max_micro = float(os.getenv("MAX_MICRO_SIZE", "0.25") or "0.25")
+                    except Exception:
+                        policy_max_micro = 0.25
                     p_success_raw = None
                     p_success_cal = None
                     if isinstance(model_pipe, PolicyPipeline) and rule_dir in ("BUY", "SELL"):
@@ -1799,32 +1875,63 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                             teacher_dir=rule_dir,
                         )
 
-                    if p_success_cal is not None and teacher_tradeable:
-                        denom = max(1e-6, 1.0 - policy_min)
-                        scale = float(np.clip((float(p_success_cal) - policy_min) / denom, 0.0, 1.0))
-                        size_mult *= scale
-                        if scale <= 0.0:
-                            if policy_veto_strict:
-                                tradeable_flag = False
-                                gate_reasons.append("policy_veto")
-                            else:
-                                size_mult = max(size_mult, policy_min_size)
-                                tradeable_flag = True
-                                gate_reasons.append("policy_floor")
+                    policy_authorized = False
+                    override_reason = "NONE"
+                    if teacher_tradeable:
+                        if p_success_cal is None:
+                            tradeable_flag = False
+                            gate_reasons.append("policy_no_score")
                         else:
-                            tradeable_flag = True
-                    elif teacher_tradeable and p_success_cal is None:
+                            if float(p_success_cal) >= policy_min:
+                                denom = max(1e-6, 1.0 - policy_min)
+                                scale = float(np.clip((float(p_success_cal) - policy_min) / denom, 0.0, 1.0))
+                                size_mult *= scale
+                                policy_authorized = True
+                                tradeable_flag = True
+                            else:
+                                override_min = float(policy_min) * float(policy_override_ratio)
+                                flow_side = int(round(float(rule_signals.get("flow_side", 0.0))))
+                                try:
+                                    mtf_cons = float(rule_signals.get("mtf_consensus", 0.0))
+                                except Exception:
+                                    mtf_cons = 0.0
+                                try:
+                                    htf_neutral = float(os.getenv("HTF_NEUTRAL_MIN", "0.35") or "0.35")
+                                    htf_strong_veto = float(os.getenv("HTF_STRONG_VETO_MIN", "0.60") or "0.60")
+                                except Exception:
+                                    htf_neutral = 0.35
+                                    htf_strong_veto = 0.60
+                                side = 1 if rule_dir == "BUY" else -1
+                                flow_align = (flow_side == side)
+                                htf_align = (mtf_cons >= htf_neutral and side == 1) or (mtf_cons <= -htf_neutral and side == -1)
+                                htf_veto = (mtf_cons >= htf_strong_veto and side == -1) or (mtf_cons <= -htf_strong_veto and side == 1)
+                                hard_veto = list(decision.get("hard_veto", []))
+                                override_ok = bool(flow_align and htf_align and (not htf_veto) and (len(hard_veto) == 0) and (float(p_success_cal) >= override_min))
+                                if override_ok:
+                                    policy_authorized = True
+                                    tradeable_flag = True
+                                    size_mult = min(float(size_mult), float(policy_max_micro))
+                                    override_reason = "policy_micro_override"
+                                    gate_reasons.append("policy_micro_override")
+                                else:
+                                    tradeable_flag = False
+                                    gate_reasons.append("policy_veto")
+                    else:
                         tradeable_flag = False
-                        gate_reasons.append("policy_no_score")
+                        gate_reasons.append("teacher_ineligible")
                     # Structured decision log (machine-readable)
                     logger.info(
-                        "[%s] [DECISION] lane=%s intent=%s tradeable=%s size=%.2f score=%.3f edge_req=%.3f edge_q=%.3f "
-                        "str_center=%.3f str_raw=%.3f trend_sig=%d trend_str=%.2f trigger=%s(%s) tape=%s conflict=%s "
-                        "would_trade_wo_soft=%s hard=%s soft=%s",
+                        "[%s] [DECISION] lane=%s intent=%s tradeable=%s teacher_eligible=%s policy_auth=%s override=%s "
+                        "size=%.2f score=%.3f edge_req=%.3f edge_q=%.3f str_center=%.3f str_raw=%.3f "
+                        "trend_sig=%d trend_str=%.2f trigger=%s(%s) tape=%s conflict=%s would_trade_wo_soft=%s "
+                        "hard=%s soft=%s",
                         name,
                         lane,
                         str(decision.get('intent', 'NA')),
-                        bool(decision.get('tradeable', False)),
+                        bool(tradeable_flag),
+                        bool(teacher_tradeable),
+                        bool(policy_authorized),
+                        str(override_reason),
                         float(size_mult),
                         float(decision.get('score', 0.0)),
                         float(decision.get('edge_required', 0.0)),
@@ -1875,7 +1982,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         f"[{name}] [SETUP] state={setup_state} "
                         f"teacher_dir={rule_dir or 'NA'} strength={teacher_strength:.3f} "
                         f"is_bull_setup={is_bull_setup} is_bear_setup={is_bear_setup} "
-                        f"tradeable={tradeable_flag}"
+                        f"tradeable={tradeable_flag} teacher_eligible={teacher_tradeable} policy_auth={policy_authorized}"
                     )
 
                     # --- Final direction: teacher defines direction; policy only filters entries ---
@@ -1886,16 +1993,20 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         gate_reasons.append("teacher_flat")
 
                     # Signal record: prediction for close at t+2*interval
-                    suggest_tradeable = bool(teacher_tradeable)
+                    suggest_tradeable = bool(tradeable_flag)
                     sig = {
                         "pred_for": target_start.isoformat(), # where target_start = t + 2*interval
                         "decision": "USER",
                         "teacher_dir": str(rule_dir),
                         "teacher_tradeable": bool(teacher_tradeable),
+                        "exec_tradeable": bool(tradeable_flag),
+                        "policy_authorized": bool(policy_authorized),
+                        "override_reason": str(override_reason),
                         "teacher_strength": float(teacher_strength),
                         "policy_success_raw": float(p_success_raw) if p_success_raw is not None else None,
                         "policy_success_calib": float(p_success_cal) if p_success_cal is not None else None,
                         "policy_min_success": float(policy_min),
+                        "tape_valid": bool(tape_valid),
                         "ema_decision_tf": (ema_meta or {}).get("decision_tf"),
                         "ema_filter_tf": (ema_meta or {}).get("filter_tf"),
                         "ema_regime": (ema_meta or {}).get("regime"),

@@ -470,16 +470,31 @@ class FeaturePipeline:
                 is_flat = slope21_norm <= flat_thr
                 is_tangled = sep_norm <= tangle_thr
 
-                if is_flat or is_tangled:
+                try:
+                    early_slope_thr = float(os.getenv("EMA_EARLY_SLOPE_ATR", "0.04"))
+                    early_sep_thr = float(os.getenv("EMA_EARLY_SEP_ATR", "0.15"))
+                except Exception:
+                    early_slope_thr = 0.04
+                    early_sep_thr = 0.15
+
+                if is_flat and is_tangled:
                     regime = "CHOP"
                     bias = 0
                 else:
                     if ema21_f > ema50_f and slope21 > 0 and slope50 >= 0:
-                        regime = "TREND_UP"
-                        bias = 1
+                        if slope21_norm >= early_slope_thr and sep_norm >= early_sep_thr:
+                            regime = "TREND_UP_EARLY" if sep_norm < tangle_thr else "TREND_UP"
+                            bias = 1
+                        else:
+                            regime = "MIXED"
+                            bias = 0
                     elif ema21_f < ema50_f and slope21 < 0 and slope50 <= 0:
-                        regime = "TREND_DN"
-                        bias = -1
+                        if slope21_norm >= early_slope_thr and sep_norm >= early_sep_thr:
+                            regime = "TREND_DN_EARLY" if sep_norm < tangle_thr else "TREND_DN"
+                            bias = -1
+                        else:
+                            regime = "MIXED"
+                            bias = 0
                     else:
                         regime = "MIXED"
                         bias = 0

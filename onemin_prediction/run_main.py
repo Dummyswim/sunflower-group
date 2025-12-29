@@ -77,9 +77,9 @@ config = SimpleNamespace(
     trade_tp_pct=float(os.getenv("TRADE_TP_PCT", "0.0015") or "0.0015"),
     trade_sl_pct=float(os.getenv("TRADE_SL_PCT", "0.0008") or "0.0008"),
 
-    # Calibrator cadence (fit on >=220 directional rows)
+    # Calibrator cadence (fit on >=CALIB_MIN_ROWS directional rows)
     calib_interval_sec=300,
-    calib_min_rows=220,
+    calib_min_rows=int(os.getenv("CALIB_MIN_ROWS", "220") or "220"),
 
 )
 
