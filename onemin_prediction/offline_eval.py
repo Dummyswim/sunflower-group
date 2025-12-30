@@ -65,6 +65,9 @@ def _labels_from_trainlog(train_log_path: str, max_rows: int = 300000) -> Option
         out.append({
             "ts": str(ts),
             "label": str(lbl),
+            "label_weight": float(r.get("label_weight", 1.0) or 1.0),
+            "label_source_flag": float(r.get("label_source_flag", 0.0) or 0.0),
+            "label_source": str(r.get("label_source", "")),
         })
 
     if not out:
@@ -125,6 +128,23 @@ def _brier(y_true: np.ndarray, scores: np.ndarray) -> float:
     return float(np.mean((scores - y_true) ** 2))
 
 
+def _brier_weighted(y_true: np.ndarray, scores: np.ndarray, weights: np.ndarray) -> Optional[float]:
+    try:
+        scores = np.clip(scores.astype(float), 1e-9, 1 - 1e-9)
+        weights = weights.astype(float)
+        y_true = y_true.astype(float)
+    except Exception:
+        return None
+    mask = np.isfinite(scores) & np.isfinite(weights) & np.isfinite(y_true)
+    if not mask.any():
+        return None
+    w = np.clip(weights[mask], 0.0, None)
+    denom = float(w.sum())
+    if denom <= 0.0:
+        return None
+    return float(np.sum(w * (scores[mask] - y_true[mask]) ** 2) / denom)
+
+
 def _score_column(df: pd.DataFrame) -> str:
     if "policy_success_calib" in df.columns:
         return "policy_success_calib"
@@ -161,9 +181,51 @@ def main() -> None:
             continue
         y = (sub["label"].astype(str).str.upper() == d).astype(int).to_numpy()
         p = sub[score_col].astype(float).to_numpy()
+        w = sub.get("label_weight", pd.Series([1.0] * len(sub))).astype(float).to_numpy()
         auc = _compute_auc(y, p)
         brier = _brier(y, p)
-        logger.info("[%s] n=%d auc=%s brier=%.4f", d, int(len(sub)), f"{auc:.3f}" if auc is not None else "NA", brier)
+        brier_w = _brier_weighted(y, p, w)
+        logger.info(
+            "[%s] n=%d auc=%s brier=%.4f brier_w=%s",
+            d,
+            int(len(sub)),
+            f"{auc:.3f}" if auc is not None else "NA",
+            brier,
+            f"{brier_w:.4f}" if brier_w is not None else "NA",
+        )
+
+        if "label_source_flag" in sub.columns:
+            for flag_val in (0.0, 1.0):
+                sub_flag = sub[sub["label_source_flag"].astype(float) == flag_val]
+                if sub_flag.empty:
+                    continue
+                y_f = (sub_flag["label"].astype(str).str.upper() == d).astype(int).to_numpy()
+                p_f = sub_flag[score_col].astype(float).to_numpy()
+                w_f = sub_flag.get("label_weight", pd.Series([1.0] * len(sub_flag))).astype(float).to_numpy()
+                brier_f = _brier_weighted(y_f, p_f, w_f)
+                logger.info(
+                    "[%s] label_source_flag=%s n=%d brier_w=%s",
+                    d,
+                    int(flag_val),
+                    int(len(sub_flag)),
+                    f"{brier_f:.4f}" if brier_f is not None else "NA",
+                )
+
+        if "regime" in sub.columns:
+            for reg, sub_reg in sub.groupby("regime"):
+                if sub_reg.empty:
+                    continue
+                y_r = (sub_reg["label"].astype(str).str.upper() == d).astype(int).to_numpy()
+                p_r = sub_reg[score_col].astype(float).to_numpy()
+                w_r = sub_reg.get("label_weight", pd.Series([1.0] * len(sub_reg))).astype(float).to_numpy()
+                brier_r = _brier_weighted(y_r, p_r, w_r)
+                logger.info(
+                    "[%s] regime=%s n=%d brier_w=%s",
+                    d,
+                    str(reg),
+                    int(len(sub_reg)),
+                    f"{brier_r:.4f}" if brier_r is not None else "NA",
+                )
 
 
 if __name__ == "__main__":

@@ -108,6 +108,7 @@ class PolicyPipeline:
         self,
         buy_model: PolicyModel,
         sell_model: PolicyModel,
+        move_model: Optional[PolicyModel] = None,
         *,
         schema_cols: List[str],
         calib_buy_path: Optional[str] = None,
@@ -115,6 +116,7 @@ class PolicyPipeline:
     ) -> None:
         self.buy_model = buy_model
         self.sell_model = sell_model
+        self.move_model = move_model
         self.feature_schema_names = list(schema_cols)
         self._calib_buy_path = calib_buy_path or ""
         self._calib_sell_path = calib_sell_path or ""
@@ -123,6 +125,7 @@ class PolicyPipeline:
         self.last_p_success_raw: Optional[float] = None
         self.last_p_success_calib: Optional[float] = None
         self.last_teacher_dir: Optional[str] = None
+        self.last_p_move_raw: Optional[float] = None
 
     def _align_features(
         self,
@@ -275,6 +278,21 @@ class PolicyPipeline:
         self.last_p_success_calib = float(p_cal)
         return float(p_raw), float(p_cal)
 
+    def predict_move(
+        self,
+        *,
+        feature_names: List[str],
+        feature_values: List[float],
+    ) -> Optional[float]:
+        if self.move_model is None:
+            self.last_p_move_raw = None
+            return None
+        model = self.move_model
+        X = self._align_features(feature_names, feature_values, model=model)
+        p_raw = model.predict_success(X)
+        self.last_p_move_raw = float(p_raw)
+        return float(p_raw)
+
 
 def load_policy_models(
     *,
@@ -283,6 +301,7 @@ def load_policy_models(
     schema_path: Optional[str] = None,
     calib_buy_path: Optional[str] = None,
     calib_sell_path: Optional[str] = None,
+    move_path: Optional[str] = None,
 ) -> PolicyPipeline:
     if xgb is None:
         raise RuntimeError("xgboost is required for policy models")
@@ -324,13 +343,45 @@ def load_policy_models(
     if not schema_cols:
         raise RuntimeError("POLICY_SCHEMA_COLS_PATH is required for policy models")
 
+    move_model = None
+    move_path = str(move_path or "").strip() if move_path is not None else ""
+    if not move_path:
+        move_path = os.getenv("POLICY_MOVE_PATH", "").strip()
+    if move_path:
+        if not Path(move_path).exists():
+            logger.warning("[POLICY] move model not found: %s (move head disabled)", move_path)
+        else:
+            booster_move = xgb.Booster()
+            booster_move.load_model(move_path)
+            try:
+                move_feat_names = list(getattr(booster_move, "feature_names", None) or []) or None
+            except Exception:
+                move_feat_names = None
+            try:
+                move_num = int(booster_move.num_features())
+            except Exception:
+                move_num = None
+            move_model = PolicyModel(
+                booster=booster_move,
+                name="policy_move",
+                feature_names=move_feat_names,
+                num_features=move_num,
+            )
+
     pipe = PolicyPipeline(
         buy_model=PolicyModel(booster=booster_buy, name="policy_buy", feature_names=buy_feat_names, num_features=buy_num),
         sell_model=PolicyModel(booster=booster_sell, name="policy_sell", feature_names=sell_feat_names, num_features=sell_num),
+        move_model=move_model,
         schema_cols=schema_cols,
         calib_buy_path=calib_buy_path,
         calib_sell_path=calib_sell_path,
     )
     pipe.reload_calibration()
-    logger.info("[POLICY] loaded BUY=%s SELL=%s schema_n=%d", buy_path, sell_path, len(schema_cols))
+    logger.info(
+        "[POLICY] loaded BUY=%s SELL=%s MOVE=%s schema_n=%d",
+        buy_path,
+        sell_path,
+        move_path or "<none>",
+        len(schema_cols),
+    )
     return pipe

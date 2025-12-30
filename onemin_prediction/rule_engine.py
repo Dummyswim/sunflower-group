@@ -13,6 +13,210 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        v = int(x)
+        return v
+    except Exception:
+        return int(default)
+
+
+def _sign(x: float) -> int:
+    try:
+        v = float(x)
+    except Exception:
+        return 0
+    if v > 0:
+        return 1
+    if v < 0:
+        return -1
+    return 0
+
+
+class RegimeStateMachine:
+    """Simple regime state with hysteresis + volatility band."""
+
+    def __init__(self, *, hold_bars: int = 3, vol_ema_alpha: float = 0.15) -> None:
+        self.hold_bars = max(1, int(hold_bars))
+        self.vol_ema_alpha = float(vol_ema_alpha)
+        self._regime = "SIDEWAYS"
+        self._age = 0
+        self._candidate = None
+        self._cand_age = 0
+        self._atr_ema = None
+        self._vol_band = "NORMAL"
+
+    def _update_vol_band(self, atr_1t: float) -> str:
+        if not np.isfinite(atr_1t) or atr_1t <= 0:
+            return self._vol_band
+        if self._atr_ema is None:
+            self._atr_ema = float(atr_1t)
+        else:
+            self._atr_ema = (self.vol_ema_alpha * float(atr_1t)) + ((1.0 - self.vol_ema_alpha) * self._atr_ema)
+        low_mult = _safe_float(os.getenv("VOL_BAND_LOW_MULT", "0.85"), 0.85)
+        high_mult = _safe_float(os.getenv("VOL_BAND_HIGH_MULT", "1.15"), 1.15)
+        if self._atr_ema and atr_1t <= (self._atr_ema * low_mult):
+            self._vol_band = "LOW"
+        elif self._atr_ema and atr_1t >= (self._atr_ema * high_mult):
+            self._vol_band = "HIGH"
+        else:
+            self._vol_band = "NORMAL"
+        return self._vol_band
+
+    def update(self, candidate: str, atr_1t: float) -> dict:
+        if candidate == self._regime:
+            self._age += 1
+            self._candidate = None
+            self._cand_age = 0
+        else:
+            if candidate != self._candidate:
+                self._candidate = candidate
+                self._cand_age = 1
+            else:
+                self._cand_age += 1
+            if self._cand_age >= self.hold_bars:
+                self._regime = candidate
+                self._age = 0
+                self._candidate = None
+                self._cand_age = 0
+        vol_band = self._update_vol_band(float(atr_1t))
+        return {
+            "regime": self._regime,
+            "regime_age": int(self._age),
+            "vol_band": vol_band,
+        }
+
+
+class DynamicThresholds:
+    """Dynamic thresholds with bounded EMA updates."""
+
+    def __init__(self) -> None:
+        self.enabled = _safe_getenv_bool("DYNAMIC_THRESHOLDS", default=True)
+        self.alpha = _safe_float(os.getenv("DYN_THRESH_EMA_ALPHA", "0.20"), 0.20)
+        self.update_every = max(1, _safe_int(os.getenv("DYN_THRESH_UPDATE_EVERY", "1"), 1))
+        self._tick = 0
+        self.base = {}
+        self.curr = {}
+        self.bounds = {}
+        self._init_defaults()
+
+    def _init_defaults(self) -> None:
+        defaults = {
+            "FLOW_STRONG_MIN": 0.50,
+            "HTF_STRONG_VETO_MIN": 0.70,
+            "LANE_SCORE_MIN": 0.50,
+            "EMA_CHOP_HARD_MIN": 0.55,
+            "GATE_MARGIN_THR": 0.06,
+            "FLOW_VWAP_EXT": 0.0020,
+        }
+        for k, dflt in defaults.items():
+            raw = os.getenv(k, str(dflt))
+            base = _safe_float(raw, dflt)
+            self.base[k] = base
+            self.curr[k] = base
+            lo = _safe_float(os.getenv(f"DYN_{k}_MIN", str(base * 0.7)), base * 0.7)
+            hi = _safe_float(os.getenv(f"DYN_{k}_MAX", str(base * 1.5)), base * 1.5)
+            self.bounds[k] = (min(lo, hi), max(lo, hi))
+
+    def _mult_for_regime(self, key: str, regime: str) -> float:
+        env_key = f"DYN_{key}_{regime}_MULT"
+        if os.getenv(env_key) is not None:
+            return _safe_float(os.getenv(env_key), 1.0)
+        if key in ("FLOW_STRONG_MIN", "LANE_SCORE_MIN", "GATE_MARGIN_THR", "FLOW_VWAP_EXT", "HTF_STRONG_VETO_MIN", "EMA_CHOP_HARD_MIN"):
+            if regime.startswith("TREND"):
+                return 0.90
+            if regime == "CHOP":
+                return 1.10
+            if regime == "SIDEWAYS":
+                return 1.05
+            if regime == "REVERSAL_RISK":
+                return 1.00
+        return 1.0
+
+    def _mult_for_vol(self, key: str, vol_band: str) -> float:
+        env_key = f"DYN_{key}_VOL_{vol_band}_MULT"
+        if os.getenv(env_key) is not None:
+            return _safe_float(os.getenv(env_key), 1.0)
+        if key in ("FLOW_STRONG_MIN", "LANE_SCORE_MIN", "GATE_MARGIN_THR"):
+            if vol_band == "HIGH":
+                return 0.95
+            if vol_band == "LOW":
+                return 1.05
+        return 1.0
+
+    def update(self, *, regime: str, vol_band: str, regime_age: int) -> dict:
+        self._tick += 1
+        if not self.enabled or (self._tick % self.update_every != 0):
+            return self.curr
+        if regime_age < max(1, _safe_int(os.getenv("REGIME_HOLD_BARS", "3"), 3)):
+            return self.curr
+        for key, base in self.base.items():
+            target = base * self._mult_for_regime(key, regime) * self._mult_for_vol(key, vol_band)
+            lo, hi = self.bounds.get(key, (base * 0.7, base * 1.5))
+            target = float(np.clip(target, lo, hi))
+            prev = float(self.curr.get(key, base))
+            self.curr[key] = (self.alpha * target) + ((1.0 - self.alpha) * prev)
+        return self.curr
+
+    def get(self, key: str, default: float) -> float:
+        if not self.enabled:
+            return float(default)
+        return float(self.curr.get(key, default))
+
+
+def classify_regime(
+    *,
+    features_raw: Mapping[str, Any],
+) -> dict:
+    """Return candidate regime and reversal-risk modifiers."""
+    flow_score = _safe_float(features_raw.get("flow_score", 0.0), 0.0)
+    vwap_dev = _safe_float(features_raw.get("flow_fut_vwap_dev", 0.0), 0.0)
+    vwap_side = int(round(_safe_float(features_raw.get("flow_vwap_side", 0.0), 0.0)))
+    ema_chop = bool(_safe_float(features_raw.get("ema_regime_chop_5t", 0.0), 0.0) > 0.5)
+    ema_bias = int(round(_safe_float(features_raw.get("ema_bias_5t", 0.0), 0.0)))
+    micro_imb = _safe_float(features_raw.get("flow_micro_imb", 0.0), 0.0)
+    micro_slope = _safe_float(features_raw.get("flow_micro_slope", features_raw.get("micro_slope", 0.0)), 0.0)
+    fut_cvd = _safe_float(features_raw.get("flow_fut_cvd", 0.0), 0.0)
+    trap_long = bool(_safe_float(features_raw.get("trap_long", 0.0), 0.0) > 0.5)
+    trap_short = bool(_safe_float(features_raw.get("trap_short", 0.0), 0.0) > 0.5)
+
+    flow_trend_min = _safe_float(os.getenv("REGIME_FLOW_TREND_MIN", "0.35"), 0.35)
+    flow_chop_max = _safe_float(os.getenv("REGIME_FLOW_CHOP_MAX", "0.20"), 0.20)
+    vwap_trend_min = _safe_float(os.getenv("REGIME_VWAP_TREND_MIN", "0.0006"), 0.0006)
+    vwap_chop_max = _safe_float(os.getenv("REGIME_VWAP_CHOP_MAX", "0.0003"), 0.0003)
+
+    candidate = "SIDEWAYS"
+    if ema_chop or (abs(flow_score) <= flow_chop_max and abs(vwap_dev) <= vwap_chop_max):
+        candidate = "CHOP"
+    elif abs(flow_score) >= flow_trend_min and abs(vwap_dev) >= vwap_trend_min:
+        dir_bias = ema_bias if ema_bias != 0 else _sign(flow_score)
+        if dir_bias > 0:
+            candidate = "TREND_UP"
+        elif dir_bias < 0:
+            candidate = "TREND_DN"
+        else:
+            candidate = "SIDEWAYS"
+
+    rev_imb = _safe_float(os.getenv("REVERSAL_IMB_MIN", "0.05"), 0.05)
+    rev_cvd = _safe_float(os.getenv("REVERSAL_CVD_MIN", "0.0"), 0.0)
+    vwap_rev_min = _safe_float(os.getenv("REVERSAL_VWAP_MIN", "0.0004"), 0.0004)
+    rev_slope = _safe_float(os.getenv("REVERSAL_SLOPE_MIN", "0.10"), 0.10)
+    reversal_risk = False
+    flow_dir = _sign(flow_score)
+    if candidate.startswith("TREND") and flow_dir != 0:
+        if flow_dir < 0:
+            flip_ok = (micro_imb >= rev_imb) or (micro_slope >= rev_slope)
+            reversal_risk = (trap_long or (flip_ok and fut_cvd >= rev_cvd)) and (vwap_side <= 0) and (abs(vwap_dev) >= vwap_rev_min)
+        else:
+            flip_ok = (micro_imb <= -rev_imb) or (micro_slope <= -rev_slope)
+            reversal_risk = (trap_short or (flip_ok and fut_cvd <= -rev_cvd)) and (vwap_side >= 0) and (abs(vwap_dev) >= vwap_rev_min)
+
+    return {
+        "candidate": candidate,
+        "reversal_risk": bool(reversal_risk),
+    }
+
+
 def _safe_getenv_bool(key: str, default: bool = False) -> bool:
     val = os.getenv(key)
     if val is None:
@@ -35,6 +239,7 @@ def compute_flow_signal(
     *,
     log: bool = False,
     mutate: bool = True,
+    vwap_ext_override: Optional[float] = None,
 ) -> Tuple[float, int, float, float, float, int]:
     """Compute flow score/side from micro imbalance + futures CVD + VWAP deviation."""
     def _get(k: str, default: float = 0.0) -> float:
@@ -53,6 +258,8 @@ def compute_flow_signal(
         vwap_ext = float(os.getenv('FLOW_VWAP_EXT', '0.0020') or '0.0020')
     except Exception:
         vwap_ext = 0.0020
+    if vwap_ext_override is not None and np.isfinite(float(vwap_ext_override)):
+        vwap_ext = float(vwap_ext_override)
     try:
         cvd_min = float(os.getenv('FLOW_CVD_MIN', '2.5e-05') or '2.5e-05')
     except Exception:
@@ -65,8 +272,20 @@ def compute_flow_signal(
     else:
         vwap_side = 0
 
-    strong_bear_regime = (vwap_side == -1) and (micro_imb <= 0.0) and (fut_cvd <= +cvd_min)
-    strong_bull_regime = (vwap_side == +1) and (micro_imb >= 0.0) and (fut_cvd >= -cvd_min)
+    try:
+        lock_imb = float(os.getenv("FLOW_LOCK_IMB_MIN", "0.05") or "0.05")
+    except Exception:
+        lock_imb = 0.05
+    try:
+        lock_cvd = float(os.getenv("FLOW_LOCK_CVD_MIN", str(cvd_min)) or str(cvd_min))
+    except Exception:
+        lock_cvd = float(cvd_min)
+    lock_imb = abs(lock_imb)
+    lock_cvd = abs(lock_cvd)
+
+    # Lock regimes should require stronger evidence to avoid sticky flow.
+    strong_bear_regime = (vwap_side == -1) and (micro_imb <= -lock_imb) and (fut_cvd <= -lock_cvd)
+    strong_bull_regime = (vwap_side == +1) and (micro_imb >= +lock_imb) and (fut_cvd >= +lock_cvd)
 
     cvd_term = 0.0
     if cvd_min > 0:
@@ -252,6 +471,9 @@ def compute_rule_hierarchy(
     is_bear_setup: bool,
     any_setup: bool,
     ambiguous_setup: bool,
+    dynamic_thresholds: Optional[Mapping[str, float]] = None,
+    regime: Optional[str] = None,
+    reversal_risk: bool = False,
 ) -> Tuple[str, str, str, List[str]]:
     """Flow trigger with HTF veto and structure context."""
     try:
@@ -269,7 +491,13 @@ def compute_rule_hierarchy(
     conflict_level = "none"
     conflict_reasons: List[str] = []
 
-    flow_score, flow_side, micro_imb, fut_cvd, fut_vwap, vwap_side = compute_flow_signal(features_raw)
+    vwap_ext_override = None
+    if dynamic_thresholds and "FLOW_VWAP_EXT" in dynamic_thresholds:
+        vwap_ext_override = float(dynamic_thresholds.get("FLOW_VWAP_EXT", 0.0))
+    flow_score, flow_side, micro_imb, fut_cvd, fut_vwap, vwap_side = compute_flow_signal(
+        features_raw,
+        vwap_ext_override=vwap_ext_override,
+    )
 
     try:
         mtf_cons = float(mtf.get("mtf_consensus", 0.0)) if mtf else 0.0
@@ -282,14 +510,18 @@ def compute_rule_hierarchy(
         flow_strong_min = float(os.getenv("FLOW_STRONG_MIN", "0.50") or "0.50")
     except Exception:
         flow_strong_min = 0.50
+    if dynamic_thresholds and "FLOW_STRONG_MIN" in dynamic_thresholds:
+        flow_strong_min = float(dynamic_thresholds.get("FLOW_STRONG_MIN", flow_strong_min))
     try:
         htf_neutral_min = float(os.getenv("HTF_NEUTRAL_MIN", "0.35") or "0.35")
     except Exception:
         htf_neutral_min = 0.35
     try:
-        htf_strong_veto_min = float(os.getenv("HTF_STRONG_VETO_MIN", "0.60") or "0.60")
+        htf_strong_veto_min = float(os.getenv("HTF_STRONG_VETO_MIN", "0.70") or "0.70")
     except Exception:
         htf_strong_veto_min = 0.60
+    if dynamic_thresholds and "HTF_STRONG_VETO_MIN" in dynamic_thresholds:
+        htf_strong_veto_min = float(dynamic_thresholds.get("HTF_STRONG_VETO_MIN", htf_strong_veto_min))
 
     flow_dir = 0
     if abs(float(flow_score)) >= flow_strong_min:
@@ -336,9 +568,40 @@ def compute_rule_hierarchy(
         conflict_reasons.append("flow_not_strong")
     else:
         if htf_veto != 0 and htf_veto != flow_dir:
-            rule_dir = "FLAT"
-            conflict_level = "red"
-            conflict_reasons.append("htf_veto")
+            veto_mode = str(os.getenv("HTF_VETO_MODE", "hard") or "hard").lower().strip()
+            regime_txt = (regime or "na").upper()
+            allow_soft = (regime_txt.startswith("TREND") and not reversal_risk)
+            if veto_mode == "soft" and allow_soft:
+                rule_dir = "BUY" if flow_dir > 0 else "SELL"
+                conflict_level = "yellow"
+                conflict_reasons.append("htf_veto_soft")
+            elif veto_mode == "conditional" and allow_soft:
+                try:
+                    soft_flow_min = float(os.getenv("HTF_VETO_SOFT_FLOW_MIN", "0.85") or "0.85")
+                except Exception:
+                    soft_flow_min = 0.85
+                vwap_ext = vwap_ext_override
+                if vwap_ext is None:
+                    try:
+                        vwap_ext = float(os.getenv("FLOW_VWAP_EXT", "0.0020") or "0.0020")
+                    except Exception:
+                        vwap_ext = 0.0020
+                ema_bias = int(round(_safe_float(features_raw.get("ema_bias_5t", 0.0), 0.0)))
+                ema_chop = bool(_safe_float(features_raw.get("ema_regime_chop_5t", 0.0), 0.0) > 0.5)
+                override_ok = (not ema_chop) and (abs(float(flow_score)) >= soft_flow_min) and (vwap_side == flow_dir) \
+                    and (abs(float(fut_vwap)) >= float(vwap_ext)) and (ema_bias == flow_dir)
+                if override_ok:
+                    rule_dir = "BUY" if flow_dir > 0 else "SELL"
+                    conflict_level = "yellow"
+                    conflict_reasons.append("htf_veto_soft_override")
+                else:
+                    rule_dir = "FLAT"
+                    conflict_level = "red"
+                    conflict_reasons.append("htf_veto")
+            else:
+                rule_dir = "FLAT"
+                conflict_level = "red"
+                conflict_reasons.append("htf_veto")
         elif struct_side != 0 and struct_side != flow_dir:
             try:
                 struct_flow_min = float(os.getenv("STRUCT_OPPOSE_FLOW_MIN", "0.70") or "0.70")
@@ -348,6 +611,8 @@ def compute_rule_hierarchy(
                 vwap_ext = float(os.getenv("FLOW_VWAP_EXT", "0.0020") or "0.0020")
             except Exception:
                 vwap_ext = 0.0020
+            if vwap_ext_override is not None:
+                vwap_ext = float(vwap_ext_override)
             strong_flow_override = (abs(float(flow_score)) >= struct_flow_min) and (abs(float(fut_vwap)) >= vwap_ext)
             if strong_flow_override:
                 rule_dir = "BUY" if flow_dir > 0 else "SELL"
@@ -422,6 +687,8 @@ class DecisionState:
         self._counts = Counter()
         self._decisions = 0
         self._session_date = None
+        self.regime_state = RegimeStateMachine(hold_bars=_safe_int(os.getenv("REGIME_HOLD_BARS", "3"), 3))
+        self.dynamic_thresholds = DynamicThresholds()
 
     def update_edge(self, side: int, strength: float) -> None:
         if side not in (1, -1):
@@ -501,6 +768,9 @@ def decide_trade(
     is_bull_setup: bool,
     is_bear_setup: bool,
     safe_df: Any,
+    dynamic_thresholds: Optional[Mapping[str, float]] = None,
+    regime: Optional[str] = None,
+    reversal_risk: bool = False,
 ) -> Dict[str, Any]:
     """Hard/soft veto + lane selection (SETUP vs TREND) + rolling edge gating."""
     hard: list[str] = []
@@ -762,6 +1032,8 @@ def decide_trade(
         lane_min = float(os.getenv('LANE_SCORE_MIN', '0.50') or '0.50')
     except Exception:
         lane_min = 0.50
+    if dynamic_thresholds and "LANE_SCORE_MIN" in dynamic_thresholds:
+        lane_min = float(dynamic_thresholds.get("LANE_SCORE_MIN", lane_min))
     if lane == 'NONE' and lane_score >= lane_min:
         lane = 'SETUP' if setup_score >= trend_score else 'TREND'
         soft['lane_score_override'] = float(os.getenv('PEN_LANE_SCORE', '0.01') or '0.01')
@@ -772,9 +1044,29 @@ def decide_trade(
     if lane == 'NONE':
         hard.append('lane_score_low')
 
-    if side == 1 and (vwap_side < 0 and flow_side <= 0 and abs(fut_vwap) >= float(os.getenv('FLOW_VWAP_EXT', '0.0020') or '0.0020')):
+    rv_10 = _safe_float(features_raw.get('rv_10', 0.0), 0.0)
+    atr_1t = _safe_float(features_raw.get('atr_1t', features_raw.get('atr_3t', 0.0)), 0.0)
+    try:
+        rv_atr_min = float(os.getenv('RV_ATR_MIN', '1e-05') or '1e-05')
+    except Exception:
+        rv_atr_min = 1e-05
+    rv_atr = abs(rv_10) / atr_1t if atr_1t > 0 else 0.0
+    if rv_atr_min > 0.0 and (lane in ('TREND', 'BREAKOUT')) and (not setup_lane):
+        if rv_atr < rv_atr_min:
+            hard.append('rv_atr_low')
+
+    vwap_ext_dyn = None
+    if dynamic_thresholds and "FLOW_VWAP_EXT" in dynamic_thresholds:
+        vwap_ext_dyn = float(dynamic_thresholds.get("FLOW_VWAP_EXT", 0.0))
+    try:
+        vwap_ext_gate = float(os.getenv('FLOW_VWAP_EXT', '0.0020') or '0.0020')
+    except Exception:
+        vwap_ext_gate = 0.0020
+    if vwap_ext_dyn is not None:
+        vwap_ext_gate = float(vwap_ext_dyn)
+    if side == 1 and (vwap_side < 0 and flow_side <= 0 and abs(fut_vwap) >= vwap_ext_gate):
         hard.append('structure_conflict')
-    if side == -1 and (vwap_side > 0 and flow_side >= 0 and abs(fut_vwap) >= float(os.getenv('FLOW_VWAP_EXT', '0.0020') or '0.0020')):
+    if side == -1 and (vwap_side > 0 and flow_side >= 0 and abs(fut_vwap) >= vwap_ext_gate):
         hard.append('structure_conflict')
 
     if ema_chop:
@@ -783,6 +1075,8 @@ def decide_trade(
             ema_chop_hard_min = float(os.getenv('EMA_CHOP_HARD_MIN', '0.55') or '0.55')
         except Exception:
             ema_chop_hard_min = 0.55
+        if dynamic_thresholds and "EMA_CHOP_HARD_MIN" in dynamic_thresholds:
+            ema_chop_hard_min = float(dynamic_thresholds.get("EMA_CHOP_HARD_MIN", ema_chop_hard_min))
         if (not trend_flow_agree) and (not breakout_lane) and (lane_score < ema_chop_hard_min):
             hard.append('ema_chop_hard')
         else:
@@ -796,6 +1090,8 @@ def decide_trade(
         min_edge = float(os.getenv('GATE_MARGIN_THR', '0.06') or '0.06')
     except Exception:
         min_edge = 0.06
+    if dynamic_thresholds and "GATE_MARGIN_THR" in dynamic_thresholds:
+        min_edge = float(dynamic_thresholds.get("GATE_MARGIN_THR", min_edge))
 
     edge_required, edge_q = state.edge_threshold(side, min_edge=min_edge)
     if lane == 'BREAKOUT':
@@ -816,6 +1112,11 @@ def decide_trade(
     if vwap_side == side:
         score += float(os.getenv('BONUS_VWAP', '0.005') or '0.005')
     score -= float(sum(float(v) for v in soft.values()))
+
+    if reversal_risk and lane in ("TREND", "BREAKOUT") and (not trigger):
+        hard.append("short_reversal_risk" if side == -1 else "long_reversal_risk")
+    elif reversal_risk:
+        soft["reversal_risk"] = float(os.getenv("PEN_REVERSAL_RISK", "0.02") or "0.02")
 
     would_trade_wo_soft = (len(hard) == 0) and (lane != 'NONE') and (raw_strength >= edge_required)
     tradeable = would_trade_wo_soft and (score >= edge_required)
@@ -878,11 +1179,6 @@ def decide_trade(
         if lane != 'SETUP' and raw_strength < (edge_required + 0.05):
             hard.append('ema15_break_against')
             tradeable = False
-
-    rev_risk = bool(ema_bias == side and ema_break == -side)
-    if rev_risk and lane in ('TREND', 'BREAKOUT') and not setup_lane:
-        hard.append('reversal_risk')
-        tradeable = False
 
     gate_reasons = []
     gate_reasons.extend(hard)

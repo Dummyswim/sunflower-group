@@ -54,6 +54,10 @@ export MODEL_PRODUCTION_LINK="${MODEL_PRODUCTION_LINK:-trained_models/production
 # Schema paths (base + policy)
 export FEATURE_SCHEMA_COLS_PATH="${FEATURE_SCHEMA_COLS_PATH:-data/feature_schema_cols.json}"
 export POLICY_SCHEMA_COLS_PATH="${POLICY_SCHEMA_COLS_PATH:-trained_models/production/policy_schema_cols.json}"
+export POLICY_MOVE_PATH="${POLICY_MOVE_PATH:-trained_models/production/policy_move.json}"
+MOVE_HEAD_ATR_MULT="${MOVE_HEAD_ATR_MULT:-0.35}"
+MOVE_HEAD_MIN_ROWS="${MOVE_HEAD_MIN_ROWS:-5000}"
+MOVE_HEAD_MAX_ROWS="${MOVE_HEAD_MAX_ROWS:-200000}"
 
 # --- cache manifest + fetch (optional) ---
 if [ "${POST_REBUILD_MANIFEST}" = "1" ]; then
@@ -142,6 +146,19 @@ fi
 echo "[POST] Running offline trainer: $TRAINER"
 /home/hanumanth/Documents/pyvirtualenv/venv/bin/python "$TRAINER" --log "$TRAIN_LOG_PATH"
 
+TRAIN_MOVE_HEAD="${TRAIN_MOVE_HEAD:-1}"
+if [ "${TRAIN_MOVE_HEAD}" = "1" ] && [ -f "train_move_head.py" ]; then
+  echo "[POST] Training move head (ATR mult=${MOVE_HEAD_ATR_MULT})..."
+  /home/hanumanth/Documents/pyvirtualenv/venv/bin/python train_move_head.py \
+    --log "$TRAIN_LOG_PATH" \
+    --atr_mult "$MOVE_HEAD_ATR_MULT" \
+    --min_rows "$MOVE_HEAD_MIN_ROWS" \
+    --max_rows "$MOVE_HEAD_MAX_ROWS" \
+    --out "$POLICY_MOVE_PATH"
+else
+  echo "[POST] Move head training skipped (TRAIN_MOVE_HEAD=${TRAIN_MOVE_HEAD})"
+fi
+
 echo "[POST] Active production bundle:"
 if [ -L "$MODEL_PRODUCTION_LINK" ]; then
   readlink -f "$MODEL_PRODUCTION_LINK" || true
@@ -196,6 +213,41 @@ if b_sell.num_features() != len(cols):
 
 print("[POST] Policy models/schema OK ✅")
 PY
+
+# --- HARD validation: move head vs schema ---
+if [ "${TRAIN_MOVE_HEAD:-0}" = "1" ]; then
+  /home/hanumanth/Documents/pyvirtualenv/venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+import os
+import xgboost as xgb
+
+prod = Path(os.getenv("MODEL_PRODUCTION_LINK", "trained_models/production"))
+move_path = Path(os.getenv("POLICY_MOVE_PATH", str(prod / "policy_move.json")))
+schema_path = prod / "policy_schema_cols.json"
+
+if not move_path.exists():
+    raise SystemExit(f"[POST][ERROR] Missing move model: {move_path}")
+if not schema_path.exists():
+    raise SystemExit(f"[POST][ERROR] Missing: {schema_path}")
+
+obj = json.loads(schema_path.read_text(encoding="utf-8"))
+cols = obj.get("columns") or obj.get("feature_names") or obj.get("features") or obj
+if not isinstance(cols, list):
+    raise SystemExit("[POST][ERROR] policy_schema_cols.json has unexpected format (expected list under 'columns').")
+
+booster = xgb.Booster()
+booster.load_model(str(move_path))
+
+print("[POST] MOVE num_features:", booster.num_features())
+print("[POST] Schema cols:", len(cols))
+
+if booster.num_features() != len(cols):
+    raise SystemExit("[POST][ERROR] MOVE/schema mismatch. Refusing to continue.")
+
+print("[POST] Move model/schema OK ✅")
+PY
+fi
 
 # --- offline eval (non-fatal, but useful) ---
 # --- score train log for calibrator ---
@@ -400,6 +452,24 @@ PY
 
 
 echo "[POST] Done."
+
+# --- cleanup (optional) ---
+POST_CLEANUP="${POST_CLEANUP:-1}"
+KEEP_BUNDLES="${KEEP_BUNDLES:-3}"
+if [ "${POST_CLEANUP}" = "1" ]; then
+  echo "[POST] Cleanup: temp logs + old bundles"
+  if [ -n "${SCORE_TMP}" ] && [ -f "${SCORE_TMP}" ]; then
+    rm -f "${SCORE_TMP}"
+    echo "[POST] Removed ${SCORE_TMP}"
+  fi
+  if [ -n "${SCORED_TRADEABLE_LOG:-}" ] && [ -f "${SCORED_TRADEABLE_LOG}" ]; then
+    rm -f "${SCORED_TRADEABLE_LOG}"
+    echo "[POST] Removed ${SCORED_TRADEABLE_LOG}"
+  fi
+  if [ -d "${MODEL_BUNDLES_DIR}" ]; then
+    ls -1dt "${MODEL_BUNDLES_DIR}"/* 2>/dev/null | tail -n +"$((KEEP_BUNDLES + 1))" | xargs -r rm -rf
+  fi
+fi
 
 # Crontab entry to run this script at 2:00 AM from Sunday to Thursday and save logs to a file
 # 0 2 * * 0-4 /bin/bash /home/hanumanth/Documents/sunflower-group/onemin_prediction/post_session_train_eval_fixed.sh >> /home/hanumanth/Documents/sunflower-group/onemin_prediction/logs/post_session_train_eval_fixed.log 2>&1

@@ -26,6 +26,7 @@ from rule_engine import (
     compute_structure_score,
     compute_rule_hierarchy,
     compute_ta_rule_signal,
+    classify_regime,
     DecisionState,
     decide_trade,
 )
@@ -236,7 +237,11 @@ def compute_trade_window_label(
         return "FLAT"
 
     k = float(fallback_atr_mult)
-    thr = k * atr_ret
+    try:
+        min_ret = float(os.getenv("TRAIN_FALLBACK_ATR_MIN_RET", "0.00025") or "0.00025")
+    except Exception:
+        min_ret = 0.00025
+    thr = max(k * atr_ret, min_ret)
 
     if end_ret > thr:
         return "BUY"
@@ -818,7 +823,9 @@ def _scalper_playbook_line(
 
     # Translate into a scalper-style sentence (action-consistent)
     if not tradeable:
-        if "ema15_break_veto" in gate_reasons or ema15_break_dn or ema15_break_up:
+        if "ema15_break_against" in gate_reasons:
+            plan = "EMA15 break against: wait for retest/hold before committing"
+        elif "ema15_break_veto" in gate_reasons or ema15_break_dn or ema15_break_up:
             if ema15_break_dn:
                 plan = "EMA15 breakdown veto: bearish momentum shift; avoid longs. Wait for retest/reclaim before acting"
             elif ema15_break_up:
@@ -886,6 +893,34 @@ def _scalper_playbook_line(
         gate_txt = ""
 
     return f"[SCALPER] {trad}: {plan} | {decision} | {probs} | {ctx}{gate_txt}"
+
+
+def _scalper_action_line(
+    *,
+    intent: str,
+    tradeable: bool,
+    policy_authorized: bool,
+    reversal_risk: bool,
+    prev_intent: Optional[str],
+    prev_tradeable: bool,
+    gate_reasons: List[str],
+) -> str:
+    """Short, chart-friendly scalper action line."""
+    intent = str(intent or "FLAT").upper()
+    if reversal_risk and intent in ("BUY", "SELL"):
+        action = "AVOID_REVERSAL"
+    elif tradeable and policy_authorized and intent in ("BUY", "SELL"):
+        action = f"ENTER_{intent}"
+    elif prev_tradeable and prev_intent == intent and intent in ("BUY", "SELL"):
+        action = f"HOLD_IF_IN_{intent}"
+    elif intent in ("BUY", "SELL"):
+        action = "WAIT_CONFIRM"
+    else:
+        action = "NO_TRADE"
+    gate_hint = "n/a"
+    if gate_reasons:
+        gate_hint = ",".join(gate_reasons[:3])
+    return f"[SCALPER] ACTION: {action} | gates={gate_hint}"
 
 
 # ========== HEARTBEAT / WATCHDOG / WS UTILITIES ==========
@@ -1130,6 +1165,15 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
         "TAPE_YELLOW_SIZE_MULT", "REQUIRE_SETUP", "LEGACY_TRAIN_CSV",
         "ENABLE_INDICATOR_MODULATION", "IND_MOD_SCALE",
         "ENABLE_PATTERN_MODULATION", "PAT_MOD_SCALE",
+        "REGIME_HOLD_BARS", "DYNAMIC_THRESHOLDS", "DYN_THRESH_EMA_ALPHA", "DYN_THRESH_UPDATE_EVERY",
+        "REGIME_FLOW_TREND_MIN", "REGIME_FLOW_CHOP_MAX", "REGIME_VWAP_TREND_MIN", "REGIME_VWAP_CHOP_MAX",
+        "VOL_BAND_LOW_MULT", "VOL_BAND_HIGH_MULT",
+        "HTF_VETO_MODE", "HTF_VETO_SOFT_FLOW_MIN",
+        "REVERSAL_IMB_MIN", "REVERSAL_CVD_MIN", "REVERSAL_VWAP_MIN", "REVERSAL_SLOPE_MIN", "PEN_REVERSAL_RISK",
+        "USE_MOVE_HEAD", "MOVE_HEAD_MODE", "MOVE_HEAD_FALLBACK_PROXY",
+        "MOVE_EDGE_MIN", "MOVE_EDGE_TREND_ONLY", "MOVE_PROXY_ATR_MULT", "POLICY_MOVE_PATH",
+        "RV_ATR_MIN", "TRAIN_FALLBACK_ATR_MIN_RET",
+        "FLOW_LOCK_IMB_MIN", "FLOW_LOCK_CVD_MIN",
     ])
 
     # Normalize connections (single connection default)
@@ -1751,8 +1795,16 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                             tape_valid = False
                     features_raw["tape_valid"] = int(tape_valid)
 
+                    dyn_thresholds = None
+                    if hasattr(decision_state, "dynamic_thresholds"):
+                        dyn_thresholds = getattr(decision_state, "dynamic_thresholds")
+                    dyn_values = dyn_thresholds.curr if getattr(dyn_thresholds, "enabled", False) else None
+                    vwap_ext_override = None
+                    if isinstance(dyn_values, dict) and "FLOW_VWAP_EXT" in dyn_values:
+                        vwap_ext_override = float(dyn_values.get("FLOW_VWAP_EXT", 0.0))
+
                     # Compute flow once (and log once). Downstream modules reuse cached values.
-                    compute_flow_signal(features_raw, log=True)
+                    compute_flow_signal(features_raw, log=True, vwap_ext_override=vwap_ext_override)
                     features_raw.update(rev_cross_feats)
                     features = FeaturePipeline.normalize_features(features_raw, scale=scale)
 
@@ -1779,11 +1831,55 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     # Combined rule signal: indicators + MTF + patterns + TA
                     rule_sig = (rule_weight_ind * ind_score) + (rule_weight_mtf * mtf_cons) + (rule_weight_pat * pat_adj) + (rule_weight_ta * ta_rule)
 
-                    # Precompute flow once (cached in features_raw) to avoid recomputation/log spam
-                    compute_flow_signal(features_raw, log=True)
                     struct_score, struct_side = compute_structure_score(features_raw)
                     features_raw["struct_side"] = int(struct_side)
                     features_raw["struct_score"] = float(struct_score)
+
+                    regime_candidate = "SIDEWAYS"
+                    reversal_risk = False
+                    trap_flag = bool(float(features_raw.get("trap_long", 0.0)) > 0.5 or float(features_raw.get("trap_short", 0.0)) > 0.5)
+                    try:
+                        regime_info = classify_regime(features_raw=features_raw)
+                        regime_candidate = str(regime_info.get("candidate") or "SIDEWAYS")
+                        reversal_risk = bool(regime_info.get("reversal_risk", False))
+                    except Exception:
+                        regime_candidate = "SIDEWAYS"
+                        reversal_risk = False
+
+                    base_regime = regime_candidate
+                    if regime_candidate.startswith("TREND") and reversal_risk:
+                        regime_candidate = "REVERSAL_RISK"
+
+                    regime_state = {"regime": "SIDEWAYS", "regime_age": 0, "vol_band": "NORMAL"}
+                    if hasattr(decision_state, "regime_state"):
+                        try:
+                            regime_state = decision_state.regime_state.update(
+                                candidate=regime_candidate,
+                                atr_1t=float(features_raw.get("atr_1t", 0.0) or 0.0),
+                            )
+                        except Exception:
+                            regime_state = {"regime": "SIDEWAYS", "regime_age": 0, "vol_band": "NORMAL"}
+
+                    regime = str(regime_state.get("regime", "SIDEWAYS"))
+                    regime_age = int(regime_state.get("regime_age", 0))
+                    vol_band = str(regime_state.get("vol_band", "NORMAL"))
+
+                    if dyn_thresholds is not None:
+                        try:
+                            prev_dyn = dict(dyn_thresholds.curr)
+                        except Exception:
+                            prev_dyn = {}
+                        dyn_values = dyn_thresholds.update(regime=regime, vol_band=vol_band, regime_age=regime_age)
+                        if isinstance(dyn_values, dict) and prev_dyn:
+                            changed = []
+                            for k, v in dyn_values.items():
+                                try:
+                                    if k in prev_dyn and abs(float(v) - float(prev_dyn.get(k))) > 1e-9:
+                                        changed.append(f"{k}={prev_dyn.get(k):.4f}->{v:.4f}")
+                                except Exception:
+                                    continue
+                            if changed:
+                                logger.info("[%s] [DYN-THRESH] regime=%s age=%d vol=%s | %s", name, regime, regime_age, vol_band, ", ".join(changed))
 
                     rule_signals = {
                         "rule_sig": float(rule_sig),
@@ -1797,6 +1893,12 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         "indicator_score": float(ind_score),
                         "pattern_adj": float(pat_adj),
                         "ta_rule": float(ta_rule),
+                        "regime": str(regime),
+                        "regime_age": int(regime_age),
+                        "base_regime": str(base_regime),
+                        "vol_band": str(vol_band),
+                        "reversal_risk": bool(reversal_risk),
+                        "trap_flag": bool(trap_flag),
                     }
 
                     # Hierarchy-based rule direction (flow/HTF > EMA trend > structure)
@@ -1814,7 +1916,13 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         is_bear_setup=is_bear_setup,
                         any_setup=any_setup,
                         ambiguous_setup=ambiguous_setup,
+                        dynamic_thresholds=dyn_values if isinstance(dyn_values, dict) else None,
+                        regime=regime,
+                        reversal_risk=bool(reversal_risk),
                     )
+                    rule_signals["flow_side"] = float(features_raw.get("flow_side", 0.0))
+                    rule_signals["flow_score"] = float(features_raw.get("flow_score", 0.0))
+                    rule_signals["vwap_side"] = float(features_raw.get("flow_vwap_side", 0.0))
                     if not tape_valid:
                         tape_conflict_level = "invalid"
                         tape_conflict_reasons = list(tape_conflict_reasons or []) + ["tape_invalid_data"]
@@ -1832,6 +1940,9 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         is_bull_setup=bool(is_bull_setup),
                         is_bear_setup=bool(is_bear_setup),
                         safe_df=safe_df,
+                        dynamic_thresholds=dyn_values if isinstance(dyn_values, dict) else None,
+                        regime=regime,
+                        reversal_risk=bool(reversal_risk),
                     )
 
                     teacher_tradeable = bool(decision.get('tradeable', False))
@@ -1860,6 +1971,9 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         policy_max_micro = 0.25
                     p_success_raw = None
                     p_success_cal = None
+                    p_move = None
+                    p_edge = None
+                    policy_features = None
                     if isinstance(model_pipe, PolicyPipeline) and rule_dir in ("BUY", "SELL"):
                         policy_features = compose_policy_features(
                             features=features,
@@ -1874,6 +1988,42 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                             feature_values=feat_vals,
                             teacher_dir=rule_dir,
                         )
+                    use_move_head = _safe_getenv_bool("USE_MOVE_HEAD", default=False)
+                    if use_move_head:
+                        mode = str(os.getenv("MOVE_HEAD_MODE", "proxy") or "proxy").lower().strip()
+                        fallback_proxy = _safe_getenv_bool("MOVE_HEAD_FALLBACK_PROXY", default=True)
+                        if mode == "model":
+                            if policy_features is None:
+                                policy_features = compose_policy_features(
+                                    features=features,
+                                    rule_signals=rule_signals,
+                                    gates=gates,
+                                    teacher_strength=teacher_strength,
+                                )
+                            feat_names = list(policy_features.keys())
+                            feat_vals = [policy_features[k] for k in feat_names]
+                            try:
+                                p_move = model_pipe.predict_move(
+                                    feature_names=feat_names,
+                                    feature_values=feat_vals,
+                                )
+                            except Exception:
+                                p_move = None
+                            if p_move is None and fallback_proxy:
+                                mode = "proxy"
+                        if mode == "proxy":
+                            try:
+                                rv10 = float(features_raw.get("rv_10", 0.0) or 0.0)
+                                atr1 = float(features_raw.get("atr_1t", 0.0) or 0.0)
+                            except Exception:
+                                rv10 = 0.0
+                                atr1 = 0.0
+                            try:
+                                move_k = float(os.getenv("MOVE_PROXY_ATR_MULT", "0.35") or "0.35")
+                            except Exception:
+                                move_k = 0.35
+                            if atr1 > 0 and move_k > 0:
+                                p_move = min(1.0, abs(rv10) / (move_k * atr1))
 
                     policy_authorized = False
                     override_reason = "NONE"
@@ -1883,11 +2033,33 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                             gate_reasons.append("policy_no_score")
                         else:
                             if float(p_success_cal) >= policy_min:
-                                denom = max(1e-6, 1.0 - policy_min)
-                                scale = float(np.clip((float(p_success_cal) - policy_min) / denom, 0.0, 1.0))
-                                size_mult *= scale
-                                policy_authorized = True
-                                tradeable_flag = True
+                                if use_move_head and p_move is not None:
+                                    try:
+                                        edge_min = float(os.getenv("MOVE_EDGE_MIN", "0.30") or "0.30")
+                                    except Exception:
+                                        edge_min = 0.30
+                                    p_edge = float(p_success_cal) * float(p_move)
+                                    move_edge_trend_only = _safe_getenv_bool("MOVE_EDGE_TREND_ONLY", default=True)
+                                    apply_move_gate = True
+                                    if move_edge_trend_only and lane not in ("TREND", "BREAKOUT"):
+                                        apply_move_gate = False
+                                    if apply_move_gate and p_edge < edge_min:
+                                        tradeable_flag = False
+                                        gate_reasons.append("move_edge_veto")
+                                        policy_authorized = False
+                                        override_reason = "move_edge_veto"
+                                    else:
+                                        denom = max(1e-6, 1.0 - policy_min)
+                                        scale = float(np.clip((float(p_success_cal) - policy_min) / denom, 0.0, 1.0))
+                                        size_mult *= scale
+                                        policy_authorized = True
+                                        tradeable_flag = True
+                                else:
+                                    denom = max(1e-6, 1.0 - policy_min)
+                                    scale = float(np.clip((float(p_success_cal) - policy_min) / denom, 0.0, 1.0))
+                                    size_mult *= scale
+                                    policy_authorized = True
+                                    tradeable_flag = True
                             else:
                                 override_min = float(policy_min) * float(policy_override_ratio)
                                 flow_side = int(round(float(rule_signals.get("flow_side", 0.0))))
@@ -1897,7 +2069,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                                     mtf_cons = 0.0
                                 try:
                                     htf_neutral = float(os.getenv("HTF_NEUTRAL_MIN", "0.35") or "0.35")
-                                    htf_strong_veto = float(os.getenv("HTF_STRONG_VETO_MIN", "0.60") or "0.60")
+                                    htf_strong_veto = float(os.getenv("HTF_STRONG_VETO_MIN", "0.70") or "0.70")
                                 except Exception:
                                     htf_neutral = 0.35
                                     htf_strong_veto = 0.60
@@ -1924,6 +2096,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         "[%s] [DECISION] lane=%s intent=%s tradeable=%s teacher_eligible=%s policy_auth=%s override=%s "
                         "size=%.2f score=%.3f edge_req=%.3f edge_q=%.3f str_center=%.3f str_raw=%.3f "
                         "trend_sig=%d trend_str=%.2f trigger=%s(%s) tape=%s conflict=%s would_trade_wo_soft=%s "
+                        "regime=%s reg_age=%d vol=%s rev_risk=%s "
                         "hard=%s soft=%s",
                         name,
                         lane,
@@ -1945,6 +2118,10 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         str(decision.get('tape_conflict_level', 'none')),
                         str(decision.get('conflict', 'na')),
                         bool(decision.get('would_trade_without_soft', False)),
+                        str(regime),
+                        int(regime_age),
+                        str(vol_band),
+                        bool(reversal_risk),
                         list(decision.get('hard_veto', [])),
                         list((decision.get('soft_penalties', {}) or {}).keys()),
                     )
@@ -2005,6 +2182,8 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         "teacher_strength": float(teacher_strength),
                         "policy_success_raw": float(p_success_raw) if p_success_raw is not None else None,
                         "policy_success_calib": float(p_success_cal) if p_success_cal is not None else None,
+                        "policy_move_p": float(p_move) if p_move is not None else None,
+                        "policy_edge_p": float(p_edge) if p_edge is not None else None,
                         "policy_min_success": float(policy_min),
                         "tape_valid": bool(tape_valid),
                         "ema_decision_tf": (ema_meta or {}).get("decision_tf"),
@@ -2017,7 +2196,12 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         "mtf_consensus": float(mtf.get("mtf_consensus", 0.0)) if mtf else 0.0,
                         "indicator_score": float(indicator_score) if indicator_score is not None else None,
                         "pattern_adj": float(pattern_features.get('probability_adjustment', 0.0)) if pattern_features else 0.0,
-                        "regime": "na",
+                        "regime": str(regime),
+                        "regime_age": int(regime_age),
+                        "base_regime": str(base_regime),
+                        "vol_band": str(vol_band),
+                        "reversal_risk": bool(reversal_risk),
+                        "trap_flag": bool(trap_flag),
                         "suggest_tradeable": suggest_tradeable,
                         "rule_signal": float(rule_sig) if rule_sig is not None else None,
                         "rule_direction": rule_dir,
@@ -2076,6 +2260,25 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         ),
                     )
                     logger.info(f"[{name}] {interval_min}-min {scalper_line}")
+                    prev_intent = getattr(decision_state, "_last_intent", None)
+                    prev_tradeable = bool(getattr(decision_state, "_last_tradeable", False))
+                    action_line = _scalper_action_line(
+                        intent=dir_overall,
+                        tradeable=tradeable_flag,
+                        policy_authorized=policy_authorized,
+                        reversal_risk=bool(reversal_risk),
+                        prev_intent=prev_intent,
+                        prev_tradeable=prev_tradeable,
+                        gate_reasons=gate_reasons,
+                    )
+                    logger.info(f"[{name}] {interval_min}-min {action_line}")
+                    if tradeable_flag and policy_authorized and dir_overall in ("BUY", "SELL"):
+                        logger.info(
+                            f"[{name}] {interval_min}-min [SCALPER ALERT] ENTER_{dir_overall} NOW | "
+                            f"p_success={p_success_txt} | strength={teacher_strength:.3f} | gate={gate_reason_str}"
+                        )
+                    decision_state._last_intent = dir_overall
+                    decision_state._last_tradeable = bool(tradeable_flag)
 
 
                     logger.info(
