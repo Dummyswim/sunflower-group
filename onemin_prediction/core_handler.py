@@ -5,7 +5,7 @@ Consolidates: enhanced_websocket_handler.py, microstructure_features.py, latency
 import asyncio
 import struct
 import logging
-from typing import Dict, Optional, Any, List, Tuple
+from typing import Dict, Optional, Any, List, Tuple, Callable, Awaitable
 import pandas as pd
 import numpy as np
 import base64
@@ -42,7 +42,7 @@ class UnifiedWebSocketHandler:
         logger.info("[WS] Initializing Unified WebSocket Handler (volume-free)")
 
         self.config = config
-        self.websocket = None
+        self.websocket: Optional[Any] = None
         self.authenticated = False
         self.running = True
         
@@ -67,10 +67,10 @@ class UnifiedWebSocketHandler:
 
         
         # Callbacks
-        self.on_tick = None
-        self.on_candle = None
+        self.on_tick: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+        self.on_candle: Optional[Callable[[pd.DataFrame, pd.DataFrame], Awaitable[None]]] = None
         self.on_error = None
-        self.on_preclose = None
+        self.on_preclose: Optional[Callable[[pd.DataFrame, pd.DataFrame], Awaitable[None]]] = None
 
 
         # NEW: auth state
@@ -554,8 +554,13 @@ class UnifiedWebSocketHandler:
             try:
                 if self.tick_count == 1 or (self.tick_count % 50 == 0):
                     ltp_val = float(tick_data.get('ltp', 0.0))
-                    ts = tick_data.get('timestamp')
-                    ts_str = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
+                    ts = tick_data.get("timestamp")
+                    if ts is None:
+                        ts_str = "n/a"
+                    elif hasattr(ts, "isoformat"):
+                        ts_str = ts.isoformat()
+                    else:
+                        ts_str = str(ts)
                     logger.info("[WS] Tick #%d at %s | ltp=%.4f", self.tick_count, ts_str, ltp_val)
             except Exception:
                 # Non-fatal instrumentation
@@ -740,7 +745,8 @@ class UnifiedWebSocketHandler:
         Fire a pre-close preview once per candle bucket, in the last preclose_lead_seconds before the candle boundary.
         """
         try:
-            if not getattr(self, "on_preclose", None):
+            on_preclose = self.on_preclose
+            if on_preclose is None:
                 return
             if not isinstance(self.current_candle, dict):
                 return
@@ -797,7 +803,7 @@ class UnifiedWebSocketHandler:
 
             hist = getattr(self, "candle_data", None)
             full_hist = hist.copy() if isinstance(hist, pd.DataFrame) and not hist.empty else preview.copy()
-            await self.on_preclose(preview, full_hist)
+            await on_preclose(preview, full_hist)
 
         except asyncio.CancelledError:
             raise
@@ -837,9 +843,10 @@ class UnifiedWebSocketHandler:
         try:
             if stop_running:
                 self.running = False
-            if self.websocket:
+            ws = self.websocket
+            if ws is not None:
                 try:
-                    await self.websocket.close()
+                    await ws.close()
                 except Exception:
                     pass
             logger.info("UnifiedWebSocketHandler disconnected")

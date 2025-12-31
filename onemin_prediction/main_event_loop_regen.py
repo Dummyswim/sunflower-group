@@ -639,7 +639,7 @@ def compute_setup_conditional_label(
 
 # ========== FUTURES SIDECAR FEATURE INGEST ==========
 
-_FUT_CACHE = {"mtime": None, "last_row": None, "prev_row": None}
+_FUT_CACHE: Dict[str, Any] = {"mtime": None, "last_row": None, "prev_row": None}
 
 def _read_latest_fut_features(path: str, spot_last_px: float) -> Dict[str, float]:
     """
@@ -696,10 +696,29 @@ def _read_latest_fut_features(path: str, spot_last_px: float) -> Dict[str, float
         cvd_norm = float(np.tanh(cvd_delta / max(1.0, cur_vol)))
         vol_norm = float(np.tanh(vol_delta / 10000.0))
 
-        if cur_vwap > 0.0 and spot_last_px > 0.0:
-            vwap_dev = (spot_last_px - cur_vwap) / max(1e-9, cur_vwap)
+        fut_last_px = 0.0
+        for key in ("close", "last", "ltp", "price"):
+            try:
+                val = float(last.get(key, 0.0) or 0.0)
+                if np.isfinite(val) and val > 0.0:
+                    fut_last_px = val
+                    break
+            except Exception:
+                continue
+        ref_px = fut_last_px if fut_last_px > 0.0 else spot_last_px
+        if cur_vwap > 0.0 and ref_px > 0.0:
+            vwap_dev = (ref_px - cur_vwap) / max(1e-9, cur_vwap)
         else:
             vwap_dev = 0.0
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[FUT] vwap_dev ref=%.2f fut_last=%.2f spot=%.2f vwap=%.2f -> %.5f",
+                float(ref_px),
+                float(fut_last_px),
+                float(spot_last_px),
+                float(cur_vwap),
+                float(vwap_dev),
+            )
         vwap_dev = float(np.clip(vwap_dev, -0.01, 0.01))
 
         feats.update({
@@ -720,9 +739,9 @@ def _compute_vol_features(candle_df: pd.DataFrame) -> Dict[str, float]:
             return feats
         df = candle_df.tail(30).copy()
 
-        hi = df["high"].astype(float).values
-        lo = df["low"].astype(float).values
-        cl = df["close"].astype(float).values
+        hi = df["high"].to_numpy(dtype=float)
+        lo = df["low"].to_numpy(dtype=float)
+        cl = df["close"].to_numpy(dtype=float)
 
         rng = np.maximum(0.0, hi - lo)
         feats["atr_1t"] = float(np.mean(rng[-5:])) if len(rng) >= 5 else float(np.mean(rng))
@@ -948,7 +967,7 @@ def _build_dhan_ws_url(cfg: Any) -> Optional[str]:
         tok_b64 = getattr(cfg, "dhan_access_token_b64", "") or ""
         cid_b64 = getattr(cfg, "dhan_client_id_b64", "") or ""
         if not tok_b64 or not cid_b64:
-            return None, {}
+            return None
         access_token = base64.b64decode(tok_b64).decode("utf-8")
         client_id = base64.b64decode(cid_b64).decode("utf-8")
         return ("wss://api-feed.dhan.co"
@@ -1363,7 +1382,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     logger.debug(f"[{name}] on_tick callback error (ignored): {e}")
 
             # ---------- PRE-CLOSE: STAGE FEATURES AT CURRENT CANDLE START (2-MIN HORIZON) ----------
-            async def _on_preclose_cb(preview_df: pd.DataFrame, full_df: pd.DataFrame):
+            async def _on_preclose_cb(preview_df: pd.DataFrame, full_df: pd.DataFrame):  # pyright: ignore[reportGeneralTypeIssues]
                 try:
                     nonlocal setup_ready_at
                     if preview_df is None or preview_df.empty:
@@ -2368,25 +2387,37 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         )
                         return
 
+                    def _coerce_loc(loc: Any) -> Optional[int]:
+                        if isinstance(loc, slice):
+                            if loc.start is None:
+                                return None
+                            return int(loc.start)
+                        if isinstance(loc, np.ndarray):
+                            if loc.size == 0:
+                                return None
+                            if loc.dtype == bool:
+                                idxs = np.flatnonzero(loc)
+                                return int(idxs[0]) if idxs.size else None
+                            return int(loc[0])
+                        try:
+                            return int(loc)
+                        except Exception:
+                            return None
+
                     idx_ref = None
 
                     # Prefer stepping back from the actual idx_ts position to stay on-grid.
                     try:
-                        idx_ts_loc = full_df.index.get_loc(idx_ts)
-                        if isinstance(idx_ts_loc, np.ndarray):
-                            idx_ts_loc = int(idx_ts_loc[0])
-                        idx_ts_loc = int(idx_ts_loc)
-                        idx_ref = idx_ts_loc - horizon_bars
+                        idx_ts_loc = _coerce_loc(full_df.index.get_loc(idx_ts))
+                        if idx_ts_loc is not None:
+                            idx_ref = idx_ts_loc - horizon_bars
                     except Exception:
                         idx_ref = None
 
                     # Fallback: try locating ref_ts directly (may fail if timestamps are missing)
                     if idx_ref is None:
                         try:
-                            idx_ref = full_df.index.get_loc(ref_ts)
-                            if isinstance(idx_ref, np.ndarray):
-                                idx_ref = int(idx_ref[0])
-                            idx_ref = int(idx_ref)
+                            idx_ref = _coerce_loc(full_df.index.get_loc(ref_ts))
                         except Exception:
                             idx_ref = len(full_df) - horizon_bars - 1
 
