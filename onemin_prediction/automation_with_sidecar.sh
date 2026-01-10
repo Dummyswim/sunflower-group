@@ -112,7 +112,7 @@ fi
 
 # ---------- START MAIN AUTOMATION ----------
 echo "[$(date +'%F %T')] Starting main automation..." >&2
-"${PYTHON_BIN}" "${MAIN_SCRIPT}" &> "${MAIN_LOG}" &
+"${PYTHON_BIN}" "${MAIN_SCRIPT}" &>> "${MAIN_LOG}" &
 MAIN_PID=$!
 MAIN_PGID="$(ps -o pgid= "${MAIN_PID}" 2>/dev/null | tr -d ' ' || true)"
 echo "[$(date +'%F %T')] Main automation PID=${MAIN_PID} PGID=${MAIN_PGID}" >&2

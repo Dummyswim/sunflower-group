@@ -54,17 +54,32 @@ import os
 import struct
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 import numpy as np
 import websockets
+try:
+    from websockets.exceptions import InvalidHandshake, InvalidMessage, InvalidStatusCode, ConnectionClosed
+except Exception:
+    try:
+        from websockets import InvalidHandshake, InvalidMessage, InvalidStatusCode, ConnectionClosed  # type: ignore
+    except Exception:
+        InvalidHandshake = InvalidMessage = InvalidStatusCode = ConnectionClosed = Exception
 
 from logging_setup import setup_logging2, start_dynamic_level_watcher, get_logger
 
 # IST timezone
 IST = timezone(timedelta(hours=5, minutes=30))
+
+def _build_ws_handshake_errors():
+    errors = (InvalidHandshake, InvalidMessage)
+    if isinstance(InvalidStatusCode, type) and issubclass(InvalidStatusCode, Exception):
+        errors = errors + (InvalidStatusCode,)
+    return errors
+
+_WS_HANDSHAKE_ERRORS = _build_ws_handshake_errors()
 
 
 # ==========================
@@ -185,7 +200,7 @@ class FuturesVWAPCVDClient:
         self._last_cum_vol: Optional[float] = None
         self._last_price: Optional[float] = None
         self._last_cvd_side: int = 0     # +1 = buy, -1 = sell, 0 = unknown
-        self._session_date: Optional[datetime.date] = None
+        self._session_date: Optional[date] = None
 
         # Per-candle aggregation
         self._bucket_start: Optional[datetime] = None
@@ -619,13 +634,9 @@ class FuturesVWAPCVDClient:
             except asyncio.CancelledError:
                 self.log.info("[VWAP-CVD] Run cancelled; exiting main loop.")
                 break
-            except (
-                websockets.exceptions.InvalidHandshake,
-                websockets.exceptions.InvalidMessage,
-                websockets.exceptions.InvalidStatusCode,
-            ) as e:
+            except _WS_HANDSHAKE_ERRORS as e:
                 self.log.warning("[VWAP-CVD] WS handshake failed: %s", e)
-            except websockets.exceptions.ConnectionClosed as e:
+            except ConnectionClosed as e:
                 self.log.warning("[VWAP-CVD] WS connection closed: %s", e)
             except Exception as e:
                 self.log.error("[VWAP-CVD] Connection or loop error: %s", e, exc_info=True)

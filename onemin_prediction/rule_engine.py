@@ -6,6 +6,7 @@ import logging
 import os
 from collections import Counter, deque
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -522,6 +523,8 @@ def compute_rule_hierarchy(
         htf_strong_veto_min = 0.60
     if dynamic_thresholds and "HTF_STRONG_VETO_MIN" in dynamic_thresholds:
         htf_strong_veto_min = float(dynamic_thresholds.get("HTF_STRONG_VETO_MIN", htf_strong_veto_min))
+    if regime == "CHOP":
+        htf_strong_veto_min = min(0.95, float(htf_strong_veto_min) * 1.15)
 
     flow_dir = 0
     if abs(float(flow_score)) >= flow_strong_min:
@@ -910,12 +913,19 @@ def decide_trade(
     fast_setup_ready = bool(_safe_float(features_raw.get('fast_setup_ready', 0.0)) > 0.5)
 
 
+    try:
+        flow_strong_min = float(os.getenv("FLOW_STRONG_MIN", "0.50") or "0.50")
+    except Exception:
+        flow_strong_min = 0.50
+    if dynamic_thresholds and "FLOW_STRONG_MIN" in dynamic_thresholds:
+        flow_strong_min = float(dynamic_thresholds.get("FLOW_STRONG_MIN", flow_strong_min))
+
     trend_signals = 0
     if ema_bias == side:
         trend_signals += 1
     if vwap_side == side:
         trend_signals += 1
-    if flow_side == side and abs(float(flow_score)) >= 0.35:
+    if flow_side == side and abs(float(flow_score)) >= float(flow_strong_min):
         trend_signals += 1
     try:
         mtf_cons = float(mtf.get('mtf_consensus', 0.0)) if mtf else 0.0
@@ -1034,6 +1044,8 @@ def decide_trade(
         lane_min = 0.50
     if dynamic_thresholds and "LANE_SCORE_MIN" in dynamic_thresholds:
         lane_min = float(dynamic_thresholds.get("LANE_SCORE_MIN", lane_min))
+    if trend_signals >= 2:
+        lane_min *= 0.90
     if lane == 'NONE' and lane_score >= lane_min:
         lane = 'SETUP' if setup_score >= trend_score else 'TREND'
         soft['lane_score_override'] = float(os.getenv('PEN_LANE_SCORE', '0.01') or '0.01')
@@ -1077,6 +1089,8 @@ def decide_trade(
             ema_chop_hard_min = 0.55
         if dynamic_thresholds and "EMA_CHOP_HARD_MIN" in dynamic_thresholds:
             ema_chop_hard_min = float(dynamic_thresholds.get("EMA_CHOP_HARD_MIN", ema_chop_hard_min))
+        if trend_signals >= 2 and trend_flow_agree:
+            ema_chop_hard_min *= 0.90
         if (not trend_flow_agree) and (not breakout_lane) and (lane_score < ema_chop_hard_min):
             hard.append('ema_chop_hard')
         else:
@@ -1084,7 +1098,8 @@ def decide_trade(
 
     require_setup = _safe_getenv_bool('REQUIRE_SETUP', default=True)
     if require_setup and lane == 'TREND':
-        soft['require_setup_no_setup'] = float(os.getenv('PEN_NO_SETUP', '0.01') or '0.01')
+        if trend_signals < 2:
+            soft['require_setup_no_setup'] = float(os.getenv('PEN_NO_SETUP', '0.01') or '0.01')
 
     try:
         min_edge = float(os.getenv('GATE_MARGIN_THR', '0.06') or '0.06')

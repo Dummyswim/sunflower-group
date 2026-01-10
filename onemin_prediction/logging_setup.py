@@ -15,7 +15,7 @@ import json
 from datetime import datetime, timezone, timedelta
 
 from pathlib import Path
-from typing import Optional, Dict, Callable, Any
+from typing import Optional, Dict, Callable, Any, Literal
 from threading import Lock, Thread
 
 
@@ -38,7 +38,7 @@ class ISTFormatter(logging.Formatter):
     No color codes - plain text output only.
     """
     
-    def __init__(self, fmt=None, datefmt=None, style='%'):
+    def __init__(self, fmt=None, datefmt=None, style: Literal["%", "{", "$"] = "%"):
         super().__init__(fmt=fmt, datefmt=datefmt, style=style)
     
     def formatTime(self, record, datefmt=None):

@@ -21,6 +21,7 @@ from logging_setup import log_every
 from policy_pipeline import PolicyPipeline
 from signal_context import build_signal_context, compose_policy_features
 from signal_log_utils import append_jsonl, validate_or_quarantine
+from dynamic_tuning import DynamicTuner, TunerConfig
 from rule_engine import (
     compute_flow_signal,
     compute_structure_score,
@@ -685,12 +686,15 @@ def _read_latest_fut_features(path: str, spot_last_px: float) -> Dict[str, float
         cur_vwap = float(last.get("session_vwap", 0.0) or 0.0)
         cur_cvd = float(last.get("cvd", 0.0) or 0.0)
         cur_vol = float(last.get("cum_volume", 0.0) or 0.0)
+        cur_candle_vol = float(last.get("volume", 0.0) or 0.0)
+        cur_tick_count = float(last.get("tick_count", 0.0) or 0.0)
 
         prev_cvd = float(prev.get("cvd", cur_cvd) or cur_cvd)
         prev_vol = float(prev.get("cum_volume", cur_vol) or cur_vol)
 
         cvd_delta = cur_cvd - prev_cvd
         vol_delta = cur_vol - prev_vol
+        candle_vol = cur_candle_vol if cur_candle_vol > 0.0 else max(0.0, vol_delta)
 
         # Bounded order-flow proxies
         cvd_norm = float(np.tanh(cvd_delta / max(1.0, cur_vol)))
@@ -726,6 +730,9 @@ def _read_latest_fut_features(path: str, spot_last_px: float) -> Dict[str, float
             "fut_vwap_dev": vwap_dev,
             "fut_cvd_delta": cvd_norm,
             "fut_vol_delta": vol_norm,
+            "fut_candle_volume": float(candle_vol),
+            "fut_cum_volume": float(cur_vol),
+            "fut_tick_count": float(cur_tick_count),
         })
     except Exception as e:
         logger.debug(f"[FUT] read_latest_fut_features failed: {e}", exc_info=True)
@@ -755,6 +762,39 @@ def _compute_vol_features(candle_df: pd.DataFrame) -> Dict[str, float]:
     except Exception as e:
         logger.debug(f"[VOL] compute_vol_features failed: {e}", exc_info=True)
     return feats
+
+
+def _apply_volume_fallback(
+    candle_df: pd.DataFrame,
+    *,
+    fut_candle_volume: Optional[float] = None,
+    allow_tick_fallback: bool = True,
+) -> pd.DataFrame:
+    if candle_df is None or candle_df.empty:
+        return candle_df
+    if "volume" not in candle_df.columns:
+        candle_df["volume"] = 0.0
+    try:
+        vol = pd.to_numeric(candle_df["volume"], errors="coerce").fillna(0.0)
+    except Exception:
+        return candle_df
+    if fut_candle_volume is not None and np.isfinite(float(fut_candle_volume)) and float(fut_candle_volume) > 0.0:
+        try:
+            idx = candle_df.index[-1]
+            if float(vol.loc[idx]) <= 0.0:
+                candle_df.loc[idx, "volume"] = float(fut_candle_volume)
+                vol = pd.to_numeric(candle_df["volume"], errors="coerce").fillna(0.0)
+        except Exception:
+            pass
+    if allow_tick_fallback and "tick_count" in candle_df.columns:
+        try:
+            ticks = pd.to_numeric(candle_df["tick_count"], errors="coerce").fillna(0.0)
+            mask = vol <= 0.0
+            if mask.any():
+                candle_df.loc[mask, "volume"] = ticks[mask]
+        except Exception:
+            pass
+    return candle_df
 
 
 def _time_of_day_features(ts: datetime) -> Dict[str, float]:
@@ -1368,6 +1408,15 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                 hyst_bars=int(os.getenv('TREND_HYST_BARS', '3') or '3'),
                 summary_every=int(os.getenv('DECISION_SUMMARY_EVERY', '50') or '50'),
             )
+            tuner_cfg = TunerConfig(
+                enabled=_safe_getenv_bool("DYN_TUNE_ENABLE", default=True),
+                path=os.getenv("DYN_TUNE_PATH", "runtime/thresholds.json"),
+                update_every=int(os.getenv("DYN_TUNE_UPDATE_EVERY", "5") or "5"),
+                min_samples=int(os.getenv("DYN_TUNE_MIN_SAMPLES", "10") or "10"),
+                step=float(os.getenv("DYN_TUNE_STEP", "0.01") or "0.01"),
+                alpha=float(os.getenv("DYN_TUNE_ALPHA", "0.15") or "0.15"),
+            )
+            tuner = DynamicTuner(tuner_cfg)
             setup_ready_at: Optional[datetime] = None  # setup READY timestamp for delayed entry
 
             async def _on_tick_cb(tick: Dict[str, Any]):
@@ -1475,7 +1524,22 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         return  # nothing to compute safely
 
                     last_px = float(prices[-1])
-# Recent candles for MTF patterns and SR bundle
+
+                    # --- Futures sidecar features (used for flow + volume proxies) ---
+                    fut_path = os.getenv("FUT_SIDECAR_PATH", "trained_models/production/fut_candles_vwap_cvd.csv")
+                    fut_feats = _read_latest_fut_features(fut_path, spot_last_px=last_px)
+                    if fut_feats:
+                        logger.debug(f"[FUT] injected futures features: {fut_feats}")
+
+                    # Apply volume fallback before TA/MTF (futures volume or tick_count proxy)
+                    fut_candle_vol = None
+                    try:
+                        fut_candle_vol = float(fut_feats.get("fut_candle_volume", 0.0)) if fut_feats else None
+                    except Exception:
+                        fut_candle_vol = None
+                    decision_df = _apply_volume_fallback(decision_df, fut_candle_volume=fut_candle_vol, allow_tick_fallback=True)
+
+                    # Recent candles for MTF patterns and SR bundle
                     safe_df = decision_df.tail(500) if isinstance(decision_df, pd.DataFrame) and not decision_df.empty else pd.DataFrame()
 
                     # TA/EMA
@@ -1568,12 +1632,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     tod_ts = current_bucket_start if isinstance(current_bucket_start, datetime) else datetime.now(IST)
                     tod_feats = _time_of_day_features(tod_ts)
 
-                    # --- NEW: futures sidecar features ---
-                    fut_path = os.getenv("FUT_SIDECAR_PATH", "trained_models/production/fut_candles_vwap_cvd.csv")
-                    fut_feats = _read_latest_fut_features(fut_path, spot_last_px=last_px)
-
-                    if fut_feats:
-                        logger.debug(f"[FUT] injected futures features: {fut_feats}")
+                    # --- Futures sidecar features already fetched above ---
 
                     # last_zscore
                     try:
@@ -2092,6 +2151,13 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                                 except Exception:
                                     htf_neutral = 0.35
                                     htf_strong_veto = 0.60
+                                if isinstance(dyn_values, dict) and "HTF_STRONG_VETO_MIN" in dyn_values:
+                                    try:
+                                        htf_strong_veto = float(dyn_values.get("HTF_STRONG_VETO_MIN", htf_strong_veto))
+                                    except Exception:
+                                        htf_strong_veto = htf_strong_veto
+                                if str(regime or "").upper().startswith("CHOP"):
+                                    htf_strong_veto = min(0.95, float(htf_strong_veto) * 1.15)
                                 side = 1 if rule_dir == "BUY" else -1
                                 flow_align = (flow_side == side)
                                 htf_align = (mtf_cons >= htf_neutral and side == 1) or (mtf_cons <= -htf_neutral and side == -1)
@@ -2103,13 +2169,16 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                                     tradeable_flag = True
                                     size_mult = min(float(size_mult), float(policy_max_micro))
                                     override_reason = "policy_micro_override"
-                                    gate_reasons.append("policy_micro_override")
+                                    if "policy_micro_override" not in gate_reasons:
+                                        gate_reasons.append("policy_micro_override")
                                 else:
                                     tradeable_flag = False
-                                    gate_reasons.append("policy_veto")
+                                    if "policy_veto" not in gate_reasons:
+                                        gate_reasons.append("policy_veto")
                     else:
                         tradeable_flag = False
-                        gate_reasons.append("teacher_ineligible")
+                        if "no_direction" not in gate_reasons and "teacher_ineligible" not in gate_reasons:
+                            gate_reasons.append("teacher_ineligible")
                     # Structured decision log (machine-readable)
                     logger.info(
                         "[%s] [DECISION] lane=%s intent=%s tradeable=%s teacher_eligible=%s policy_auth=%s override=%s "
@@ -2186,7 +2255,8 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     dir_overall = intent if intent in ("BUY", "SELL") else "FLAT"
                     if dir_overall in ("NEUTRAL", "FLAT"):
                         tradeable_flag = False
-                        gate_reasons.append("teacher_flat")
+                        if "no_direction" not in gate_reasons and "teacher_flat" not in gate_reasons:
+                            gate_reasons.append("teacher_flat")
 
                     # Signal record: prediction for close at t+2*interval
                     suggest_tradeable = bool(tradeable_flag)
@@ -2356,6 +2426,30 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
 
                     idx_ts = candle_df.index[-1]
                     row_t2 = candle_df.iloc[-1]
+                    vol_val = float(row_t2.get("volume", 0.0) or 0.0)
+                    tc_val = float(row_t2.get("tick_count", 0.0) or 0.0)
+                    if vol_val <= 0.0:
+                        fut_candle_vol = None
+                        try:
+                            fut_path = os.getenv("FUT_SIDECAR_PATH", "trained_models/production/fut_candles_vwap_cvd.csv")
+                            spot_px = float(row_t2.get("close", 0.0) or 0.0)
+                            fut_feats = _read_latest_fut_features(fut_path, spot_last_px=spot_px)
+                            fut_candle_vol = float(fut_feats.get("fut_candle_volume", 0.0)) if fut_feats else 0.0
+                        except Exception:
+                            fut_candle_vol = 0.0
+                        if fut_candle_vol and fut_candle_vol > 0.0:
+                            vol_val = float(fut_candle_vol)
+                        elif tc_val > 0.0:
+                            vol_val = float(tc_val)
+                        try:
+                            candle_df.loc[idx_ts, "volume"] = float(vol_val)
+                        except Exception:
+                            pass
+                        if isinstance(full_df, pd.DataFrame):
+                            try:
+                                full_df.loc[idx_ts, "volume"] = float(vol_val)
+                            except Exception:
+                                pass
 
                     logger.info(
                         f"[{name}] Candle closed at {idx_ts.strftime('%H:%M:%S')} | "
@@ -2363,8 +2457,8 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         f"H:{float(row_t2.get('high', 0.0)):.2f} "
                         f"L:{float(row_t2.get('low', 0.0)):.2f} "
                         f"C:{float(row_t2.get('close', 0.0)):.2f} "
-                        f"Vol:{int(row_t2.get('volume', 0)):,} "
-                        f"Ticks:{int(row_t2.get('tick_count', 0))}"
+                        f"Vol:{int(vol_val):,} "
+                        f"Ticks:{int(tc_val):,}"
                     )
 
                     # Trade-window label: horizon_min (minutes) -> bars using candle interval
@@ -2525,6 +2619,19 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         teacher_tradeable,
                         f"{policy_success_calib:.4f}" if policy_success_calib is not None else "NA",
                     )
+
+                    try:
+                        dyn_thresholds = getattr(decision_state, "dynamic_thresholds", None)
+                        tuner.update(
+                            label=str(label),
+                            intent=teacher_dir,
+                            lane=str((staged or {}).get("lane", "")),
+                            regime=str(rule_signals.get("regime", "")),
+                            dyn_thresholds=dyn_thresholds,
+                            logger=logger,
+                        )
+                    except Exception as e:
+                        logger.debug(f"[{name}] [DYN-TUNE] update skipped: {e}")
 
                     
                     # Sample weight: teach the model harder on clean setups, softer on generic window labels.

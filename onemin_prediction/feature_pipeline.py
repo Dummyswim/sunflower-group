@@ -5,7 +5,7 @@ Unified feature engineering and drift detection (probabilities-only).
 import pandas as pd
 import numpy as np
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 import logging
 
 try:
@@ -14,6 +14,43 @@ except Exception:
     ks_2samp = None
 
 logger = logging.getLogger(__name__)
+
+def _coerce_float(x: Any) -> Optional[float]:
+    try:
+        v = float(cast(Any, x))
+    except Exception:
+        return None
+    return v if np.isfinite(v) else None
+
+def _ks_2samp_stats(base: np.ndarray, live_arr: np.ndarray) -> Optional[Tuple[float, float]]:
+    if ks_2samp is None:
+        return None
+    try:
+        ks = cast(Any, ks_2samp)
+        result = ks(base, live_arr, alternative='two-sided', mode='auto')
+    except TypeError:
+        try:
+            result = ks_2samp(base, live_arr, alternative='two-sided')
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    if hasattr(result, "statistic") and hasattr(result, "pvalue"):
+        stat = getattr(result, "statistic")
+        pval = getattr(result, "pvalue")
+    elif isinstance(result, tuple) and len(result) >= 2:
+        stat, pval = result[0], result[1]
+    else:
+        return None
+
+    if isinstance(stat, tuple) or isinstance(pval, tuple):
+        return None
+    stat_f = _coerce_float(stat)
+    pval_f = _coerce_float(pval)
+    if stat_f is None or pval_f is None:
+        return None
+    return stat_f, pval_f
 
 def _safe_series(arr, min_len=1):
     try:
@@ -176,7 +213,11 @@ class TA:
     def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
         """On-Balance Volume; we’ll z-score it later."""
         try:
-            direction = np.sign(close.diff().fillna(0.0))
+            direction = pd.Series(
+                np.sign(close.diff().fillna(0.0).to_numpy()),
+                index=close.index,
+                dtype=float,
+            )
             obv = (direction * volume).cumsum()
             return obv.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         except Exception:
@@ -213,6 +254,7 @@ class TA:
             close = candle_df["close"].astype(float)
         except Exception:
             return {}
+        close_list = close.tolist()
 
         out: Dict[str, float] = {}
 
@@ -220,6 +262,8 @@ class TA:
         high = candle_df.get("high")
         low = candle_df.get("low")
         vol = candle_df.get("volume", candle_df.get("vol"))
+        if vol is None:
+            vol = candle_df.get("tick_count")
 
         if high is not None:
             high = high.astype(float)
@@ -230,15 +274,15 @@ class TA:
 
         # --- RSI14 ----------------------------------------------------------
         try:
-            rsi = TA.rsi(close, window=14)
-            out["ta_rsi14"] = float(rsi.iloc[-1]) if len(rsi) else 50.0
+            rsi = TA.rsi(close_list, period=14)
+            out["ta_rsi14"] = float(rsi)
         except Exception:
             out["ta_rsi14"] = 50.0
 
         # --- MACD (line / signal / hist) -----------------------------------
         try:
-            macd_line, macd_signal, macd_hist = TA.macd(close)
-            if len(close):
+            macd_line, macd_signal, macd_hist = TA.macd(close_list)
+            if len(close_list):
                 out["ta_macd_line"] = float(macd_line)
                 out["ta_macd_signal"] = float(macd_signal)
                 out["ta_macd_hist"] = float(np.clip(macd_hist, -5.0, 5.0))
@@ -247,8 +291,8 @@ class TA:
 
         # --- Bollinger Bands (+ %B, bandwidth) ------------------------------
         try:
-            bb_up, bb_mid, bb_low, bb_pctb, bb_bw = TA.bollinger(prices=list(close))
-            if len(close):
+            bb_up, bb_mid, bb_low, bb_pctb, bb_bw = TA.bollinger(prices=close_list)
+            if len(close_list):
                 out["ta_bb_mid"] = float(bb_mid)
                 out["ta_bb_pctb"] = float(bb_pctb)  # 0–1
                 out["ta_bb_bw"] = float(np.clip(bb_bw, 0.0, 5.0))
@@ -410,7 +454,7 @@ class FeaturePipeline:
                     tf_res = tf_res[:-1] + "min"
             except Exception:
                 tf_res = tf
-            out = df.resample(tf_res, label="left", closed="left").agg(agg)
+            out = df.resample(tf_res, label="left", closed="left").agg(cast(Any, agg))
             out = out.dropna(subset=["open", "high", "low", "close"], how="any")
             return out
         except Exception:
@@ -1586,9 +1630,13 @@ class FeaturePipeline:
                         recent = candle_df.tail(max(3, rvol_window))
                     else:
                         df = candle_df.copy()
-                        ohlc = df[["open", "high", "low", "close"]].resample(tf_res, label="left", closed="left").agg({
-                            "open": "first", "high": "max", "low": "min", "close": "last"
+                        ohlc_agg = cast(Any, {
+                            "open": "first",
+                            "high": "max",
+                            "low": "min",
+                            "close": "last",
                         })
+                        ohlc = df[["open", "high", "low", "close"]].resample(tf_res, label="left", closed="left").agg(ohlc_agg)
                         ticks = df[["tick_count"]].resample(tf_res, label="left", closed="left").sum()
                         recent = pd.concat([ohlc, ticks], axis=1).dropna(subset=["open","high","low","close"], how="any")
                         if recent.empty:
@@ -1697,8 +1745,11 @@ class FeaturePipeline:
                 live_arr = np.asarray(live_val if hasattr(live_val, '__len__') else [live_val], dtype=float)
                 if base.size == 0 or live_arr.size == 0:
                     continue
-                stat, pval = ks_2samp(base, live_arr, alternative='two-sided', mode='auto')
-                drift_stats[feat] = {'ks_stat': float(stat), 'p_value': float(pval)}
+                res = _ks_2samp_stats(base, live_arr)
+                if res is None:
+                    continue
+                stat, pval = res
+                drift_stats[feat] = {'ks_stat': stat, 'p_value': pval}
             except Exception:
                 continue
         return drift_stats

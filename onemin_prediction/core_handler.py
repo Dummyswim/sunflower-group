@@ -670,8 +670,9 @@ class UnifiedWebSocketHandler:
             h = float(max(prices))
             l = float(min(prices))
             c = float(prices[-1])
-            vol = 0  # volume-free design
             tc = int(len(prices))
+            # Volume proxy: use tick_count when real volume is unavailable.
+            vol = float(tc)
 
             # Build single-row DataFrame indexed by start_time
             row = pd.DataFrame([{
@@ -795,7 +796,7 @@ class UnifiedWebSocketHandler:
             preview = pd.DataFrame([{
                 "timestamp": start,
                 "open": o, "high": h, "low": l, "close": c,
-                "volume": 0, "tick_count": len(prices)
+                "volume": float(len(prices)), "tick_count": len(prices)
             }]).set_index("timestamp")
 
             # Mark before awaiting callback to avoid double fire on re-entry

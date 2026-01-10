@@ -73,6 +73,8 @@ def _extract_model_p_raw(val: Any) -> Optional[float]:
         p = val.get("p_success_raw")
         if p is None:
             p = val.get("policy_success_raw")
+        if p is None:
+            return None
         try:
             p = float(p)
         except Exception:
@@ -227,6 +229,14 @@ def _fit_platt(p_raw: np.ndarray, y: np.ndarray, direction: str) -> Optional[Cal
 
 
 def _write_calib(path: str, fit: CalibFit, source: str) -> None:
+    if fit.brier_after > fit.brier_before:
+        logger.warning(
+            "[CALIB] skip write for %s: brier_after %.6f > brier_before %.6f",
+            fit.direction,
+            fit.brier_after,
+            fit.brier_before,
+        )
+        return
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload = {
         "a": fit.a,

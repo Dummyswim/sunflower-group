@@ -324,7 +324,8 @@ def build_trainlog_from_cache(
             df["wick_extreme_up"], df["wick_extreme_down"] = _wick_extremes(df)
 
             # time-of-day (match live session encoding)
-            mins = (df.index.hour * 60 + df.index.minute).astype(float)
+            idx = pd.DatetimeIndex(df.index)
+            mins = (idx.hour * 60 + idx.minute).astype(float)
             mins = np.maximum(0.0, mins - (9 * 60 + 15))
             ang = (2.0 * np.pi * mins) / 375.0
             df["tod_sin"] = np.sin(ang)
