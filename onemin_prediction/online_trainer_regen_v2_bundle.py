@@ -392,8 +392,37 @@ def _train_and_promote_sync(
             "cols": len(schema),
         }
 
+    if not os.getenv("PREPROMO_MIN_HOLDOUT_ROWS"):
+        holdout_frac = float(os.getenv("PREPROMO_HOLDOUT_FRAC", "0.1") or "0.1")
+        tradeable_counts = {
+            "BUY": int(buy_data.n_rows),
+            "SELL": int(sell_data.n_rows),
+        }
+        min_dir = min(tradeable_counts.values()) if tradeable_counts else 0
+        expected = int(min_dir * holdout_frac)
+        if expected >= 500:
+            dyn_min = 500
+        else:
+            dyn_min = max(50, int(expected * 0.8))
+        os.environ["PREPROMO_MIN_HOLDOUT_ROWS"] = str(dyn_min)
+
     eval_ok, eval_report = evaluate_holdout(rows, list(policy_schema), buy_model, sell_model)
     if not eval_ok:
+        reasons = []
+        if isinstance(eval_report, dict):
+            for key in ("buy_reason", "sell_reason", "reason"):
+                val = eval_report.get(key)
+                if val:
+                    reasons.append(str(val))
+        if reasons and all(r == "holdout_too_small" for r in reasons):
+            return {
+                "status": "wait",
+                "reason": "eval_holdout_too_small",
+                "report": eval_report,
+                "rows": len(rows),
+                "buy_rows": int(buy_data.n_rows),
+                "sell_rows": int(sell_data.n_rows),
+            }
         return {"status": "error", "reason": "eval_gate_failed", "report": eval_report}
 
     notes = {
@@ -470,6 +499,17 @@ async def background_trainer_loop(
                 status = result.get("status")
                 if status == "wait":
                     report = result.get("report") or {}
+                    if result.get("reason") == "eval_holdout_too_small":
+                        min_holdout = int(os.getenv("PREPROMO_MIN_HOLDOUT_ROWS", "500") or "500")
+                        logger.info(
+                            "[TRAIN] waiting: eval holdout too small buy=%d sell=%d min=%d total=%d",
+                            int(report.get("buy_holdout", 0)),
+                            int(report.get("sell_holdout", 0)),
+                            min_holdout,
+                            int(report.get("holdout_total", 0)),
+                        )
+                        last_mtime = mtime
+                        continue
                     reasons = report.get("reasons") or []
                     if reasons:
                         live_report = report.get("live_coverage") or {}
@@ -498,7 +538,8 @@ async def background_trainer_loop(
                         except Exception:
                             logger.debug("[TRAIN] pipeline_ref replace failed", exc_info=True)
                 elif status == "error":
-                    logger.error("[TRAIN] error: %s", result.get("reason"))
+                    report = result.get("report") or {}
+                    logger.error("[TRAIN] error: %s report=%s", result.get("reason"), report)
                 elif status == "skip":
                     logger.info(
                         "[TRAIN] skipped: rows=%d buy_rows=%d sell_rows=%d cols=%d",

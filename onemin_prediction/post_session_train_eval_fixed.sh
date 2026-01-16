@@ -8,6 +8,8 @@ cd "$PROJECT_ROOT"
 # --- inputs ---
 TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-data/train_log_v3_schema_v5.jsonl}"
 LIVE_LOG_PATH="${LIVE_LOG_PATH:-data/train_log_v3_live.jsonl}"
+export TRAIN_LOG_PATH
+export LIVE_LOG_PATH
 
 POST_REBUILD_MANIFEST="${POST_REBUILD_MANIFEST:-1}"
 POST_FETCH_MISSING="${POST_FETCH_MISSING:-0}"
@@ -111,6 +113,8 @@ if [ "${POST_VERIFY_COUNTS}" = "1" ]; then
 import json
 from collections import Counter
 path="data/train_log_v3_schema_v5.jsonl"
+import os
+path = os.getenv("TRAIN_LOG_PATH", path)
 ctr_dir=Counter()
 ctr_trade=Counter()
 ctr_trade_dir=Counter()
@@ -131,6 +135,43 @@ print('teacher_dir counts:', ctr_dir)
 print('tradeable rows:', ctr_trade)
 print('tradeable by dir:', ctr_trade_dir)
 PY
+fi
+
+# --- dynamic holdout floor (only if not set) ---
+if [ -z "${PREPROMO_MIN_HOLDOUT_ROWS:-}" ]; then
+  PREPROMO_MIN_HOLDOUT_ROWS=$(
+    /home/hanumanth/Documents/pyvirtualenv/venv/bin/python3 - <<'PY'
+import json
+import os
+from collections import Counter
+
+path = os.getenv("TRAIN_LOG_PATH", "data/train_log_v3_schema_v5.jsonl")
+holdout_frac = float(os.getenv("PREPROMO_HOLDOUT_FRAC", "0.1") or "0.1")
+ctr_trade_dir = Counter()
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip().startswith("{"):
+                continue
+            rec = json.loads(line)
+            if bool(rec.get("teacher_tradeable")):
+                d = str(rec.get("teacher_dir", "")).upper()
+                ctr_trade_dir[d] += 1
+except FileNotFoundError:
+    print("50")
+    raise SystemExit(0)
+
+min_dir = min(ctr_trade_dir.get("BUY", 0), ctr_trade_dir.get("SELL", 0))
+expected = int(min_dir * holdout_frac)
+if expected >= 500:
+    val = 500
+else:
+    val = max(50, int(expected * 0.8))
+print(val)
+PY
+  )
+  export PREPROMO_MIN_HOLDOUT_ROWS
+  echo "[POST] PREPROMO_MIN_HOLDOUT_ROWS auto -> ${PREPROMO_MIN_HOLDOUT_ROWS}"
 fi
 
 # --- pick offline trainer ---
@@ -428,6 +469,75 @@ PY
 CALIB_MIN_ROWS="${CALIB_MIN_ROWS:-200}"
 echo "[POST] Calibrator refresh (min_rows=${CALIB_MIN_ROWS})…"
 /home/hanumanth/Documents/pyvirtualenv/venv/bin/python calibrator.py --log "$SCORED_TRADEABLE_LOG" --min_rows "$CALIB_MIN_ROWS" || true
+
+# --- append calib brier_eval to daily_comparison.md ---
+REPORT_PATH="${REPORT_PATH:-reports/daily_comparison.md}"
+if [ -f "${REPORT_PATH}" ]; then
+  /home/hanumanth/Documents/pyvirtualenv/venv/bin/python - <<'PY'
+import json
+import os
+from datetime import datetime
+
+report_path = os.getenv("REPORT_PATH", "reports/daily_comparison.md")
+buy_path = os.getenv("CALIB_BUY_PATH", "")
+sell_path = os.getenv("CALIB_SELL_PATH", "")
+
+def _load(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+buy = _load(buy_path)
+sell = _load(sell_path)
+if not buy or not sell:
+    raise SystemExit(0)
+
+def _fmt(val):
+    try:
+        return f"{float(val):.6f}"
+    except Exception:
+        return "NA"
+
+date = None
+for src in (buy, sell):
+    ts = src.get("generated_at")
+    if ts:
+        date = ts[:10]
+        break
+if not date:
+    date = datetime.utcnow().strftime("%Y-%m-%d")
+
+line = (
+    f"- {date}: BUY eval {_fmt(buy.get('brier_before_eval'))} -> {_fmt(buy.get('brier_after_eval'))} "
+    f"(n={int(buy.get('n_eval') or 0)}) | "
+    f"SELL eval {_fmt(sell.get('brier_before_eval'))} -> {_fmt(sell.get('brier_after_eval'))} "
+    f"(n={int(sell.get('n_eval') or 0)})"
+)
+
+try:
+    with open(report_path, "r", encoding="utf-8") as f:
+        content = f.read()
+except FileNotFoundError:
+    raise SystemExit(0)
+
+if line in content:
+    raise SystemExit(0)
+
+section = "## Calibration Health (To Track Going Forward)"
+if section not in content:
+    content = content.rstrip() + "\n\n" + section + "\n"
+    content += "- Record brier_before_eval -> brier_after_eval for BUY/SELL after each session.\n"
+    content += "- Flag any session where brier_after_eval worsens; skip calibration for that session.\n"
+
+content = content.rstrip() + "\n" + line + "\n"
+with open(report_path, "w", encoding="utf-8") as f:
+    f.write(content)
+PY
+fi
 
 # --- seed next session live log ---
 NEXT_LIVE_LOG="${NEXT_LIVE_LOG:-data/train_log_v3_live.jsonl}"

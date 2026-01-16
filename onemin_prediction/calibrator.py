@@ -151,12 +151,22 @@ class CalibFit:
     auc: float
     brier_before: float
     brier_after: float
+    brier_before_eval: Optional[float]
+    brier_after_eval: Optional[float]
+    n_eval: int
     base_rate: float
     inverted: bool
     direction: str
 
 
-def _fit_platt(p_raw: np.ndarray, y: np.ndarray, direction: str) -> Optional[CalibFit]:
+def _fit_platt(
+    p_raw: np.ndarray,
+    y: np.ndarray,
+    direction: str,
+    *,
+    eval_p: Optional[np.ndarray] = None,
+    eval_y: Optional[np.ndarray] = None,
+) -> Optional[CalibFit]:
     if LogisticRegression is None:
         logger.warning("[CALIB] sklearn not available → cannot fit calibration")
         return None
@@ -215,28 +225,49 @@ def _fit_platt(p_raw: np.ndarray, y: np.ndarray, direction: str) -> Optional[Cal
     p_fit = _sigmoid(a * x + b)
     base = float(np.mean(y)) if y.size else 0.0
 
+    brier_before = _brier(y, p_raw)
+    brier_after = _brier(y, p_fit)
+    brier_before_eval = None
+    brier_after_eval = None
+    n_eval = 0
+
+    if eval_p is not None and eval_y is not None and len(eval_y) > 0:
+        eval_p = np.asarray(eval_p, dtype=float)
+        eval_y = np.asarray(eval_y, dtype=int)
+        eval_x = _logit_clip_arr(eval_p)
+        eval_fit = _sigmoid(a * eval_x + b)
+        brier_before_eval = _brier(eval_y, eval_p)
+        brier_after_eval = _brier(eval_y, eval_fit)
+        n_eval = int(len(eval_y))
+
     return CalibFit(
         a=a,
         b=b,
         n=n,
         auc=float(auc),
-        brier_before=_brier(y, p_raw),
-        brier_after=_brier(y, p_fit),
+        brier_before=brier_before,
+        brier_after=brier_after,
+        brier_before_eval=brier_before_eval,
+        brier_after_eval=brier_after_eval,
+        n_eval=n_eval,
         base_rate=base,
         inverted=inverted,
         direction=str(direction).upper(),
     )
 
 
-def _write_calib(path: str, fit: CalibFit, source: str) -> None:
-    if fit.brier_after > fit.brier_before:
+def _write_calib(path: str, fit: CalibFit, source: str) -> bool:
+    tol = float(os.getenv("CALIB_IMPROVE_TOL", "0.0") or "0.0")
+    before = fit.brier_before_eval if fit.brier_before_eval is not None else fit.brier_before
+    after = fit.brier_after_eval if fit.brier_after_eval is not None else fit.brier_after
+    if after > (before + tol):
         logger.warning(
             "[CALIB] skip write for %s: brier_after %.6f > brier_before %.6f",
             fit.direction,
-            fit.brier_after,
-            fit.brier_before,
+            after,
+            before,
         )
-        return
+        return False
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload = {
         "a": fit.a,
@@ -245,6 +276,9 @@ def _write_calib(path: str, fit: CalibFit, source: str) -> None:
         "auc": fit.auc,
         "brier_before": fit.brier_before,
         "brier_after": fit.brier_after,
+        "brier_before_eval": fit.brier_before_eval,
+        "brier_after_eval": fit.brier_after_eval,
+        "n_eval": fit.n_eval,
         "base_rate": fit.base_rate,
         "inverted": fit.inverted,
         "direction": fit.direction,
@@ -252,6 +286,7 @@ def _write_calib(path: str, fit: CalibFit, source: str) -> None:
         "generated_at": now,
     }
     _atomic_write_json(path, payload)
+    return True
 
 
 def _fit_direction(
@@ -260,12 +295,23 @@ def _fit_direction(
     direction: str,
     min_rows: int,
     source: str,
+    holdout_frac: float,
+    min_holdout: int,
 ) -> Optional[CalibFit]:
     p_raw, y = _extract_arrays(rows, direction=direction, require_tradeable=True)
     if len(y) < min_rows:
         logger.debug("[CALIB] %s skipped: n=%d < min_rows=%d", direction, len(y), min_rows)
         return None
-    return _fit_platt(p_raw, y, direction)
+    eval_p = None
+    eval_y = None
+    if holdout_frac > 0.0:
+        holdout_n = int(len(y) * holdout_frac)
+        if holdout_n >= min_holdout and (len(y) - holdout_n) >= min_rows:
+            eval_p = p_raw[-holdout_n:]
+            eval_y = y[-holdout_n:]
+            p_raw = p_raw[:-holdout_n]
+            y = y[:-holdout_n]
+    return _fit_platt(p_raw, y, direction, eval_p=eval_p, eval_y=eval_y)
 
 
 async def background_calibrator_loop(
@@ -279,6 +325,8 @@ async def background_calibrator_loop(
     max_rows: int = 50000,
 ):
     last_mtime = None
+    holdout_frac = float(os.getenv("CALIB_HOLDOUT_FRAC", "0.2") or "0.2")
+    min_holdout = int(os.getenv("CALIB_MIN_HOLDOUT", "50") or "50")
 
     while True:
         try:
@@ -301,18 +349,38 @@ async def background_calibrator_loop(
                 await asyncio.sleep(interval_sec)
                 continue
 
-            fit_buy = _fit_direction(rows, direction="BUY", min_rows=min_dir_rows, source=str(p))
-            fit_sell = _fit_direction(rows, direction="SELL", min_rows=min_dir_rows, source=str(p))
+            fit_buy = _fit_direction(
+                rows,
+                direction="BUY",
+                min_rows=min_dir_rows,
+                source=str(p),
+                holdout_frac=holdout_frac,
+                min_holdout=min_holdout,
+            )
+            fit_sell = _fit_direction(
+                rows,
+                direction="SELL",
+                min_rows=min_dir_rows,
+                source=str(p),
+                holdout_frac=holdout_frac,
+                min_holdout=min_holdout,
+            )
 
             if fit_buy:
-                _write_calib(calib_buy_out_path, fit_buy, source=str(p))
-                logger.info("[CALIB] BUY updated n=%d auc=%.3f", fit_buy.n, fit_buy.auc)
+                wrote = _write_calib(calib_buy_out_path, fit_buy, source=str(p))
+                if wrote:
+                    logger.info("[CALIB] BUY updated n=%d auc=%.3f", fit_buy.n, fit_buy.auc)
+                else:
+                    logger.info("[CALIB] BUY skipped (brier_after worse)")
             else:
                 logger.info("[CALIB] BUY skipped (insufficient rows/skill)")
 
             if fit_sell:
-                _write_calib(calib_sell_out_path, fit_sell, source=str(p))
-                logger.info("[CALIB] SELL updated n=%d auc=%.3f", fit_sell.n, fit_sell.auc)
+                wrote = _write_calib(calib_sell_out_path, fit_sell, source=str(p))
+                if wrote:
+                    logger.info("[CALIB] SELL updated n=%d auc=%.3f", fit_sell.n, fit_sell.auc)
+                else:
+                    logger.info("[CALIB] SELL skipped (brier_after worse)")
             else:
                 logger.info("[CALIB] SELL skipped (insufficient rows/skill)")
 
@@ -332,6 +400,8 @@ if __name__ == "__main__":
     ap.add_argument("--buy", default=os.getenv("CALIB_BUY_PATH", "calib_buy.json"))
     ap.add_argument("--sell", default=os.getenv("CALIB_SELL_PATH", "calib_sell.json"))
     ap.add_argument("--min_rows", type=int, default=int(os.getenv("CALIB_MIN_ROWS", "200") or "200"))
+    ap.add_argument("--holdout_frac", type=float, default=float(os.getenv("CALIB_HOLDOUT_FRAC", "0.2") or "0.2"))
+    ap.add_argument("--min_holdout", type=int, default=int(os.getenv("CALIB_MIN_HOLDOUT", "50") or "50"))
     args = ap.parse_args()
 
     if not args.log:
@@ -341,17 +411,37 @@ if __name__ == "__main__":
     if not rows:
         raise SystemExit("no rows found")
 
-    fit_buy = _fit_direction(rows, direction="BUY", min_rows=args.min_rows, source=args.log)
-    fit_sell = _fit_direction(rows, direction="SELL", min_rows=args.min_rows, source=args.log)
+    fit_buy = _fit_direction(
+        rows,
+        direction="BUY",
+        min_rows=args.min_rows,
+        source=args.log,
+        holdout_frac=float(args.holdout_frac),
+        min_holdout=int(args.min_holdout),
+    )
+    fit_sell = _fit_direction(
+        rows,
+        direction="SELL",
+        min_rows=args.min_rows,
+        source=args.log,
+        holdout_frac=float(args.holdout_frac),
+        min_holdout=int(args.min_holdout),
+    )
 
     if fit_buy:
-        _write_calib(args.buy, fit_buy, source=args.log)
-        print(f"[CALIB] BUY written -> {args.buy}")
+        wrote = _write_calib(args.buy, fit_buy, source=args.log)
+        if wrote:
+            print(f"[CALIB] BUY written -> {args.buy}")
+        else:
+            print("[CALIB] BUY skipped (brier_after worse)")
     else:
         print("[CALIB] BUY skipped")
 
     if fit_sell:
-        _write_calib(args.sell, fit_sell, source=args.log)
-        print(f"[CALIB] SELL written -> {args.sell}")
+        wrote = _write_calib(args.sell, fit_sell, source=args.log)
+        if wrote:
+            print(f"[CALIB] SELL written -> {args.sell}")
+        else:
+            print("[CALIB] SELL skipped (brier_after worse)")
     else:
         print("[CALIB] SELL skipped")

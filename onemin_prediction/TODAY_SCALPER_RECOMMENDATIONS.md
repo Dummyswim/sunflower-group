@@ -3,6 +3,34 @@
 ## Summary
 Recent sessions (Jan8–Jan9) show SELL-heavy intent, low BUY recall, and tradeable rates under 3%. Dynamic tuning is active and futures features now show variance, but most misses are still blocked by flow gating (`no_direction`) and low-vol/reversal risk gates.
 
+## Jan 14 2026 Update (Re-eval + Trend/Chop Tune)
+### Re-eval Snapshot (Jan12/Jan13)
+- Accuracy: 37.1% / 37.5%; tradeable rate: 52.9% / 42.2% (spike vs Jan9 1.4%).
+- BUY recall improved to 50%, but SELL/FLAT recall fell (Jan12: 41% / 12%).
+- TREND_UP accuracy remains weak (Jan13 TREND_UP 0%), suggesting false trend signals.
+
+### Changes Implemented
+- Raised `BB_BW_PCTL_CHOP_MAX` to 0.30 to classify more low-width periods as CHOP.
+- Raised `DI_SPREAD_MIN` to 9.0 to require stronger DI separation before trend acceptance.
+- Defaults updated in the rule engine and main loop; dynamic multipliers still relax thresholds in TREND regimes.
+
+### Verification (Next Session + After Close)
+- During session: watch gate counts for `bb_squeeze_chop` and weak DI spread; tradeable rate should drop vs Jan12/Jan13.
+- After close: regenerate bucketized ext CSV and compare accuracy by regime (TREND_UP/SIDEWAYS/CHOP) vs Jan12/Jan13.
+- Confirm BUY hits retain positive `ctx_flow`/`vwap_dev`; downflow BUY misses should remain filtered.
+- Update `reports/daily_comparison.md` with the new session deltas.
+
+## Calib Health (Jan 15 2026)
+### Latest Calibration Snapshot
+- BUY: train n=368, holdout n=91; brier_eval 0.001834 -> 0.000015 (improved).
+- SELL: train n=300, holdout n=74; brier_eval 0.001006 -> 0.000006 (improved).
+- In-sample brier worsened; holdout-gated calibration is now the truth source.
+
+### Verification (Next Session)
+- Compare p_success_raw vs p_success_calib distribution; expect calibrated scores to be lower at mid-range.
+- Confirm tradeable rate does not collapse (watch for >20% drop vs prior session).
+- Re-run calibrator and record holdout brier; if brier_after_eval > brier_before_eval, disable calib for that session.
+
 ## Root Cause
 - Flow gating (`no_direction`) suppresses BUY when flow strength is marginal.
 - Low-vol gating (`rv_atr_low`) and reversal-risk penalties suppress early trend entries.

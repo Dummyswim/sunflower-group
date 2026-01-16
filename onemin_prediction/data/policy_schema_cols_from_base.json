@@ -158,6 +158,12 @@
     "teacher_strength",
     "lane_code",
     "conflict_code",
-    "gate_count"
+    "gate_count",
+    "ta_bb_bw_pct",
+    "ta_di_plus",
+    "ta_di_minus",
+    "ta_di_spread",
+    "ta_supertrend_dir",
+    "ta_supertrend_flip"
   ]
 }

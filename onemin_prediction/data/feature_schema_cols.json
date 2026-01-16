@@ -24,7 +24,10 @@
     "flow_side",
     "flow_vwap_side",
     "fut_cvd_delta",
+    "fut_candle_volume",
+    "fut_cum_volume",
     "fut_session_vwap",
+    "fut_tick_count",
     "fut_vol_delta",
     "fut_vwap_dev",
     "high",
@@ -143,6 +146,12 @@
     "tod_sin",
     "vwap_reversion_flag",
     "wick_extreme_down",
-    "wick_extreme_up"
+    "wick_extreme_up",
+    "ta_bb_bw_pct",
+    "ta_di_plus",
+    "ta_di_minus",
+    "ta_di_spread",
+    "ta_supertrend_dir",
+    "ta_supertrend_flip"
   ]
 }

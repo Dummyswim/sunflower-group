@@ -178,6 +178,43 @@ class TA:
             return pd.Series(dtype=float)
 
     @staticmethod
+    def adx_di(
+        high: pd.Series,
+        low: pd.Series,
+        close: pd.Series,
+        window: int = 14,
+    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """ADX with +DI/-DI (0–100)."""
+        try:
+            up_move = high.diff()
+            down_move = -low.diff()
+            plus_dm = np.where(
+                (up_move > down_move) & (up_move > 0), up_move, 0.0
+            )
+            minus_dm = np.where(
+                (down_move > up_move) & (down_move > 0), down_move, 0.0
+            )
+
+            tr1 = high - low
+            tr2 = (high - close.shift()).abs()
+            tr3 = (low - close.shift()).abs()
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+            tr_s = tr.rolling(window, min_periods=1).sum().replace(0.0, np.nan)
+            plus_di = 100.0 * pd.Series(plus_dm).rolling(window, min_periods=1).sum() / tr_s
+            minus_di = 100.0 * pd.Series(minus_dm).rolling(window, min_periods=1).sum() / tr_s
+
+            dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+            adx = dx.rolling(window, min_periods=1).mean()
+            adx = adx.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            plus_di = plus_di.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            minus_di = minus_di.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            return adx, plus_di, minus_di
+        except Exception:
+            empty = pd.Series(dtype=float)
+            return empty, empty, empty
+
+    @staticmethod
     def mfi(
         high: pd.Series,
         low: pd.Series,
@@ -222,6 +259,65 @@ class TA:
             return obv.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         except Exception:
             return pd.Series(dtype=float)
+
+    @staticmethod
+    def supertrend(
+        high: pd.Series,
+        low: pd.Series,
+        close: pd.Series,
+        window: int = 10,
+        mult: float = 3.0,
+    ) -> Tuple[pd.Series, pd.Series]:
+        """Supertrend direction (+1/-1) and flip flags (0/1)."""
+        try:
+            if high is None or low is None or close is None:
+                empty = pd.Series(dtype=float)
+                return empty, empty
+            h = high.astype(float)
+            l = low.astype(float)
+            c = close.astype(float)
+            if h.empty or l.empty or c.empty:
+                empty = pd.Series(dtype=float)
+                return empty, empty
+
+            hl2 = (h + l) / 2.0
+            tr1 = h - l
+            tr2 = (h - c.shift()).abs()
+            tr3 = (l - c.shift()).abs()
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(window, min_periods=1).mean()
+
+            basic_ub = hl2 + (mult * atr)
+            basic_lb = hl2 - (mult * atr)
+
+            final_ub = basic_ub.copy()
+            final_lb = basic_lb.copy()
+            trend = pd.Series(index=c.index, dtype=float)
+
+            trend.iloc[0] = 1.0
+            for i in range(1, len(c)):
+                if (basic_ub.iloc[i] < final_ub.iloc[i - 1]) or (c.iloc[i - 1] > final_ub.iloc[i - 1]):
+                    final_ub.iloc[i] = basic_ub.iloc[i]
+                else:
+                    final_ub.iloc[i] = final_ub.iloc[i - 1]
+
+                if (basic_lb.iloc[i] > final_lb.iloc[i - 1]) or (c.iloc[i - 1] < final_lb.iloc[i - 1]):
+                    final_lb.iloc[i] = basic_lb.iloc[i]
+                else:
+                    final_lb.iloc[i] = final_lb.iloc[i - 1]
+
+                if trend.iloc[i - 1] == -1 and c.iloc[i] > final_ub.iloc[i - 1]:
+                    trend.iloc[i] = 1.0
+                elif trend.iloc[i - 1] == 1 and c.iloc[i] < final_lb.iloc[i - 1]:
+                    trend.iloc[i] = -1.0
+                else:
+                    trend.iloc[i] = trend.iloc[i - 1]
+
+            flip = (trend != trend.shift(1)).fillna(0.0).astype(float)
+            return trend, flip
+        except Exception:
+            empty = pd.Series(dtype=float)
+            return empty, empty
 
     @staticmethod
     def _zscore_last(series: pd.Series, window: int = 100) -> float:
@@ -298,6 +394,25 @@ class TA:
                 out["ta_bb_bw"] = float(np.clip(bb_bw, 0.0, 5.0))
         except Exception:
             pass
+        try:
+            bb_win = int(os.getenv("BB_BW_PCTL_WIN", "120") or "120")
+        except Exception:
+            bb_win = 120
+        try:
+            if len(close) >= 5:
+                mid = close.rolling(window=20, min_periods=2).mean()
+                std = close.rolling(window=20, min_periods=2).std(ddof=0)
+                up = mid + (2.0 * std)
+                lo = mid - (2.0 * std)
+                bw = (up - lo) / mid.replace(0.0, np.nan)
+                bw = bw.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                last_bw = float(bw.iloc[-1])
+                win = min(len(bw), max(10, int(bb_win)))
+                window = bw.iloc[-win:]
+                pct = float((window <= last_bw).mean())
+                out["ta_bb_bw_pct"] = float(np.clip(pct, 0.0, 1.0))
+        except Exception:
+            pass
 
         # --- Stoch / CCI / ADX / MFI (need H/L[/V]) -------------------------
         if high is not None and low is not None:
@@ -318,9 +433,32 @@ class TA:
                 pass
 
             try:
-                adx = TA.adx(high, low, close)
+                adx, plus_di, minus_di = TA.adx_di(high, low, close)
                 if len(adx):
                     out["ta_adx"] = float(np.clip(adx.iloc[-1], 0.0, 100.0))
+                if len(plus_di):
+                    out["ta_di_plus"] = float(np.clip(plus_di.iloc[-1], 0.0, 100.0))
+                if len(minus_di):
+                    out["ta_di_minus"] = float(np.clip(minus_di.iloc[-1], 0.0, 100.0))
+                if len(plus_di) and len(minus_di):
+                    out["ta_di_spread"] = float(np.clip(plus_di.iloc[-1] - minus_di.iloc[-1], -100.0, 100.0))
+            except Exception:
+                pass
+
+            try:
+                st_len = int(os.getenv("SUPERTREND_ATR_LEN", "10") or "10")
+            except Exception:
+                st_len = 10
+            try:
+                st_mult = float(os.getenv("SUPERTREND_ATR_MULT", "3.0") or "3.0")
+            except Exception:
+                st_mult = 3.0
+            try:
+                st_dir, st_flip = TA.supertrend(high, low, close, window=st_len, mult=st_mult)
+                if len(st_dir):
+                    out["ta_supertrend_dir"] = float(np.clip(st_dir.iloc[-1], -1.0, 1.0))
+                if len(st_flip):
+                    out["ta_supertrend_flip"] = float(np.clip(st_flip.iloc[-1], 0.0, 1.0))
             except Exception:
                 pass
 
@@ -698,6 +836,7 @@ class FeaturePipeline:
             "ta_rsi14",
             "ta_bb_pctb",
             "ta_bb_bw",
+            "ta_bb_bw_pct",
             "mtf_consensus",
             "pattern_prob_adjustment",
             "vwap_reversion_flag",
@@ -710,9 +849,14 @@ class FeaturePipeline:
             "ta_stoch_d",
             "ta_cci",
             "ta_adx",
+            "ta_di_plus",
+            "ta_di_minus",
+            "ta_di_spread",
             "ta_mfi",
             "ta_mom14",
             "ta_obv_z",
+            "ta_supertrend_dir",
+            "ta_supertrend_flip",
         }
         if k in bounded_keys:
             return True
@@ -1257,7 +1401,15 @@ class FeaturePipeline:
         try:
             if k == "ta_rsi14":
                 return float(np.clip(v, 0.0, 100.0))
-            if k in ("ta_bb_pctb", "price_range_tightness"):
+            if k in ("ta_bb_pctb", "ta_bb_bw_pct", "price_range_tightness"):
+                return float(np.clip(v, 0.0, 1.0))
+            if k in ("ta_adx", "ta_di_plus", "ta_di_minus"):
+                return float(np.clip(v, 0.0, 100.0))
+            if k == "ta_di_spread":
+                return float(np.clip(v, -100.0, 100.0))
+            if k == "ta_supertrend_dir":
+                return float(np.clip(v, -1.0, 1.0))
+            if k == "ta_supertrend_flip":
                 return float(np.clip(v, 0.0, 1.0))
             if k == "micro_slope":
                 return float(np.clip(v, -3.0, +3.0))

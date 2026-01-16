@@ -109,6 +109,8 @@ class DynamicThresholds:
             "EMA_CHOP_HARD_MIN": 0.55,
             "GATE_MARGIN_THR": 0.06,
             "FLOW_VWAP_EXT": 0.0020,
+            "BB_BW_PCTL_CHOP_MAX": 0.30,
+            "DI_SPREAD_MIN": 9.0,
         }
         for k, dflt in defaults.items():
             raw = os.getenv(k, str(dflt))
@@ -132,6 +134,18 @@ class DynamicThresholds:
                 return 1.05
             if regime == "REVERSAL_RISK":
                 return 1.00
+        if key == "BB_BW_PCTL_CHOP_MAX":
+            if regime.startswith("TREND"):
+                return 0.80
+            if regime == "CHOP":
+                return 1.15
+            if regime == "SIDEWAYS":
+                return 1.05
+        if key == "DI_SPREAD_MIN":
+            if regime.startswith("TREND"):
+                return 0.90
+            if regime == "CHOP":
+                return 1.10
         return 1.0
 
     def _mult_for_vol(self, key: str, vol_band: str) -> float:
@@ -175,6 +189,9 @@ def classify_regime(
     vwap_side = int(round(_safe_float(features_raw.get("flow_vwap_side", 0.0), 0.0)))
     ema_chop = bool(_safe_float(features_raw.get("ema_regime_chop_5t", 0.0), 0.0) > 0.5)
     ema_bias = int(round(_safe_float(features_raw.get("ema_bias_5t", 0.0), 0.0)))
+    bb_bw_pct = _safe_float(features_raw.get("ta_bb_bw_pct", 1.0), 1.0)
+    di_spread = _safe_float(features_raw.get("ta_di_spread", 0.0), 0.0)
+    st_flip = bool(_safe_float(features_raw.get("ta_supertrend_flip", 0.0), 0.0) > 0.5)
     micro_imb = _safe_float(features_raw.get("flow_micro_imb", 0.0), 0.0)
     micro_slope = _safe_float(features_raw.get("flow_micro_slope", features_raw.get("micro_slope", 0.0)), 0.0)
     fut_cvd = _safe_float(features_raw.get("flow_fut_cvd", 0.0), 0.0)
@@ -185,9 +202,12 @@ def classify_regime(
     flow_chop_max = _safe_float(os.getenv("REGIME_FLOW_CHOP_MAX", "0.20"), 0.20)
     vwap_trend_min = _safe_float(os.getenv("REGIME_VWAP_TREND_MIN", "0.0006"), 0.0006)
     vwap_chop_max = _safe_float(os.getenv("REGIME_VWAP_CHOP_MAX", "0.0003"), 0.0003)
+    bb_chop_max = _safe_float(os.getenv("BB_BW_PCTL_CHOP_MAX", "0.30"), 0.30)
+    di_trend_min = _safe_float(os.getenv("DI_SPREAD_MIN", "9.0"), 9.0)
 
     candidate = "SIDEWAYS"
-    if ema_chop or (abs(flow_score) <= flow_chop_max and abs(vwap_dev) <= vwap_chop_max):
+    bb_chop = (bb_bw_pct <= bb_chop_max) and (abs(di_spread) < di_trend_min)
+    if ema_chop or (abs(flow_score) <= flow_chop_max and abs(vwap_dev) <= vwap_chop_max) or bb_chop:
         candidate = "CHOP"
     elif abs(flow_score) >= flow_trend_min and abs(vwap_dev) >= vwap_trend_min:
         dir_bias = ema_bias if ema_bias != 0 else _sign(flow_score)
@@ -211,6 +231,8 @@ def classify_regime(
         else:
             flip_ok = (micro_imb <= -rev_imb) or (micro_slope <= -rev_slope)
             reversal_risk = (trap_short or (flip_ok and fut_cvd <= -rev_cvd)) and (vwap_side >= 0) and (abs(vwap_dev) >= vwap_rev_min)
+    if candidate.startswith("TREND") and st_flip:
+        reversal_risk = True
 
     return {
         "candidate": candidate,
@@ -393,6 +415,9 @@ def compute_ta_rule_signal(feats: Mapping[str, float]) -> float:
         macd_hist = float(feats.get("ta_macd_hist", 0.0))
         bb_bw = float(feats.get("ta_bb_bw", 0.0))
         bb_pctb = float(feats.get("ta_bb_pctb", 0.5))
+        bb_bw_pct = float(feats.get("ta_bb_bw_pct", 0.5))
+        di_spread = float(feats.get("ta_di_spread", 0.0))
+        st_dir = int(round(float(feats.get("ta_supertrend_dir", 0.0))))
     except Exception:
         return 0.0
 
@@ -453,6 +478,21 @@ def compute_ta_rule_signal(feats: Mapping[str, float]) -> float:
             score += 0.10
         elif bb_pctb < 0.4:
             score -= 0.10
+    try:
+        di_spread_min = float(os.getenv("DI_SPREAD_MIN", "9.0"))
+    except ValueError:
+        di_spread_min = 8.0
+    if abs(di_spread) >= di_spread_min:
+        score += 0.10 if di_spread > 0 else -0.10
+    if st_dir != 0:
+        score += 0.10 if st_dir > 0 else -0.10
+
+    try:
+        bb_bw_chop = float(os.getenv("BB_BW_PCTL_CHOP_MAX", "0.30"))
+    except ValueError:
+        bb_bw_chop = 0.25
+    if bb_bw_pct <= bb_bw_chop:
+        score *= 0.70
 
     if ema_trend > 0 and fut_vwap_dev < 0:
         score *= 0.6
@@ -499,6 +539,8 @@ def compute_rule_hierarchy(
         features_raw,
         vwap_ext_override=vwap_ext_override,
     )
+    di_spread = _safe_float(features_raw.get("ta_di_spread", 0.0), 0.0)
+    st_dir = int(round(_safe_float(features_raw.get("ta_supertrend_dir", 0.0), 0.0)))
 
     try:
         mtf_cons = float(mtf.get("mtf_consensus", 0.0)) if mtf else 0.0
@@ -589,10 +631,19 @@ def compute_rule_hierarchy(
                         vwap_ext = float(os.getenv("FLOW_VWAP_EXT", "0.0020") or "0.0020")
                     except Exception:
                         vwap_ext = 0.0020
+                try:
+                    di_spread_min = float(os.getenv("DI_SPREAD_MIN", "9.0") or "9.0")
+                except Exception:
+                    di_spread_min = 8.0
+                if dynamic_thresholds and "DI_SPREAD_MIN" in dynamic_thresholds:
+                    di_spread_min = float(dynamic_thresholds.get("DI_SPREAD_MIN", di_spread_min))
                 ema_bias = int(round(_safe_float(features_raw.get("ema_bias_5t", 0.0), 0.0)))
                 ema_chop = bool(_safe_float(features_raw.get("ema_regime_chop_5t", 0.0), 0.0) > 0.5)
                 override_ok = (not ema_chop) and (abs(float(flow_score)) >= soft_flow_min) and (vwap_side == flow_dir) \
                     and (abs(float(fut_vwap)) >= float(vwap_ext)) and (ema_bias == flow_dir)
+                st_align = (st_dir == flow_dir) and (st_dir != 0)
+                di_align = (abs(di_spread) >= di_spread_min) and (_sign(di_spread) == flow_dir)
+                override_ok = override_ok or (st_align and di_align and (abs(float(flow_score)) >= soft_flow_min * 0.9))
                 if override_ok:
                     rule_dir = "BUY" if flow_dir > 0 else "SELL"
                     conflict_level = "yellow"
@@ -616,7 +667,17 @@ def compute_rule_hierarchy(
                 vwap_ext = 0.0020
             if vwap_ext_override is not None:
                 vwap_ext = float(vwap_ext_override)
+            try:
+                di_spread_min = float(os.getenv("DI_SPREAD_MIN", "9.0") or "9.0")
+            except Exception:
+                di_spread_min = 8.0
+            if dynamic_thresholds and "DI_SPREAD_MIN" in dynamic_thresholds:
+                di_spread_min = float(dynamic_thresholds.get("DI_SPREAD_MIN", di_spread_min))
+            st_align = (st_dir == flow_dir) and (st_dir != 0)
+            di_align = (abs(di_spread) >= di_spread_min) and (_sign(di_spread) == flow_dir)
             strong_flow_override = (abs(float(flow_score)) >= struct_flow_min) and (abs(float(fut_vwap)) >= vwap_ext)
+            if st_align and di_align and (abs(float(flow_score)) >= struct_flow_min * 0.9):
+                strong_flow_override = True
             if strong_flow_override:
                 rule_dir = "BUY" if flow_dir > 0 else "SELL"
                 conflict_level = "yellow"
@@ -911,6 +972,10 @@ def decide_trade(
     struct_side = int(round(_safe_float(features_raw.get('struct_side', 0.0))))
     indicator_score = _safe_float(features_raw.get('indicator_score', 0.0))
     fast_setup_ready = bool(_safe_float(features_raw.get('fast_setup_ready', 0.0)) > 0.5)
+    bb_bw_pct = _safe_float(features_raw.get('ta_bb_bw_pct', 0.5), 0.5)
+    di_spread = _safe_float(features_raw.get('ta_di_spread', 0.0), 0.0)
+    st_dir = int(round(_safe_float(features_raw.get('ta_supertrend_dir', 0.0))))
+    st_flip = bool(_safe_float(features_raw.get('ta_supertrend_flip', 0.0)) > 0.5)
 
 
     try:
@@ -919,6 +984,19 @@ def decide_trade(
         flow_strong_min = 0.50
     if dynamic_thresholds and "FLOW_STRONG_MIN" in dynamic_thresholds:
         flow_strong_min = float(dynamic_thresholds.get("FLOW_STRONG_MIN", flow_strong_min))
+    try:
+        di_spread_min = float(os.getenv("DI_SPREAD_MIN", "9.0") or "9.0")
+    except Exception:
+        di_spread_min = 8.0
+    if dynamic_thresholds and "DI_SPREAD_MIN" in dynamic_thresholds:
+        di_spread_min = float(dynamic_thresholds.get("DI_SPREAD_MIN", di_spread_min))
+    try:
+        bb_chop_max = float(os.getenv("BB_BW_PCTL_CHOP_MAX", "0.30") or "0.30")
+    except Exception:
+        bb_chop_max = 0.25
+    if dynamic_thresholds and "BB_BW_PCTL_CHOP_MAX" in dynamic_thresholds:
+        bb_chop_max = float(dynamic_thresholds.get("BB_BW_PCTL_CHOP_MAX", bb_chop_max))
+    bb_squeeze = bool(bb_bw_pct <= bb_chop_max)
 
     trend_signals = 0
     if ema_bias == side:
@@ -926,6 +1004,11 @@ def decide_trade(
     if vwap_side == side:
         trend_signals += 1
     if flow_side == side and abs(float(flow_score)) >= float(flow_strong_min):
+        trend_signals += 1
+    di_dir = _sign(di_spread)
+    if di_dir == side and abs(float(di_spread)) >= float(di_spread_min):
+        trend_signals += 1
+    if st_dir == side:
         trend_signals += 1
     try:
         mtf_cons = float(mtf.get('mtf_consensus', 0.0)) if mtf else 0.0
@@ -1035,6 +1118,10 @@ def decide_trade(
         trend_score += 0.10
     if flow_side == side:
         trend_score += 0.10
+    if di_dir == side and abs(float(di_spread)) >= float(di_spread_min):
+        trend_score += 0.10
+    if st_dir == side:
+        trend_score += 0.10
     trend_score = float(np.clip(trend_score, 0.0, 1.0))
 
     lane_score = max(setup_score, trend_score)
@@ -1046,12 +1133,16 @@ def decide_trade(
         lane_min = float(dynamic_thresholds.get("LANE_SCORE_MIN", lane_min))
     if trend_signals >= 2:
         lane_min *= 0.90
+    if bb_squeeze and lane == 'NONE':
+        lane_min *= 1.10
     if lane == 'NONE' and lane_score >= lane_min:
         lane = 'SETUP' if setup_score >= trend_score else 'TREND'
         soft['lane_score_override'] = float(os.getenv('PEN_LANE_SCORE', '0.01') or '0.01')
 
     if tape_conflict == 'yellow' and lane == 'TREND' and not trigger:
         hard.append('tape_yellow_need_trigger')
+    if bb_squeeze and lane in ('TREND', 'BREAKOUT') and not trigger:
+        hard.append('bb_squeeze_chop')
 
     if lane == 'NONE':
         hard.append('lane_score_low')
@@ -1081,7 +1172,7 @@ def decide_trade(
     if side == -1 and (vwap_side > 0 and flow_side >= 0 and abs(fut_vwap) >= vwap_ext_gate):
         hard.append('structure_conflict')
 
-    if ema_chop:
+    if ema_chop or bb_squeeze:
         trend_flow_agree = (ema_bias == side and flow_side == side)
         try:
             ema_chop_hard_min = float(os.getenv('EMA_CHOP_HARD_MIN', '0.55') or '0.55')
@@ -1132,6 +1223,10 @@ def decide_trade(
         hard.append("short_reversal_risk" if side == -1 else "long_reversal_risk")
     elif reversal_risk:
         soft["reversal_risk"] = float(os.getenv("PEN_REVERSAL_RISK", "0.02") or "0.02")
+    if st_flip and lane in ("TREND", "BREAKOUT") and (not trigger):
+        hard.append("supertrend_flip")
+    elif st_dir != 0 and st_dir != side and lane in ("TREND", "BREAKOUT"):
+        soft["supertrend_conflict"] = float(os.getenv("PEN_SUPERTREND_CONFLICT", "0.01") or "0.01")
 
     would_trade_wo_soft = (len(hard) == 0) and (lane != 'NONE') and (raw_strength >= edge_required)
     tradeable = would_trade_wo_soft and (score >= edge_required)

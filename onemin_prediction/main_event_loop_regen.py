@@ -1904,6 +1904,29 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         except Exception:
                             pat_adj = 0.0
 
+                    bb_bw_pct = _safe_float(features_raw.get("ta_bb_bw_pct", 0.5), 0.5)
+                    di_spread = _safe_float(features_raw.get("ta_di_spread", 0.0), 0.0)
+                    st_dir = int(round(_safe_float(features_raw.get("ta_supertrend_dir", 0.0), 0.0)))
+                    try:
+                        bb_chop_max = float(os.getenv("BB_BW_PCTL_CHOP_MAX", "0.30") or "0.30")
+                    except Exception:
+                        bb_chop_max = 0.25
+                    if isinstance(dyn_values, dict) and "BB_BW_PCTL_CHOP_MAX" in dyn_values:
+                        bb_chop_max = float(dyn_values.get("BB_BW_PCTL_CHOP_MAX", bb_chop_max))
+                    try:
+                        di_spread_min = float(os.getenv("DI_SPREAD_MIN", "9.0") or "9.0")
+                    except Exception:
+                        di_spread_min = 8.0
+                    if isinstance(dyn_values, dict) and "DI_SPREAD_MIN" in dyn_values:
+                        di_spread_min = float(dyn_values.get("DI_SPREAD_MIN", di_spread_min))
+                    if bb_bw_pct <= bb_chop_max:
+                        mtf_cons = float(mtf_cons) * 0.80
+                        pat_adj = float(pat_adj) * 0.80
+                    di_dir = 1 if di_spread > 0 else (-1 if di_spread < 0 else 0)
+                    if abs(di_spread) >= di_spread_min and st_dir != 0 and st_dir == di_dir:
+                        mtf_cons = float(np.clip(float(mtf_cons) * 1.10, -1.0, 1.0))
+                        pat_adj = float(np.clip(float(pat_adj) * 1.05, -0.2, 0.2))
+
                     ta_rule = compute_ta_rule_signal(features_raw)
 
                     # Combined rule signal: indicators + MTF + patterns + TA
@@ -2117,11 +2140,32 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                                     except Exception:
                                         edge_min = 0.30
                                     p_edge = float(p_success_cal) * float(p_move)
+                                    bb_bw_pct = _safe_float(features_raw.get("ta_bb_bw_pct", 0.5), 0.5)
+                                    di_spread = _safe_float(features_raw.get("ta_di_spread", 0.0), 0.0)
+                                    st_dir = int(round(_safe_float(features_raw.get("ta_supertrend_dir", 0.0), 0.0)))
+                                    try:
+                                        bb_chop_max = float(os.getenv("BB_BW_PCTL_CHOP_MAX", "0.30") or "0.30")
+                                    except Exception:
+                                        bb_chop_max = 0.25
+                                    if isinstance(dyn_values, dict) and "BB_BW_PCTL_CHOP_MAX" in dyn_values:
+                                        bb_chop_max = float(dyn_values.get("BB_BW_PCTL_CHOP_MAX", bb_chop_max))
+                                    try:
+                                        di_spread_min = float(os.getenv("DI_SPREAD_MIN", "9.0") or "9.0")
+                                    except Exception:
+                                        di_spread_min = 8.0
+                                    if isinstance(dyn_values, dict) and "DI_SPREAD_MIN" in dyn_values:
+                                        di_spread_min = float(dyn_values.get("DI_SPREAD_MIN", di_spread_min))
+                                    edge_min_adj = float(edge_min)
+                                    if bb_bw_pct <= bb_chop_max:
+                                        edge_min_adj *= 1.10
+                                    if abs(di_spread) >= di_spread_min and st_dir != 0:
+                                        edge_min_adj *= 0.90
+                                        p_edge *= 1.05
                                     move_edge_trend_only = _safe_getenv_bool("MOVE_EDGE_TREND_ONLY", default=True)
                                     apply_move_gate = True
                                     if move_edge_trend_only and lane not in ("TREND", "BREAKOUT"):
                                         apply_move_gate = False
-                                    if apply_move_gate and p_edge < edge_min:
+                                    if apply_move_gate and p_edge < edge_min_adj:
                                         tradeable_flag = False
                                         gate_reasons.append("move_edge_veto")
                                         policy_authorized = False
