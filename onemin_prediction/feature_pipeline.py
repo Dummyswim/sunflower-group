@@ -352,7 +352,15 @@ class TA:
             return {}
         close_list = close.tolist()
 
-        out: Dict[str, float] = {}
+        out: Dict[str, float] = {
+            "ta_bb_bw_pct": 0.5,
+            "ta_adx": 0.0,
+            "ta_di_plus": 0.0,
+            "ta_di_minus": 0.0,
+            "ta_di_spread": 0.0,
+            "ta_supertrend_dir": 0.0,
+            "ta_supertrend_flip": 0.0,
+        }
 
         # --- Base series ----------------------------------------------------
         high = candle_df.get("high")

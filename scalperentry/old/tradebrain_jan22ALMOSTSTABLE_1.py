@@ -1,0 +1,1633 @@
+"""
+tradebrain.py - Master Refactor v2.1 (Index-safe, price-only scalper core)
+
+Key upgrades (no volume / no broker CVD required):
+- Anchor & Pressure Engine: HMA(20) midline + ATR bands + signed distance.
+- CVD replacement: CLV (pressure), Body% (doji filter), Path Efficiency + Travel/Tick + Smoothness.
+- Shock overhaul: close-prev_close, dynamic threshold, WATCH then confirm before entry.
+- Anti-climax guard: blocks selling the bottom during absorption.
+- HMA hysteresis: 5-bar normalized slope drives bias state (prevents flip-flop).
+- Fast Exit Engine: intra-tick hard stop + intrabar SL/TP fills + BE + trailing.
+- Harvest Mode: overextension tightens trail; exits require CLV flip (no panic exits).
+
+Design goals: minimal bloat, clean condition stack, safe math, robust logging.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone, timedelta
+from logging.handlers import RotatingFileHandler
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+# --- Build Metadata ---
+DATA_MODE = "quote"
+
+_EPS = 1e-9
+IST_TZ = timezone(timedelta(hours=5, minutes=30))
+
+
+class ISTFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, IST_TZ)
+        base = dt.strftime(datefmt) if datefmt else dt.strftime("%Y-%m-%d %H:%M:%S")
+        off = dt.strftime("%z")
+        off = (off[:3] + ":" + off[3:]) if len(off) == 5 else off
+        return f"{base}{off}"
+
+
+def setup_logger(name: str, log_file: str, level: int, also_console: bool) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.handlers = []
+    logger.propagate = False
+
+    os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+
+    fmt = ISTFormatter("%(asctime)s | %(levelname)s | %(message)s")
+    fh = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+    fh.setFormatter(fmt)
+    fh.setLevel(level)
+    logger.addHandler(fh)
+
+    if also_console:
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        sh.setLevel(level)
+        logger.addHandler(sh)
+
+    return logger
+
+
+@dataclass(frozen=True)
+class TradeBrainConfig:
+    # Logging
+    log_file: str = os.getenv("TB_LOG_FILE", "logs/tradebrain.log")
+    log_level: int = logging.INFO
+    log_to_console: bool = os.getenv("TB_LOG_TO_CONSOLE", "0") == "1"
+
+    # Anchor & Trend
+    hma_period: int = int(os.getenv("TB_HMA_PERIOD", "20"))
+    atr_period: int = int(os.getenv("TB_ATR_PERIOD", "14"))
+    stretch_limit: float = float(os.getenv("TB_STRETCH_LIMIT_ATR", "2.0"))  # band = HMA ± stretch_limit*ATR
+
+    # Directionality / chop filter
+    min_path_eff_filter: float = float(os.getenv("TB_MIN_PATH_EFF_FILTER", "0.18"))  # stay flat if below
+    entry_path_eff: float = float(os.getenv("TB_ENTRY_PATH_EFF", "0.70"))  # trade only if clean
+
+    # Pressure thresholds
+    min_clv_confirm: float = float(os.getenv("TB_MIN_CLV_CONFIRM", "0.20"))  # momentum confirm
+    strong_clv: float = float(os.getenv("TB_STRONG_CLV", "0.80"))  # clean sweep pattern
+    min_body_pct: float = float(os.getenv("TB_MIN_BODY_PCT", "0.18"))  # avoid doji/indecision
+
+    # Shock system
+    shock_atr_mult: float = float(os.getenv("TB_SHOCK_ATR_MULT", "1.5"))
+    shock_points: float = float(os.getenv("TB_SHOCK_POINTS", "35.0"))
+    shock_confirm_candles: int = int(os.getenv("TB_SHOCK_CONFIRM_CANDLES", "3"))
+
+    # Exits / Trade Mgmt
+    hard_stop_points: float = float(os.getenv("TB_HARD_STOP_POINTS", "20.0"))  # intra-tick hard stop vs entry
+    tp_atr_mult: float = float(os.getenv("TB_TP_ATR_MULT", "2.5"))  # fixed TP when not runner
+    move_to_be_atr: float = float(os.getenv("TB_MOVE_TO_BE_ATR", "1.0"))
+    be_buffer_points: float = float(os.getenv("TB_BE_BUFFER_POINTS", "1.0"))
+    trail_atr: float = float(os.getenv("TB_TRAIL_ATR", "2.0"))
+    harvest_trail_atr: float = float(os.getenv("TB_HARVEST_TRAIL_ATR", "0.5"))
+    wick_threshold: float = float(os.getenv("TB_WICK_THRESHOLD", "0.30"))  # volatility-aware default
+
+    # Squeeze
+    squeeze_lookback: int = int(os.getenv("TB_SQUEEZE_LOOKBACK", "120"))
+    squeeze_pct: float = float(os.getenv("TB_SQUEEZE_PCT", "20.0"))  # bottom percentile of range
+
+    # System / IO
+    jsonl_path: str = os.getenv("TB_JSONL", "tradebrain_signal.jsonl")
+    arm_jsonl_path: str = os.getenv("TB_ARM_JSONL", "tradebrain_arm.jsonl")
+    write_all: bool = os.getenv("TB_WRITE_ALL", "1") == "1"
+    write_hold: bool = os.getenv("TB_WRITE_HOLD", "0") == "1"
+
+    # Limits
+    max_candles: int = int(os.getenv("TB_MAX_CANDLES", "240"))  # ~4 hours of 1m
+    max_ticks_per_candle: int = int(os.getenv("TB_MAX_TICKS_PER_CANDLE", "20000"))  # loop safety
+    min_ready_candles: int = int(os.getenv("TB_MIN_READY_CANDLES", "10"))
+
+    def validate(self) -> None:
+        if self.hma_period < 5:
+            raise ValueError("hma_period must be >= 5")
+        if self.atr_period < 2:
+            raise ValueError("atr_period must be >= 2")
+        if self.stretch_limit <= 0:
+            raise ValueError("stretch_limit must be > 0")
+        if not (0.0 < self.min_path_eff_filter < 1.0):
+            raise ValueError("min_path_eff_filter must be in (0,1)")
+        if not (0.0 < self.entry_path_eff < 1.0):
+            raise ValueError("entry_path_eff must be in (0,1)")
+        if not (-1.0 <= self.min_clv_confirm <= 1.0):
+            raise ValueError("min_clv_confirm must be in [-1,1]")
+        if not (0.0 < self.min_body_pct < 1.0):
+            raise ValueError("min_body_pct must be in (0,1)")
+        if not (0.0 < self.strong_clv <= 1.0):
+            raise ValueError("strong_clv must be in (0,1]")
+        if self.shock_atr_mult <= 0:
+            raise ValueError("shock_atr_mult must be > 0")
+        if self.shock_points <= 0:
+            raise ValueError("shock_points must be > 0")
+        if self.shock_confirm_candles < 1:
+            raise ValueError("shock_confirm_candles must be >= 1")
+        if self.hard_stop_points <= 0:
+            raise ValueError("hard_stop_points must be > 0")
+        if self.tp_atr_mult <= 0:
+            raise ValueError("tp_atr_mult must be > 0")
+        if self.move_to_be_atr <= 0:
+            raise ValueError("move_to_be_atr must be > 0")
+        if self.trail_atr <= 0 or self.harvest_trail_atr <= 0:
+            raise ValueError("trail_atr and harvest_trail_atr must be > 0")
+        if not (0.05 <= self.wick_threshold <= 0.90):
+            raise ValueError("wick_threshold should be in [0.05,0.90]")
+        if self.squeeze_lookback < 20:
+            raise ValueError("squeeze_lookback must be >= 20")
+        if not (1.0 <= self.squeeze_pct <= 50.0):
+            raise ValueError("squeeze_pct must be in [1,50]")
+        if self.max_candles < 50:
+            raise ValueError("max_candles must be >= 50")
+        if self.max_ticks_per_candle < 100:
+            raise ValueError("max_ticks_per_candle must be >= 100")
+        if self.min_ready_candles < 5:
+            raise ValueError("min_ready_candles must be >= 5")
+
+    @staticmethod
+    def from_env() -> "TradeBrainConfig":
+        cfg = TradeBrainConfig()
+        log_file = _env("TB_LOG_FILE", cfg.log_file, aliases=["TB_FULL_LOG_FILE"])
+        log_level = _parse_level(_env("TB_LOG_LEVEL", str(cfg.log_level), aliases=["TB_FULL_LOG_LEVEL"]))
+        log_to_console = _env_bool("TB_LOG_TO_CONSOLE", cfg.log_to_console, aliases=["TB_FULL_LOG_TO_CONSOLE"])
+
+        default_jsonl = cfg.jsonl_path
+        if not os.path.exists(default_jsonl) and os.path.exists("tradebrain_signal.jsonl"):
+            default_jsonl = "tradebrain_signal.jsonl"
+        jsonl_path = _env("TB_JSONL", default_jsonl, aliases=["TB_FULL_JSONL"])
+        arm_jsonl_path = _env("TB_ARM_JSONL", cfg.arm_jsonl_path, aliases=["TB_FULL_ARM_JSONL"])
+        write_hold = _env_bool("TB_WRITE_HOLD", cfg.write_hold, aliases=["TB_FULL_WRITE_HOLD"])
+        write_all = _env_bool("TB_WRITE_ALL", cfg.write_all, aliases=["TB_FULL_WRITE_ALL"])
+        return replace(
+            cfg,
+            log_file=log_file,
+            log_level=log_level,
+            log_to_console=log_to_console,
+            jsonl_path=jsonl_path,
+            arm_jsonl_path=arm_jsonl_path,
+            write_hold=write_hold,
+            write_all=write_all,
+        )
+
+
+@dataclass
+class EntryIntent:
+    engine: str  # "micro" | "ema915" | ...
+    side: str  # "LONG" | "SHORT"
+    entry_px: float
+    ts: datetime
+    reason: str
+    score: float  # arbitration score
+    sl_hint: Optional[float] = None
+    tp_hint: Optional[float] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Position:
+    side: str  # "LONG" or "SHORT"
+    entry_px: float
+    entry_ts: datetime
+    hard_sl: float
+    sl: float
+    tp: Optional[float]
+    best_px: float
+    is_be: bool = False
+    is_runner: bool = False
+    is_harvest: bool = False
+    trail_atr_current: float = 0.0
+    engine: str = "candle"
+    why: str = ""
+
+
+@dataclass
+class PendingShock:
+    side: str  # "LONG" or "SHORT"
+    mid_px: float
+    remaining_candles: int
+    expires_at: Optional[datetime] = None
+
+
+class TradeBrain:
+    def __init__(self, cfg: TradeBrainConfig, log: logging.Logger):
+        cfg.validate()
+        self.cfg = cfg
+        self.log = log
+
+        self._lock = threading.Lock()
+        self.candles: Deque[Dict[str, Any]] = deque(maxlen=self.cfg.max_candles)
+        self.current_candle: Optional[Dict[str, Any]] = None
+
+        self.pos: Optional[Position] = None
+        self.bias: Optional[str] = None  # "LONG" or "SHORT" or None
+        self.pending_shock: Optional[PendingShock] = None
+
+        # Diagnostic state
+        self._last_diag: Dict[str, Any] = {}
+        self._range_hist: Deque[float] = deque(maxlen=self.cfg.squeeze_lookback)
+        self._travel_hist: Deque[float] = deque(maxlen=60)  # baseline for PAV proxy
+        self._tpt_hist: Deque[float] = deque(maxlen=60)
+
+        # Tick-time microstructure engine
+        # Store arrival-ms (not feed timestamps) so 150–400ms windows are real
+        self._tbuf: Deque[Tuple[int, float]] = deque(maxlen=400)
+        self._armed: Optional[Dict[str, Any]] = None
+        self._last_vel: float = 0.0
+        self._last_ms_eval: Optional[int] = None
+        self._cooldown_until: Optional[datetime] = None
+        self._MS_EVAL_EVERY = 50
+        self._ARM_TIMEOUT_MS = 1500
+        self._COOLDOWN_MS = 3000
+        self._HOLD_FAST_MS = 150
+        self._HOLD_SLOW_MS = 400
+        self._MICRO_ATR_FALLBACK = float(getattr(cfg, "micro_atr_fallback", 12.0))
+        self._last_px: float = 0.0
+        self._TICK_SIZE = float(getattr(cfg, "tick_size", 0.05))
+        self._arm_log_key: Optional[Tuple[str, str, str]] = None
+        self._last_entry_side: Optional[str] = None
+        self._last_entry_ms: int = 0
+
+        # EMA915 tick engine state (micro-bars + EMAs)
+        self._ema915_bar_ms = int(getattr(cfg, "ema915_bar_ms", 1000))
+        self._ema915_min_angle = float(getattr(cfg, "ema915_min_angle_deg", 30.0))
+        self._ema915_max_angle = float(getattr(cfg, "ema915_max_angle_deg", 80.0))
+        self._ema915_min_angle_deg = self._ema915_min_angle
+        self._ema915_max_angle_deg = self._ema915_max_angle
+        self._ema915_slope_lb = int(getattr(cfg, "ema915_slope_lookback_bars", 3))
+        self._ema915_touch_pad = float(getattr(cfg, "ema915_touch_pad_pts", 0.75))
+        self._ema915_arm_timeout_ms = int(getattr(cfg, "ema915_arm_timeout_ms", 1500))
+        self._ema915_cooldown_ms = int(getattr(cfg, "ema915_cooldown_ms", 2000))
+        self._ema915_eval_every_ms = int(getattr(cfg, "ema915_eval_every_ms", 50))
+
+        self._ema915_curbar: Optional[Dict[str, Any]] = None
+        self._ema915_bars: Deque[Dict[str, Any]] = deque(maxlen=1200)
+        self._ema9: Optional[float] = None
+        self._ema15: Optional[float] = None
+        self._ema9_hist: Deque[float] = deque(maxlen=50)
+        self._ema15_hist: Deque[float] = deque(maxlen=50)
+        self._ema915_armed: Optional[Dict[str, Any]] = None
+        self._ema915_last_eval_ms: int = 0
+        self._ema915_cooldown_until_ms: int = 0
+
+        # Writer setup (safe even if jsonl_path has no directory)
+        out_dir = os.path.dirname(self.cfg.jsonl_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        arm_dir = os.path.dirname(self.cfg.arm_jsonl_path)
+        if arm_dir:
+            os.makedirs(arm_dir, exist_ok=True)
+
+        log_dir = os.path.dirname(self.cfg.log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        self._write_lock = threading.Lock()
+        self.jsonl_file = open(self.cfg.jsonl_path, "a", encoding="utf-8", buffering=1)
+        self._arm_write_lock = threading.Lock()
+        self.arm_jsonl_file = open(self.cfg.arm_jsonl_path, "a", encoding="utf-8", buffering=1)
+
+    # ------------------------ Public API ------------------------
+    def on_tick(self, tick: Dict[str, Any]) -> None:
+        self.process_tick(tick)
+
+    def process_tick(self, tick: Dict[str, Any]) -> None:
+        """Main entry point for incoming ticks. Safe under bad packets."""
+        try:
+            ltp = _safe_float(tick.get("ltp"))
+            ts = _parse_ts(tick.get("timestamp"))
+            if ltp is None or ts is None:
+                return
+
+            recv_ns = time.time_ns()
+            recv_ms = int(recv_ns // 1_000_000)
+            candle_ts = ts.replace(second=0, microsecond=0)
+
+            with self._lock:
+                # Guard against out-of-order ticks (prevents stale exits/candle corruption)
+                latest_ts = None
+                if self.current_candle is not None:
+                    latest_ts = self.current_candle.get("ts")
+                elif self.candles:
+                    latest_ts = self.candles[-1].get("ts")
+                if latest_ts is not None and candle_ts < latest_ts:
+                    return
+
+                # Kill stale shocks even if candle close is slow / feed lags
+                if self.pending_shock is not None:
+                    exp = getattr(self.pending_shock, "expires_at", None)
+                    if isinstance(exp, datetime) and _now_utc() > exp:
+                        self.pending_shock = None
+
+                # 1) Candle management (close previous minute)
+                if self.current_candle and candle_ts > self.current_candle["ts"]:
+                    self._close_candle_locked()
+
+                if self.current_candle is None:
+                    self.current_candle = {
+                        "ts": candle_ts,
+                        "open": ltp,
+                        "high": ltp,
+                        "low": ltp,
+                        "close": ltp,
+                        "ticks": 0,
+                        "total_travel": 0.0,
+                        "rv2": 0.0,
+                        "last_px": ltp,
+                    }
+
+                c = self.current_candle
+
+                # Infinite-loop / runaway safety: ignore absurd tick bursts
+                if c["ticks"] >= self.cfg.max_ticks_per_candle:
+                    # still keep close updated, but stop accumulating expensive stats
+                    c["close"] = ltp
+                    self._last_px = ltp
+                    return
+
+                delta = ltp - float(c["last_px"])
+                c["high"] = max(float(c["high"]), ltp)
+                c["low"] = min(float(c["low"]), ltp)
+                c["total_travel"] = float(c["total_travel"]) + abs(delta)
+                c["rv2"] = float(c["rv2"]) + (delta * delta)
+                c["last_px"] = ltp
+                c["close"] = ltp
+                c["ticks"] = int(c["ticks"]) + 1
+
+                self._last_px = ltp
+
+                # 2) Intra-tick exits (serialized under lock)
+                if self.pos is not None:
+                    self._check_intra_tick_exits(ltp, ts)
+
+                # 3) SignalBus arbitration (only if flat)
+                if self.pos is None:
+                    m0 = self._micro_diag_fallback_locked()
+                    prev = None
+                    if self.candles:
+                        prev = dict(self.candles[-1])
+                    elif self.current_candle and int(self.current_candle.get("ticks", 0)) >= 10:
+                        prev = dict(self.current_candle)
+
+                    intents: List[EntryIntent] = []
+                    if prev is not None:
+                        mi = self._micro_intent_locked(ltp, ts, recv_ms=recv_ms, recv_ns=recv_ns, m0=m0, prev=prev)
+                        if mi:
+                            intents.append(mi)
+
+                        ei = self._ema915_intent_locked(ltp, ts, recv_ms=recv_ms, recv_ns=recv_ns, m0=m0, prev=prev)
+                        if ei:
+                            intents.append(ei)
+
+                    winner = self._resolve_entry_intents(intents)
+                    if winner is not None:
+                        self._commit_entry_intent_locked(winner, m0)
+
+        except Exception:
+            self.log.exception("process_tick failed")
+
+    def close(self) -> None:
+        """Flush & close file handles."""
+        try:
+            with self._write_lock:
+                self.jsonl_file.flush()
+                self.jsonl_file.close()
+            with self._arm_write_lock:
+                self.arm_jsonl_file.flush()
+                self.arm_jsonl_file.close()
+        except Exception:
+            self.log.exception("close failed")
+
+    # ------------------------ Candle Close ------------------------
+    def _close_candle_locked(self) -> None:
+        """Assumes self._lock is held."""
+        if self.current_candle is None:
+            return
+
+        candle = self.current_candle
+        self.candles.append(candle)
+        self.current_candle = None
+
+        metrics = self._compute_metrics_locked()
+        metrics["_candle_ts"] = candle.get("ts")
+        decision = self._evaluate_strategy(metrics)
+
+        if self.pos is None and metrics and _is_entry_suggestion(decision.get("suggestion")):
+            side = "LONG" if "LONG" in str(decision.get("suggestion")) else "SHORT"
+            ts = metrics.get("ts")
+            if not isinstance(ts, datetime):
+                ts = _now_utc()
+            px = float(metrics.get("px", 0.0) or 0.0)
+            extra = {k: v for k, v in decision.items() if k not in ("suggestion", "reason")}
+            intent = EntryIntent(
+                engine="candle",
+                side=side,
+                entry_px=px,
+                ts=ts,
+                reason=str(decision.get("reason", "")),
+                score=1000.0,
+                sl_hint=None,
+                extra=extra,
+            )
+            self._commit_entry_intent_locked(intent, metrics)
+
+        self._write_signal(decision, metrics)
+
+    def _compute_metrics_locked(self) -> Dict[str, Any]:
+        """Compute indicators from candles. Assumes self._lock is held."""
+        if len(self.candles) < self.cfg.min_ready_candles:
+            return {}
+
+        df = pd.DataFrame(list(self.candles))
+        # Ensure required columns exist
+        for col in ("open", "high", "low", "close", "ticks", "total_travel", "rv2", "ts"):
+            if col not in df.columns:
+                return {}
+
+        close = pd.to_numeric(df["close"], errors="coerce")
+        high = pd.to_numeric(df["high"], errors="coerce")
+        low = pd.to_numeric(df["low"], errors="coerce")
+        open_ = pd.to_numeric(df["open"], errors="coerce")
+
+        if close.isna().any() or high.isna().any() or low.isna().any() or open_.isna().any():
+            return {}
+
+        # HMA series + last value
+        hma_series = _hma_series(close, self.cfg.hma_period)
+        if hma_series.isna().iloc[-1]:
+            return {}
+        hma = float(hma_series.iloc[-1])
+
+        # ATR
+        prev_close = close.shift(1).fillna(close)
+        tr = np.maximum((high - low).to_numpy(), np.maximum(np.abs((high - prev_close).to_numpy()), np.abs((low - prev_close).to_numpy())))
+        tr_s = pd.Series(tr, index=df.index)
+        atr = float(tr_s.rolling(self.cfg.atr_period, min_periods=1).mean().iloc[-1])
+        if not _is_finite_pos(atr):
+            return {}
+
+        curr_px = float(close.iloc[-1])
+
+        # Signed anchor distance & bands
+        dist_signed = (curr_px - hma) / atr
+        dist_abs = abs(dist_signed)
+        upper_band = hma + self.cfg.stretch_limit * atr
+        lower_band = hma - self.cfg.stretch_limit * atr
+
+        # Pressure (CLV) + body%
+        rng = max(self._TICK_SIZE, float(high.iloc[-1] - low.iloc[-1]))
+        clv = float((2.0 * curr_px - float(high.iloc[-1]) - float(low.iloc[-1])) / rng)
+        body_pct = float(abs(curr_px - float(open_.iloc[-1])) / rng)
+
+        # Wick %
+        upper_wick = float(high.iloc[-1] - max(open_.iloc[-1], close.iloc[-1]))
+        lower_wick = float(min(open_.iloc[-1], close.iloc[-1]) - low.iloc[-1])
+        upper_wick_pct = float(upper_wick / rng)
+        lower_wick_pct = float(lower_wick / rng)
+
+        # Efficiency metrics (price-only)
+        last = self.candles[-1]
+        total_travel = float(last.get("total_travel", 0.0))
+        ticks = int(last.get("ticks", 0))
+
+        path_eff = float(abs(curr_px - float(last.get("open", curr_px))) / max(_EPS, total_travel))
+        travel_per_tick = float(total_travel / max(1, ticks))
+
+        rv2 = float(last.get("rv2", 0.0))
+        smoothness = float(abs(curr_px - float(last.get("open", curr_px))) / max(_EPS, math.sqrt(max(_EPS, rv2))))
+
+        # PAV proxy (travel vs baseline)
+        self._travel_hist.append(total_travel)
+        baseline_travel = float(np.mean(self._travel_hist)) if len(self._travel_hist) >= 10 else max(_EPS, total_travel)
+        pav_mult = float(total_travel / max(_EPS, baseline_travel))
+
+        self._tpt_hist.append(travel_per_tick)
+        avg_tpt = float(np.mean(self._tpt_hist)) if len(self._tpt_hist) >= 10 else travel_per_tick
+
+        # Squeeze: candle range bottom percentile of lookback
+        curr_range = float(high.iloc[-1] - low.iloc[-1])
+        self._range_hist.append(curr_range)
+        is_squeeze = False
+        if len(self._range_hist) >= self.cfg.squeeze_lookback:
+            perc = float(np.percentile(np.array(self._range_hist, dtype=float), self.cfg.squeeze_pct))
+            is_squeeze = curr_range <= max(_EPS, perc)
+
+        # HMA hysteresis: 5-bar normalized slope
+        slope = 0.0
+        if len(hma_series) >= 6:
+            slope = float((hma_series.iloc[-1] - hma_series.iloc[-6]) / (5.0 * atr))
+
+        # Bias state update (hysteresis)
+        self.bias = _update_bias(self.bias, slope, pos_th=0.05, neg_th=-0.05)
+
+        # Shock (close - prev_close)
+        prev_c = float(close.iloc[-2])
+        shock_move = float(curr_px - prev_c)
+        shock_thresh = float(max(self.cfg.shock_points, self.cfg.shock_atr_mult * atr))
+        is_shock = abs(shock_move) >= shock_thresh
+        shock_side = "LONG" if shock_move > 0 else "SHORT"
+        shock_mid = float((prev_c + curr_px) / 2.0)
+
+        candle_ts = self.candles[-1].get("ts") if self.candles else None
+        return {
+            "px": curr_px,
+            "ts_ist": _now_iso_ist(),
+            "ts": candle_ts,
+            "hma": hma,
+            "atr": atr,
+            "upper_band": upper_band,
+            "lower_band": lower_band,
+            "anchor_dist_atr_signed": dist_signed,
+            "anchor_dist_atr_abs": dist_abs,
+            "clv": clv,
+            "body_pct": body_pct,
+            "upper_wick_pct": upper_wick_pct,
+            "lower_wick_pct": lower_wick_pct,
+            "path_eff": path_eff,
+            "travel_per_tick": travel_per_tick,
+            "avg_travel_per_tick": avg_tpt,
+            "smoothness": smoothness,
+            "pav_mult": pav_mult,
+            "squeeze": is_squeeze,
+            "bias": self.bias or "NONE",
+            "shock": is_shock,
+            "shock_side": shock_side,
+            "shock_thresh": shock_thresh,
+            "shock_mid": shock_mid,
+        }
+
+    # ------------------------ Strategy ------------------------
+    def _evaluate_strategy(self, m: Dict[str, Any]) -> Dict[str, Any]:
+        if not m:
+            return {"suggestion": "HOLD", "reason": "warmup"}
+
+        # Always keep last diag for tick engine
+        self._last_diag = m
+
+        # If in a position: manage state + candle-close exits (intrabar exits handled elsewhere)
+        if self.pos is not None:
+            return self._manage_open_position(m)
+
+        # --- FLAT: entry selection ---
+        # Global safety: doji / indecision filter
+        if m["body_pct"] < self.cfg.min_body_pct:
+            return {"suggestion": "HOLD", "reason": "doji_body"}
+
+        # Chop safety (the bullet filter)
+        if m["path_eff"] < self.cfg.min_path_eff_filter:
+            return {"suggestion": "HOLD", "reason": "chop_low_path_eff"}
+
+        # Anti-FOMO: if outside bands, block entries in that direction
+        # (If price is > upper_band, block longs; if price is < lower_band, block shorts)
+        over_up = m["px"] > m["upper_band"]
+        over_dn = m["px"] < m["lower_band"]
+
+        # Anti-climax: detect selling climax absorption and block shorts
+        anti_climax_block_short = (m["pav_mult"] > 2.5 and m["lower_wick_pct"] > 0.20)
+        anti_climax_block_long = (m["pav_mult"] > 2.5 and m["upper_wick_pct"] > 0.20)
+
+        # Shock system: WATCH, then confirm before entry
+        shock_decision = self._handle_shock_system(m)
+        if shock_decision is not None:
+            return shock_decision
+
+        # Dist gate: enter only when still "fresh" (within 1.5 ATR of anchor)
+        if m["anchor_dist_atr_abs"] > 1.5:
+            return {"suggestion": "HOLD", "reason": "too_far_from_anchor"}
+
+        # Patterns: Clean Sweep / Inside Break / Squeeze Engulfing
+        # 1) Clean Sweep (institutional-like)
+        if m["path_eff"] >= self.cfg.entry_path_eff and m["travel_per_tick"] >= (m["avg_travel_per_tick"] * 1.05):
+            if (not over_up) and (not anti_climax_block_long) and m["clv"] >= self.cfg.strong_clv and (m["bias"] == "LONG"):
+                return self._execute_entry("LONG", m, reason="clean_sweep")
+            if (not over_dn) and (not anti_climax_block_short) and m["clv"] <= -self.cfg.strong_clv and (m["bias"] == "SHORT"):
+                return self._execute_entry("SHORT", m, reason="clean_sweep")
+
+        # 2) Inside Bar Break (fresh break near anchor)
+        inside_decision = self._inside_break_entry(m, over_up, over_dn, anti_climax_block_long, anti_climax_block_short)
+        if inside_decision is not None:
+            return inside_decision
+
+        # 3) Engulfing after squeeze (expansion scalp)
+        engulf_decision = self._squeeze_engulf_entry(m, over_up, over_dn, anti_climax_block_long, anti_climax_block_short)
+        if engulf_decision is not None:
+            return engulf_decision
+
+        # Default: pressure + bias + confirm
+        if (not over_up) and (m["bias"] == "LONG") and m["clv"] >= self.cfg.min_clv_confirm and m["path_eff"] >= 0.40:
+            return self._execute_entry("LONG", m, reason="bias_pressure")
+        if (not over_dn) and (m["bias"] == "SHORT") and m["clv"] <= -self.cfg.min_clv_confirm and m["path_eff"] >= 0.40 and not anti_climax_block_short:
+            return self._execute_entry("SHORT", m, reason="bias_pressure")
+
+        # Anti-climax explicitly explains why we didn't short
+        if anti_climax_block_short:
+            return {"suggestion": "HOLD", "reason": "anti_climax_block_short"}
+
+        return {"suggestion": "HOLD", "reason": "scanning"}
+
+    def _handle_shock_system(self, m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """WATCH shock candle, then confirm in same direction with clean efficiency."""
+        now = _now_utc()
+
+        if self.pending_shock is not None:
+            if self.pending_shock.expires_at is not None and now > self.pending_shock.expires_at:
+                self.pending_shock = None
+                return {"suggestion": "HOLD", "reason": "shock_expired_time"}
+
+            self.pending_shock.remaining_candles -= 1
+            if self.pending_shock.remaining_candles <= 0:
+                self.pending_shock = None
+                return {"suggestion": "HOLD", "reason": "shock_expired"}
+
+            if self.pending_shock.side == "LONG":
+                if m["px"] > self.pending_shock.mid_px and m["path_eff"] >= self.cfg.entry_path_eff and m["clv"] >= self.cfg.min_clv_confirm:
+                    ps = self.pending_shock
+                    self.pending_shock = None
+                    return {"suggestion": "ENTRY_LONG", "reason": "shock_confirm", "shock_mid": ps.mid_px}
+            else:
+                if m["px"] < self.pending_shock.mid_px and m["path_eff"] >= self.cfg.entry_path_eff and m["clv"] <= -self.cfg.min_clv_confirm:
+                    ps = self.pending_shock
+                    self.pending_shock = None
+                    return {"suggestion": "ENTRY_SHORT", "reason": "shock_confirm", "shock_mid": ps.mid_px}
+
+            return {"suggestion": "HOLD", "reason": "watching_shock"}
+
+        if bool(m.get("shock", False)):
+            now = _now_utc()
+            self.pending_shock = PendingShock(
+                side=str(m.get("shock_side", "LONG")),
+                mid_px=float(m.get("shock_mid", m["px"])),
+                remaining_candles=self.cfg.shock_confirm_candles,
+                expires_at=now + timedelta(minutes=int(getattr(self.cfg, "shock_expiry_minutes", 3))),
+            )
+            return {"suggestion": f"WATCH_SHOCK_{self.pending_shock.side}", "reason": "shock_detected"}
+
+        return None
+
+    def _inside_break_entry(
+        self,
+        m: Dict[str, Any],
+        over_up: bool,
+        over_dn: bool,
+        anti_climax_block_long: bool,
+        anti_climax_block_short: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Break of previous candle high/low, gated within 1 ATR of anchor."""
+        if len(self.candles) < 2:
+            return None
+
+        prev = self.candles[-2]
+        prev_high = float(prev.get("high", m["px"]))
+        prev_low = float(prev.get("low", m["px"]))
+
+        # Within 1 ATR of anchor
+        if m["anchor_dist_atr_abs"] > 1.0:
+            return None
+
+        # Breakout up
+        if (not over_up) and (not anti_climax_block_long) and m["px"] > prev_high and m["bias"] == "LONG" and m["path_eff"] >= 0.40 and m["clv"] >= self.cfg.min_clv_confirm:
+            return self._execute_entry("LONG", m, reason="break_prev_high")
+
+        # Breakdown down
+        if (not over_dn) and (not anti_climax_block_short) and m["px"] < prev_low and m["bias"] == "SHORT" and m["path_eff"] >= 0.40 and m["clv"] <= -self.cfg.min_clv_confirm:
+            return self._execute_entry("SHORT", m, reason="break_prev_low")
+
+        return None
+
+    def _squeeze_engulf_entry(
+        self,
+        m: Dict[str, Any],
+        over_up: bool,
+        over_dn: bool,
+        anti_climax_block_long: bool,
+        anti_climax_block_short: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Engulfing candle after squeeze -> fast expansion scalp."""
+        if len(self.candles) < 3:
+            return None
+
+        # We approximate "after squeeze" as: previous candle range was squeezed.
+        # Since squeeze is current-candle flag, we infer previous squeeze by range percentile.
+        prev = self.candles[-2]
+        prev_range = float(prev.get("high", 0.0) - prev.get("low", 0.0))
+        if len(self._range_hist) < self.cfg.squeeze_lookback:
+            return None
+        perc = float(np.percentile(np.array(self._range_hist, dtype=float), self.cfg.squeeze_pct))
+        prev_squeeze = prev_range <= max(_EPS, perc)
+
+        if not prev_squeeze:
+            return None
+
+        prev_open = float(prev.get("open", m["px"]))
+        prev_close = float(prev.get("close", m["px"]))
+        curr_open = float(self.candles[-1].get("open", m["px"]))
+        curr_close = float(self.candles[-1].get("close", m["px"]))
+
+        # Bullish engulfing
+        bullish_engulf = (curr_close > curr_open) and (curr_close > prev_open) and (curr_open < prev_close)
+        bearish_engulf = (curr_close < curr_open) and (curr_close < prev_open) and (curr_open > prev_close)
+
+        if bullish_engulf and (not over_up) and (not anti_climax_block_long) and m["bias"] == "LONG" and m["path_eff"] >= 0.50 and m["clv"] >= self.cfg.min_clv_confirm:
+            return self._execute_entry("LONG", m, reason="squeeze_engulf")
+
+        if bearish_engulf and (not over_dn) and (not anti_climax_block_short) and m["bias"] == "SHORT" and m["path_eff"] >= 0.50 and m["clv"] <= -self.cfg.min_clv_confirm:
+            return self._execute_entry("SHORT", m, reason="squeeze_engulf")
+
+        return None
+
+    def _manage_open_position(self, m: Dict[str, Any]) -> Dict[str, Any]:
+        """Candle-close trade management. Intrabar SL/TP handled in tick engine."""
+        p = self.pos
+        if p is None:
+            return {"suggestion": "HOLD", "reason": "no_pos"}
+
+        atr = float(m.get("atr", 0.0))
+        if not _is_finite_pos(atr):
+            return {"suggestion": "HOLD", "reason": "bad_atr"}
+
+        ts_exit = m.get("_candle_ts")
+        ts_exit = ts_exit if isinstance(ts_exit, datetime) else _now_utc()
+
+        # Harvest mode: overextension switches to tighter trailing, no panic exit
+        if m["anchor_dist_atr_abs"] >= self.cfg.stretch_limit:
+            p.is_harvest = True
+            p.trail_atr_current = self.cfg.harvest_trail_atr
+        else:
+            p.is_harvest = False
+            p.trail_atr_current = self.cfg.trail_atr
+
+        # Climax take-profit (captures peak speed before bounce)
+        # Only if NOT harvest (harvest is already tight trailing)
+        if not p.is_harvest and m["pav_mult"] >= 3.0:
+            if p.side == "LONG" and m["upper_wick_pct"] >= self.cfg.wick_threshold and m["clv"] < self.cfg.min_clv_confirm:
+                self._execute_exit("EXIT_CLIMAX", px=m["px"], ts=ts_exit, reason="pav_wick_exhaust")
+                return {"suggestion": "EXIT_CLIMAX", "reason": "pav_wick_exhaust"}
+            if p.side == "SHORT" and m["lower_wick_pct"] >= self.cfg.wick_threshold and m["clv"] > -self.cfg.min_clv_confirm:
+                self._execute_exit("EXIT_CLIMAX", px=m["px"], ts=ts_exit, reason="pav_wick_exhaust")
+                return {"suggestion": "EXIT_CLIMAX", "reason": "pav_wick_exhaust"}
+
+        # Wick rejection (volatility-aware)
+        if p.side == "LONG" and m["upper_wick_pct"] >= self.cfg.wick_threshold and m["clv"] < self.cfg.min_clv_confirm:
+            self._execute_exit("EXIT_WICK", px=m["px"], ts=ts_exit, reason="wick_reject")
+            return {"suggestion": "EXIT_WICK", "reason": "wick_reject"}
+        if p.side == "SHORT" and m["lower_wick_pct"] >= self.cfg.wick_threshold and m["clv"] > -self.cfg.min_clv_confirm:
+            self._execute_exit("EXIT_WICK", px=m["px"], ts=ts_exit, reason="wick_reject")
+            return {"suggestion": "EXIT_WICK", "reason": "wick_reject"}
+
+        # Harvest mode exit requires CLV flip (lets blow-off continue)
+        if p.is_harvest:
+            if p.side == "LONG" and m["clv"] <= -self.cfg.min_clv_confirm:
+                self._execute_exit("EXIT_HARVEST", px=m["px"], ts=ts_exit, reason="clv_flip")
+                return {"suggestion": "EXIT_HARVEST", "reason": "clv_flip"}
+            if p.side == "SHORT" and m["clv"] >= self.cfg.min_clv_confirm:
+                self._execute_exit("EXIT_HARVEST", px=m["px"], ts=ts_exit, reason="clv_flip")
+                return {"suggestion": "EXIT_HARVEST", "reason": "clv_flip"}
+
+        return {"suggestion": "HOLD", "reason": "manage_pos"}
+
+    # ------------------------ Execution ------------------------
+    def _execute_entry(
+        self,
+        side: str,
+        m: Dict[str, Any],
+        reason: str = "",
+        *,
+        tick_ts: Optional[datetime] = None,
+        tick_px: Optional[float] = None,
+        engine: str = "candle",
+    ) -> Dict[str, Any]:
+        if tick_ts is not None:
+            ts = tick_ts
+        else:
+            m_ts = m.get("ts")
+            ts = m_ts if isinstance(m_ts, datetime) else _now_utc()
+        px = float(tick_px) if tick_px is not None else float(m.get("px") or self._last_px)
+
+        atr = float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK)
+        atr = max(self._TICK_SIZE, atr)
+
+        hard_min = float(self.cfg.hard_stop_points)
+        hard_mult = float(getattr(self.cfg, "hard_stop_atr_mult", 1.5))
+        hard_pts = max(hard_min, hard_mult * atr)
+        tp_pts = float(self.cfg.tp_atr_mult * atr)
+
+        hard_sl = (px - hard_pts) if side == "LONG" else (px + hard_pts)
+        sl = hard_sl
+        tp = (px + tp_pts) if side == "LONG" else (px - tp_pts)
+
+        new_pos = Position(
+            side=side,
+            entry_px=px,
+            entry_ts=ts,
+            hard_sl=hard_sl,
+            sl=sl,
+            tp=tp,
+            best_px=px,
+            is_runner=True,
+            engine=engine,
+            why=reason or "",
+        )
+
+        payload = {
+            "suggestion": f"ENTRY_{side}",
+            "channel": engine,
+            "engine": engine,
+            "in_pos": True,
+            "px": px,
+            "ts_ist": _iso_ist(ts),
+            "reason": reason or "entry",
+            "runner": True,
+            "pos_side": side,
+            "entry_px": px,
+            "sl": sl,
+            "tp": tp,
+            "stream": "signal",
+            **{k: v for k, v in m.items() if k not in ("suggestion", "px", "ts_ist", "reason")},
+        }
+
+        try:
+            with self._write_lock:
+                self.jsonl_file.write(json.dumps(payload, default=str) + "\n")
+                self.jsonl_file.flush()
+            self.pos = new_pos
+            return payload
+        except Exception:
+            self.pos = None
+            raise
+
+    def _resolve_entry_intents(self, intents: List[EntryIntent]) -> Optional[EntryIntent]:
+        if not intents:
+            return None
+        try:
+            now_ms = int(
+                max(
+                    (i.extra.get("recv_ms", 0) if isinstance(i.extra, dict) else 0) for i in intents
+                )
+                or 0
+            )
+        except Exception:
+            now_ms = 0
+
+        if self._last_entry_side and now_ms and (now_ms - int(self._last_entry_ms) < 30_000):
+            opp = [i for i in intents if i.side != self._last_entry_side]
+            same = [i for i in intents if i.side == self._last_entry_side]
+            if opp and same:
+                best_opp = max(opp, key=lambda x: float(x.score))
+                best_same = max(same, key=lambda x: float(x.score))
+                if float(best_opp.score) < float(best_same.score) + 1500.0:
+                    return None
+        pref = {"micro": 2, "ema915": 1}
+        intents.sort(key=lambda x: (x.score, pref.get(x.engine, 0)), reverse=True)
+        return intents[0]
+
+    def _commit_entry_intent_locked(self, intent: EntryIntent, m0: Dict[str, Any]) -> None:
+        extra = dict(m0)
+        extra.update(intent.extra)
+        self._execute_entry(
+            intent.side,
+            extra,
+            reason=intent.reason,
+            tick_ts=intent.ts,
+            tick_px=float(intent.entry_px),
+            engine=intent.engine,
+        )
+        try:
+            self._last_entry_side = intent.side
+            if isinstance(intent.extra, dict) and intent.extra.get("recv_ms") is not None:
+                self._last_entry_ms = int(intent.extra.get("recv_ms", self._last_entry_ms))
+            else:
+                self._last_entry_ms = int(intent.ts.timestamp() * 1000)
+        except Exception:
+            pass
+
+        # Post-commit cleanup to prevent immediate double entries
+        if intent.engine == "micro":
+            self._armed = None
+            self._cooldown_until = intent.ts + timedelta(milliseconds=self._COOLDOWN_MS)
+            self._ema915_armed = None
+            self._ema915_cooldown_until_ms = int(time.time_ns() // 1_000_000) + int(self._ema915_cooldown_ms)
+        elif intent.engine == "ema915":
+            self._ema915_armed = None
+            self._ema915_cooldown_until_ms = int(time.time_ns() // 1_000_000) + int(self._ema915_cooldown_ms)
+            self._armed = None
+            self._cooldown_until = intent.ts + timedelta(milliseconds=self._COOLDOWN_MS)
+
+    def _mk_tick_metrics(
+        self,
+        m0: Dict[str, Any],
+        ltp: float,
+        ts: datetime,
+        *,
+        recv_ms: Optional[int] = None,
+        recv_ns: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Merge slow-truth metrics with live tick edge for immediate emission."""
+        out = dict(m0 or {})
+        out["px"] = float(ltp)
+        out["ts_utc"] = ts.astimezone(timezone.utc).isoformat()
+        out["ts_ist"] = _iso_ist(ts)
+        if recv_ms is not None:
+            out["recv_ms"] = int(recv_ms)
+            try:
+                tick_ms = int(ts.astimezone(timezone.utc).timestamp() * 1000)
+                out["latency_ms"] = int(recv_ms) - tick_ms
+            except Exception:
+                pass
+        if recv_ns is not None:
+            out["recv_ns"] = int(recv_ns)
+        return out
+
+    def _micro_diag_fallback_locked(self) -> Dict[str, Any]:
+        """Synthesize minimal diag metrics if slow engine isn't ready."""
+        if self._last_diag:
+            return dict(self._last_diag)
+
+        atr = self._MICRO_ATR_FALLBACK
+        if len(self.candles) >= 2:
+            trs = []
+            start = max(1, len(self.candles) - 6)
+            for i in range(start, len(self.candles)):
+                c = self.candles[i]
+                p = self.candles[i - 1]
+                hi = float(c.get("high", 0.0))
+                lo = float(c.get("low", 0.0))
+                pc = float(p.get("close", 0.0))
+                tr = max(hi - lo, abs(hi - pc), abs(lo - pc))
+                if tr > 0:
+                    trs.append(tr)
+            if trs:
+                atr = float(np.median(trs))
+
+        return {
+            "atr": max(atr, 20.0 * 0.05),
+            "bias": "NONE",
+            "squeeze": False,
+            "path_eff": 0.0,
+        }
+
+    def _micro_vel_acc_locked(self, ms: int, ltp: float) -> Optional[Tuple[float, float]]:
+        """Compute vel/acc using arrival time (ms)."""
+        self._tbuf.append((int(ms), float(ltp)))
+        if len(self._tbuf) < 3:
+            return None
+
+        target_min, target_max = 0.4, 0.8
+        fallback_max = 5.0
+
+        best = None
+        best_err = 1e9
+
+        for ms0, p0 in self._tbuf:
+            dt = (ms - ms0) / 1000.0
+            if dt <= 0:
+                continue
+            if target_min <= dt <= target_max:
+                err = abs(dt - 0.6)
+                if err < best_err:
+                    best = (dt, p0)
+                    best_err = err
+
+        if best is None:
+            for ms0, p0 in self._tbuf:
+                dt = (ms - ms0) / 1000.0
+                if 0 < dt <= fallback_max:
+                    best = (dt, p0)
+                    break
+
+        if best is None:
+            return None
+
+        dt, p0 = best
+        vel = (ltp - p0) / max(_EPS, dt)
+
+        dt_eval = max(_EPS, self._MS_EVAL_EVERY / 1000.0)
+        acc = (vel - self._last_vel) / dt_eval
+        self._last_vel = vel
+
+        return vel, acc
+
+    def _micro_intent_locked(
+        self,
+        ltp: float,
+        ts: datetime,
+        *,
+        recv_ms: int,
+        recv_ns: int,
+        m0: Dict[str, Any],
+        prev: Dict[str, Any],
+    ) -> Optional[EntryIntent]:
+        _ = recv_ns
+        if self.pos:
+            return None
+
+        if self._last_ms_eval is not None and (recv_ms - self._last_ms_eval) < self._MS_EVAL_EVERY:
+            return None
+        self._last_ms_eval = recv_ms
+
+        if self._cooldown_until is not None and ts < self._cooldown_until:
+            return None
+
+        diag = m0 or self._micro_diag_fallback_locked()
+        atr = float(diag.get("atr", self._MICRO_ATR_FALLBACK))
+
+        out = self._micro_vel_acc_locked(recv_ms, ltp)
+        if not out:
+            return None
+        vel, acc = out
+
+        atr_per_sec = atr / 60.0
+        vel_z = vel / max(_EPS, atr_per_sec)
+        acc_z = acc / max(_EPS, atr_per_sec)
+
+        prev_h = float(prev.get("high", ltp))
+        prev_l = float(prev.get("low", ltp))
+        buffer = max(0.12 * atr, 1.0)
+
+        if self._armed is None:
+            if vel_z > 2.5 and acc_z > 0.0 and (prev_h - ltp) <= buffer:
+                self._armed = {"mode": "BREAK", "side": "LONG", "lvl": prev_h, "ms": recv_ms}
+                self._write_signal({"suggestion": "ARM_LONG", "reason": "micro_arm"}, self._mk_tick_metrics(diag, ltp, ts, recv_ms=recv_ms))
+                return None
+            if vel_z < -2.5 and acc_z < 0.0 and (ltp - prev_l) <= buffer:
+                self._armed = {"mode": "BREAK", "side": "SHORT", "lvl": prev_l, "ms": recv_ms}
+                self._write_signal({"suggestion": "ARM_SHORT", "reason": "micro_arm"}, self._mk_tick_metrics(diag, ltp, ts, recv_ms=recv_ms))
+                return None
+            return None
+
+        age_ms = float(recv_ms - int(self._armed.get("ms", recv_ms)))
+        if age_ms > self._ARM_TIMEOUT_MS:
+            self._armed = None
+            return None
+
+        lvl = float(self._armed["lvl"])
+        req_hold = self._HOLD_FAST_MS if abs(vel_z) > 4.5 else self._HOLD_SLOW_MS
+
+        if self._armed["mode"] == "BREAK":
+            if self._armed["side"] == "LONG":
+                if ltp > (lvl + buffer) and age_ms >= req_hold:
+                    extra = {"channel": "micro", "vel_z": vel_z, "acc_z": acc_z, "lvl": lvl, "recv_ms": recv_ms}
+                    return EntryIntent(
+                        engine="micro",
+                        side="LONG",
+                        entry_px=ltp,
+                        ts=ts,
+                        reason="proactive_break_accept",
+                        score=9000.0 + abs(vel_z) * 10.0,
+                        sl_hint=None,
+                        extra=extra,
+                    )
+
+                if age_ms < req_hold and ltp < (lvl - 1.5 * buffer) and vel_z < -1.0:
+                    self._armed = {"mode": "FAIL", "side": "SHORT", "lvl": lvl, "ms": recv_ms}
+                    self._write_signal(
+                        {"suggestion": "FAIL_LONG_TO_SHORT", "reason": "micro_fail_snapback"},
+                        self._mk_tick_metrics(diag, ltp, ts, recv_ms=recv_ms),
+                    )
+                    return None
+
+            else:
+                if ltp < (lvl - buffer) and age_ms >= req_hold:
+                    extra = {"channel": "micro", "vel_z": vel_z, "acc_z": acc_z, "lvl": lvl, "recv_ms": recv_ms}
+                    return EntryIntent(
+                        engine="micro",
+                        side="SHORT",
+                        entry_px=ltp,
+                        ts=ts,
+                        reason="proactive_break_accept",
+                        score=9000.0 + abs(vel_z) * 10.0,
+                        sl_hint=None,
+                        extra=extra,
+                    )
+
+                if age_ms < req_hold and ltp > (lvl + 1.5 * buffer) and vel_z > 1.0:
+                    self._armed = {"mode": "FAIL", "side": "LONG", "lvl": lvl, "ms": recv_ms}
+                    self._write_signal(
+                        {"suggestion": "FAIL_SHORT_TO_LONG", "reason": "micro_fail_snapback"},
+                        self._mk_tick_metrics(diag, ltp, ts, recv_ms=recv_ms),
+                    )
+                    return None
+
+        if self._armed["mode"] == "FAIL":
+            min_fail_hold = 100
+            fail_age = age_ms
+
+            if self._armed["side"] == "SHORT":
+                if vel_z < -1.5 and acc_z < 0 and fail_age >= min_fail_hold and ltp < (lvl - 0.75 * buffer):
+                    extra = {"channel": "micro", "vel_z": vel_z, "acc_z": acc_z, "lvl": lvl, "recv_ms": recv_ms}
+                    return EntryIntent(
+                        engine="micro",
+                        side="SHORT",
+                        entry_px=ltp,
+                        ts=ts,
+                        reason="proactive_trap_reversal",
+                        score=9000.0 + abs(vel_z) * 10.0,
+                        sl_hint=None,
+                        extra=extra,
+                    )
+            else:
+                if vel_z > 1.5 and acc_z > 0 and fail_age >= min_fail_hold and ltp > (lvl + 0.75 * buffer):
+                    extra = {"channel": "micro", "vel_z": vel_z, "acc_z": acc_z, "lvl": lvl, "recv_ms": recv_ms}
+                    return EntryIntent(
+                        engine="micro",
+                        side="LONG",
+                        entry_px=ltp,
+                        ts=ts,
+                        reason="proactive_trap_reversal",
+                        score=9000.0 + abs(vel_z) * 10.0,
+                        sl_hint=None,
+                        extra=extra,
+                    )
+
+        return None
+
+    def _ema_update(self, prev: Optional[float], x: float, period: int) -> float:
+        a = 2.0 / (period + 1.0)
+        return x if prev is None else (a * x + (1.0 - a) * prev)
+
+    def _ema915_atr_per_bar_locked(self, m0: Dict[str, Any]) -> float:
+        atr = float(m0.get("atr", 0.0) or 0.0)
+        sec = max(1.0, self._ema915_bar_ms / 1000.0)
+        if atr > 0:
+            return max(self._TICK_SIZE, (atr / 60.0) * sec)
+
+        if len(self._ema915_bars) >= 20:
+            rs = [float(b["high"] - b["low"]) for b in list(self._ema915_bars)[-20:]]
+            rs.sort()
+            return max(self._TICK_SIZE, rs[len(rs) // 2])
+        return max(self._TICK_SIZE, (self._MICRO_ATR_FALLBACK / 60.0) * sec)
+
+    def _ema915_build_bar_locked(self, ltp: float, ts: datetime, recv_ms: int) -> Optional[Dict[str, Any]]:
+        bucket = (recv_ms // self._ema915_bar_ms) * self._ema915_bar_ms
+
+        if self._ema915_curbar is None:
+            self._ema915_curbar = {"bucket": bucket, "ts": ts, "open": ltp, "high": ltp, "low": ltp, "close": ltp}
+            return None
+
+        cb = self._ema915_curbar
+        if bucket == cb["bucket"]:
+            cb["high"] = max(float(cb["high"]), ltp)
+            cb["low"] = min(float(cb["low"]), ltp)
+            cb["close"] = ltp
+            cb["ts"] = ts
+            return None
+
+        closed = dict(cb)
+        self._ema915_bars.append(closed)
+        self._ema915_curbar = {"bucket": bucket, "ts": ts, "open": ltp, "high": ltp, "low": ltp, "close": ltp}
+        return closed
+
+    def _ema915_strong_candle_locked(self, bar: Dict[str, Any]) -> Dict[str, bool]:
+        o = float(bar["open"])
+        h = float(bar["high"])
+        l = float(bar["low"])
+        c = float(bar["close"])
+        rng = max(self._TICK_SIZE, h - l)
+        body = abs(c - o)
+        body_pct = body / rng
+        up_w = h - max(o, c)
+        dn_w = min(o, c) - l
+        up_pct = up_w / rng
+        dn_pct = dn_w / rng
+
+        bullish = c > o
+        bearish = c < o
+        big_body = body_pct >= 0.60
+        pin_bull = bullish and dn_pct >= 0.55
+        pin_bear = bearish and up_pct >= 0.55
+
+        return {"bull": bullish and (big_body or pin_bull), "bear": bearish and (big_body or pin_bear), "body_pct": body_pct}
+
+    def _ema915_angles_locked(self, atr_per_bar: float) -> Optional[Dict[str, float]]:
+        lb = self._ema915_slope_lb
+        if len(self._ema9_hist) <= lb or len(self._ema15_hist) <= lb:
+            return None
+
+        e9 = float(self._ema9_hist[-1])
+        e9p = float(self._ema9_hist[-1 - lb])
+        e15 = float(self._ema15_hist[-1])
+        e15p = float(self._ema15_hist[-1 - lb])
+
+        s9 = (e9 - e9p) / max(1, lb)
+        s15 = (e15 - e15p) / max(1, lb)
+
+        s9n = s9 / max(_EPS, atr_per_bar)
+        s15n = s15 / max(_EPS, atr_per_bar)
+
+        a9 = math.degrees(math.atan(abs(s9n)))
+        a15 = math.degrees(math.atan(abs(s15n)))
+
+        return {"a9": a9, "a15": a15, "s9": s9, "s15": s15}
+
+    def _ema915_intent_locked(
+        self,
+        ltp: float,
+        ts: datetime,
+        *,
+        recv_ms: int,
+        recv_ns: int,
+        m0: Dict[str, Any],
+        prev: Dict[str, Any],
+    ) -> Optional[EntryIntent]:
+        _ = (prev, recv_ns)
+        if recv_ms < self._ema915_cooldown_until_ms:
+            return None
+        if recv_ms - int(self._ema915_last_eval_ms) < self._ema915_eval_every_ms:
+            return None
+        self._ema915_last_eval_ms = recv_ms
+
+        closed = self._ema915_build_bar_locked(ltp, ts, recv_ms)
+        if closed is not None:
+            close_px = float(closed["close"])
+            self._ema9 = self._ema_update(self._ema9, close_px, 9)
+            self._ema15 = self._ema_update(self._ema15, close_px, 15)
+            self._ema9_hist.append(float(self._ema9))
+            self._ema15_hist.append(float(self._ema15))
+
+            atr_per_bar = self._ema915_atr_per_bar_locked(m0)
+            ang = self._ema915_angles_locked(atr_per_bar)
+            if ang is None:
+                return None
+
+            a9 = ang["a9"]
+            a15 = ang["a15"]
+            if a9 > self._ema915_max_angle or a15 > self._ema915_max_angle:
+                self._ema915_armed = None
+                return None
+
+            e9 = float(self._ema9)
+            e15 = float(self._ema15)
+            sig = self._ema915_strong_candle_locked(closed)
+
+            o = float(closed["open"])
+            h = float(closed["high"])
+            l = float(closed["low"])
+            pad = self._ema915_touch_pad
+            touch = (l - pad) <= e9 <= (h + pad) or (l - pad) <= e15 <= (h + pad)
+
+            if e9 > e15 and ang["s9"] > 0 and ang["s15"] > 0 and a9 >= self._ema915_min_angle and a15 >= self._ema915_min_angle and sig["bull"] and touch:
+                self._ema915_armed = {"side": "LONG", "lvl": h, "sl": l, "armed_ms": recv_ms}
+                self._write_signal({"suggestion": "EMA915_ARM_LONG", "reason": "ema915_arm"}, self._mk_tick_metrics(m0, ltp, ts, recv_ms=recv_ms))
+            elif e9 < e15 and ang["s9"] < 0 and ang["s15"] < 0 and a9 >= self._ema915_min_angle and a15 >= self._ema915_min_angle and sig["bear"] and touch:
+                self._ema915_armed = {"side": "SHORT", "lvl": l, "sl": h, "armed_ms": recv_ms}
+                self._write_signal({"suggestion": "EMA915_ARM_SHORT", "reason": "ema915_arm"}, self._mk_tick_metrics(m0, ltp, ts, recv_ms=recv_ms))
+
+        if self._ema915_armed is None:
+            return None
+
+        age = recv_ms - int(self._ema915_armed["armed_ms"])
+        if age > self._ema915_arm_timeout_ms:
+            self._ema915_armed = None
+            return None
+
+        side = str(self._ema915_armed["side"])
+        lvl = float(self._ema915_armed["lvl"])
+        sl_hint = float(self._ema915_armed["sl"])
+
+        if side == "LONG" and ltp >= (lvl + self._TICK_SIZE):
+            extra = {
+                "channel": "ema915",
+                "ema9": float(self._ema9 or 0.0),
+                "ema15": float(self._ema15 or 0.0),
+                "recv_ms": recv_ms,
+            }
+            return EntryIntent(
+                engine="ema915",
+                side="LONG",
+                entry_px=ltp,
+                ts=ts,
+                reason="ema915_break",
+                score=8000.0 + age,
+                sl_hint=sl_hint,
+                extra=extra,
+            )
+
+        if side == "SHORT" and ltp <= (lvl - self._TICK_SIZE):
+            extra = {
+                "channel": "ema915",
+                "ema9": float(self._ema9 or 0.0),
+                "ema15": float(self._ema15 or 0.0),
+                "recv_ms": recv_ms,
+            }
+            return EntryIntent(
+                engine="ema915",
+                side="SHORT",
+                entry_px=ltp,
+                ts=ts,
+                reason="ema915_break",
+                score=8000.0 + age,
+                sl_hint=sl_hint,
+                extra=extra,
+            )
+
+        return None
+
+    def _check_intra_tick_exits(self, ltp: float, ts: datetime) -> None:
+        """Tick-level hard stop, SL/TP fills, BE + trailing."""
+        p = self.pos
+        if p is None:
+            return
+
+        # Time-based decay exit (scalper TTL)
+        max_hold_s = int(getattr(self.cfg, "max_hold_seconds", 15 * 60))
+        entry_ts = getattr(p, "entry_ts", None)
+        if isinstance(entry_ts, datetime) and max_hold_s > 0:
+            if (ts - entry_ts).total_seconds() >= max_hold_s:
+                self._execute_exit("EXIT_TIME", px=float(ltp), ts=ts, reason="max_hold_time")
+                return
+
+        atr = float(self._last_diag.get("atr", 0.0))
+        if not _is_finite_pos(atr):
+            atr = 10.0  # safe fallback; avoids div-by-zero and NaN propagation
+
+        # Update best price for trailing
+        if p.side == "LONG":
+            p.best_px = max(p.best_px, ltp)
+
+            # Hard stop always enforced
+            if ltp <= p.hard_sl:
+                self._execute_exit("EXIT_HARD_STOP", px=p.hard_sl, ts=ts)
+                return
+
+            # SL
+            if ltp <= p.sl:
+                self._execute_exit("EXIT_SL", px=p.sl, ts=ts)
+                return
+
+            # TP (if not runner)
+            if p.tp is not None and ltp >= p.tp:
+                self._execute_exit("EXIT_TP", px=p.tp, ts=ts)
+                return
+
+            # Move to BE
+            if (not p.is_be) and ((p.best_px - p.entry_px) >= (self.cfg.move_to_be_atr * atr)):
+                p.sl = max(p.sl, p.entry_px + self.cfg.be_buffer_points)
+                p.is_be = True
+
+            # Trailing
+            trail_atr = p.trail_atr_current if p.trail_atr_current > 0 else self.cfg.trail_atr
+            trail_sl = p.best_px - (trail_atr * atr)
+            p.sl = max(p.sl, trail_sl)
+
+        else:  # SHORT
+            p.best_px = min(p.best_px, ltp)
+
+            if ltp >= p.hard_sl:
+                self._execute_exit("EXIT_HARD_STOP", px=p.hard_sl, ts=ts)
+                return
+
+            if ltp >= p.sl:
+                self._execute_exit("EXIT_SL", px=p.sl, ts=ts)
+                return
+
+            if p.tp is not None and ltp <= p.tp:
+                self._execute_exit("EXIT_TP", px=p.tp, ts=ts)
+                return
+
+            if (not p.is_be) and ((p.entry_px - p.best_px) >= (self.cfg.move_to_be_atr * atr)):
+                p.sl = min(p.sl, p.entry_px - self.cfg.be_buffer_points)
+                p.is_be = True
+
+            trail_atr = p.trail_atr_current if p.trail_atr_current > 0 else self.cfg.trail_atr
+            trail_sl = p.best_px + (trail_atr * atr)
+            p.sl = min(p.sl, trail_sl)
+
+    def _execute_exit(self, suggestion: str, *, px: float, ts: datetime, reason: str = "") -> Dict[str, Any]:
+        p = self.pos
+        payload = {
+            "suggestion": suggestion,
+            "channel": "exit",
+            "engine": (p.engine if p else "unknown"),
+            "in_pos": bool(p is not None),
+            "px": float(px),
+            "ts_ist": _iso_ist(ts),
+            "reason": reason or suggestion,
+        }
+
+        if p is not None:
+            payload.update(
+                {
+                    "pos_side": p.side,
+                    "entry_px": p.entry_px,
+                    "entry_ts_ist": _iso_ist(p.entry_ts),
+                    "sl": p.sl,
+                    "tp": p.tp,
+                    "best_px": p.best_px,
+                    "is_be": p.is_be,
+                    "is_runner": p.is_runner,
+                    "why": p.why,
+                }
+            )
+
+        with self._write_lock:
+            self.jsonl_file.write(json.dumps(payload, default=str) + "\n")
+            self.jsonl_file.flush()
+
+        self.pos = None
+        return payload
+
+    def _build_payload(self, decision: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        suggestion = decision.get("suggestion")
+        if suggestion is not None:
+            payload["suggestion"] = suggestion
+        shock_side = metrics.get("shock_side")
+        if shock_side is not None:
+            payload["shock_side"] = shock_side
+        if "squeeze" in metrics:
+            payload["squeeze"] = metrics.get("squeeze")
+
+        base: Dict[str, Any] = {**metrics, **decision}
+        for k, v in base.items():
+            if k in payload:
+                continue
+            payload[k] = v
+        return payload
+
+    def _write_signal(self, decision: Dict[str, Any], metrics: Dict[str, Any]) -> None:
+        """Writes a single JSONL line per candle close (and tick-exits separately)."""
+        try:
+            if (not self.cfg.write_all) and decision.get("suggestion", "").startswith("HOLD"):
+                return
+            if decision.get("suggestion") == "HOLD" and (not self.cfg.write_hold):
+                return
+            if _is_entry_suggestion(decision.get("suggestion")):
+                return
+
+            payload = self._build_payload(decision, metrics)
+            sug = str(payload.get("suggestion", "") or "")
+            is_arm = "ARM_" in sug
+            payload["stream"] = "arm" if is_arm else "signal"
+            if is_arm:
+                eng = str(payload.get("engine", metrics.get("engine", "")) or "")
+                cts = payload.get("_candle_ts", metrics.get("_candle_ts"))
+                key = (eng, sug, str(cts))
+                if key == self._arm_log_key:
+                    return
+                self._arm_log_key = key
+            else:
+                self._arm_log_key = None
+            lock = self._arm_write_lock if is_arm else self._write_lock
+            out_f = self.arm_jsonl_file if is_arm else self.jsonl_file
+            with lock:
+                out_f.write(json.dumps(payload, default=str) + "\n")
+                out_f.flush()
+        except Exception:
+            self.log.exception("_write_signal failed")
+
+
+# ------------------------ Helpers ------------------------
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        f = float(v)
+        if math.isfinite(f) and f != 0.0:
+            return f
+        return None
+    except Exception:
+        return None
+
+
+def _is_entry_suggestion(s: Optional[str]) -> bool:
+    return isinstance(s, str) and s.startswith("ENTRY_")
+
+
+def _parse_ts(x: Any) -> Optional[datetime]:
+    """Accepts ISO strings, epoch seconds/ms, or datetime. Returns UTC-aware datetime."""
+    if x is None:
+        return None
+    if isinstance(x, datetime):
+        return x if x.tzinfo else x.replace(tzinfo=timezone.utc)
+
+    if isinstance(x, (int, float)):
+        try:
+            v = float(x)
+            if v > 1e12:
+                v = v / 1000.0
+            return datetime.fromtimestamp(v, tz=timezone.utc)
+        except Exception:
+            return None
+
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return None
+        if s.isdigit():
+            try:
+                v = float(s)
+                if v > 1e12:
+                    v = v / 1000.0
+                return datetime.fromtimestamp(v, tz=timezone.utc)
+            except Exception:
+                return None
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                ist = timezone(timedelta(hours=5, minutes=30))
+                dt = dt.replace(tzinfo=ist)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    return None
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_ist(dt: datetime) -> str:
+    # IST = UTC+05:30
+    ist = dt.astimezone(timezone.utc).replace(tzinfo=timezone.utc)  # normalize
+    # add 5h30m by offset for string; keep simple (no pytz dependency)
+    return (ist + timedelta(hours=5, minutes=30)).isoformat()
+
+
+def _now_iso_ist() -> str:
+    return _iso_ist(_now_utc())
+
+
+def _is_finite_pos(x: float) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(float(x)) and float(x) > 0.0
+
+
+def _hma_series(series: pd.Series, period: int) -> pd.Series:
+    """Hull Moving Average series. NaN-safe."""
+    period = max(2, int(period))
+    half = max(1, period // 2)
+    sqrt_p = max(1, int(math.sqrt(period)))
+
+    def _wma(s: pd.Series, p: int) -> pd.Series:
+        def _wma_calc(x: np.ndarray) -> float:
+            w = np.arange(1, len(x) + 1, dtype=float)
+            return float(np.dot(x, w) / float(w.sum()))
+        return s.rolling(p, min_periods=1).apply(_wma_calc, raw=True)
+
+    wma_half = _wma(series, half)
+    wma_full = _wma(series, period)
+    diff = 2.0 * wma_half - wma_full
+    return _wma(diff, sqrt_p)
+
+
+def _update_bias(prev: Optional[str], slope: float, pos_th: float, neg_th: float) -> Optional[str]:
+    """Hysteresis bias: switch only on threshold cross; otherwise keep."""
+    if slope >= pos_th:
+        return "LONG"
+    if slope <= neg_th:
+        return "SHORT"
+    return prev
+
+
+def _env(key: str, default: str, aliases: Optional[list[str]] = None) -> str:
+    v = os.getenv(key)
+    if v is not None and str(v).strip() != "":
+        return str(v).strip()
+    for a in (aliases or []):
+        v2 = os.getenv(a)
+        if v2 is not None and str(v2).strip() != "":
+            return str(v2).strip()
+    return default
+
+
+def _env_bool(key: str, default: bool, aliases: Optional[list[str]] = None) -> bool:
+    raw = _env(key, "", aliases).strip().lower()
+    if raw == "":
+        return default
+    if raw in ("1", "true", "yes", "y", "on"):
+        return True
+    if raw in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _parse_level(x: str, default: int = logging.INFO) -> int:
+    x = (x or "").strip().upper()
+    if not x:
+        return default
+    if x.isdigit():
+        try:
+            return int(x)
+        except Exception:
+            return default
+    return int(getattr(logging, x, default))

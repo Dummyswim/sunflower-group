@@ -4,6 +4,7 @@ Runner script for probabilities-only 5-minute predictor.
 Emits policy success probability for teacher-defined direction.
 """
 
+from collections.abc import Awaitable
 from types import SimpleNamespace
 import asyncio
 import base64
@@ -138,13 +139,15 @@ global policy_pipe
 policy_pipe = _load_policy_pipeline()
 
 async def main():
-    await main_loop(
+    result = main_loop(
         config=config,
         policy_pipe=policy_pipe,
         train_features=train_features,
         token_b64=base64.b64encode(TELEGRAM_BOT_TOKEN.encode()).decode(),
         chat_id=TELEGRAM_CHAT_ID,
     )
+    if isinstance(result, Awaitable):
+        await result
 
 
 if __name__ == "__main__":
