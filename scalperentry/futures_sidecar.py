@@ -11,8 +11,8 @@ Sidecar VWAP + CVD calculator for NIFTY futures (Dhan WebSocket v2).
     * CVD           = cumulative signed dVol using tick-rule classification.
 - Aggregates to 1-minute candles.
 - Writes outputs to (paths are configurable):
-    * FUT_TICKS_PATH   (per-tick, default: trained_models/production/fut_ticks_vwap_cvd.csv)
-    * FUT_SIDECAR_PATH (per-minute, default: trained_models/production/fut_candles_vwap_cvd.csv)
+    * FUT_TICKS_PATH   (per-tick, default: data/fut_ticks_candles.csv)
+    * FUT_SIDECAR_PATH (per-minute, default: data/fut_candles.csv)
 - Does NOT modify or depend on the existing automation's event loop.
   It only uses the same logging conventions (logging_setup.py).
 
@@ -42,7 +42,7 @@ Usage:
     python futures_vwap_cvd_sidecar.py
 
 Later, the main automation can read FUT_SIDECAR_PATH (candles) and FUT_TICKS_PATH (ticks) to integrate VWAP/CVD.
-(Your main_event_loop_regen defaults FUT_SIDECAR_PATH to trained_models/production/fut_candles_vwap_cvd.csv.)
+(Your main_event_loop_regen defaults FUT_SIDECAR_PATH to data/fut_candles.csv.)
 
 """
 
@@ -109,8 +109,8 @@ class SidecarConfig:
     price_sanity_max: float = 200000.0
     candle_interval_seconds: int = 60
     max_tick_buffer: int = 10000
-    out_path_ticks: str = "trained_models/production/fut_ticks_vwap_cvd.csv"
-    out_path_candles: str = "trained_models/production/fut_candles_vwap_cvd.csv"
+    out_path_ticks: str = "data/fut_ticks_candles.csv"
+    out_path_candles: str = "data/fut_candles.csv"
 
     def validate(self) -> None:
         """
@@ -306,6 +306,34 @@ class FuturesVWAPCVDClient:
             self._price_sanity_failures = 0
         except Exception:
             pass
+
+    def _epoch_to_ts(self, epoch_sec: int, fallback: datetime) -> datetime:
+        """Convert vendor epoch seconds to IST datetime. Applies drift correction and falls back safely."""
+        try:
+            if not isinstance(epoch_sec, int) or epoch_sec <= 0:
+                return fallback
+            ts_utc = datetime.fromtimestamp(epoch_sec, tz=timezone.utc)
+
+            try:
+                drift_sec = int(os.getenv("TB_TS_DRIFT_SEC", "19800"))
+                tol_sec = int(os.getenv("TB_TS_DRIFT_TOLERANCE_SEC", os.getenv("TB_TS_DRIFT_TOL_SEC", "120")))
+                drift = timedelta(seconds=drift_sec)
+                tol = timedelta(seconds=tol_sec)
+
+                fb_utc = fallback.astimezone(timezone.utc)
+                delta = ts_utc - fb_utc
+                if abs(delta - drift) <= tol:
+                    ts_utc = ts_utc - drift
+                elif abs(delta + drift) <= tol:
+                    ts_utc = ts_utc + drift
+            except Exception:
+                pass
+            ts_ist = ts_utc.astimezone(IST)
+            if abs((fallback - ts_ist).total_seconds()) > 60 * 60 * 24:
+                return fallback
+            return ts_ist
+        except Exception:
+            return fallback
 
     def _reset_session_if_needed(self, ts: datetime) -> None:
         """
@@ -957,18 +985,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    def _epoch_to_ts(self, epoch_sec: int, fallback: datetime) -> datetime:
-        """Convert vendor epoch seconds to IST datetime. Falls back safely."""
-        try:
-            if not isinstance(epoch_sec, int) or epoch_sec <= 0:
-                return fallback
-            ts_utc = datetime.fromtimestamp(epoch_sec, tz=timezone.utc)
-            ts_ist = ts_utc.astimezone(IST)
-            # Guard against obviously wrong epochs (e.g., 1970) that break bucketing.
-            if abs((fallback - ts_ist).total_seconds()) > 60 * 60 * 24:
-                return fallback
-            return ts_ist
-        except Exception:
-            return fallback
-
-

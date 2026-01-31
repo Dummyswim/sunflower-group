@@ -93,22 +93,6 @@ class TradeBrainConfig:
     climax_anchor_atr: float = float(os.getenv("TB_CLIMAX_ANCHOR_ATR", "0.8"))
     flow_bias_veto: float = float(os.getenv("TB_FLOW_BIAS_VETO", "0.15"))
 
-    # Scalper context awareness (SR / absorption / latency)
-    support_lookback: int = int(os.getenv("TB_SUPPORT_LOOKBACK", "45"))  # local structure (1m)
-    sr_buffer_atr: float = float(os.getenv("TB_SR_BUFFER_ATR", "0.35"))  # too close to floor/ceiling
-    entry_rr_min: float = float(os.getenv("TB_ENTRY_RR_MIN", "0.8"))  # min reward/risk vs hard stop
-
-    absorb_wick_pct: float = float(os.getenv("TB_ABSORB_WICK_PCT", "0.45"))
-    absorb_clv_min: float = float(os.getenv("TB_ABSORB_CLV_MIN", "0.20"))
-    absorb_cooldown_ms: int = int(os.getenv("TB_ABSORB_COOLDOWN_MS", "120000"))  # 2 min
-
-    # Latency guard (only for tick engines: micro/ema915). 0 disables.
-    entry_latency_max_ms: int = int(os.getenv("TB_ENTRY_LATENCY_MAX_MS", "1000"))
-
-    # Persist confirmed 1m candles so session SR survives restarts (JSONL, filtered by IST date)
-    persist_candles: bool = os.getenv("TB_PERSIST_CANDLES", "1") == "1"
-    candle_db_file: str = os.getenv("TB_CANDLE_DB_FILE", "data/candles_session.jsonl")
-
     # Market-driven hysteresis (no fixed time cooldowns)
     # These operate on a normalized margin in [-1..1] derived from candle metrics.
     ready_margin: float = float(os.getenv("TB_READY_MARGIN", "0.18"))  # becomes READY_LONG/READY_SHORT
@@ -173,7 +157,7 @@ class TradeBrainConfig:
     min_activity_w_confirm: float = float(os.getenv("TB_MIN_ACTIVITY_W_CONFIRM", "0.35"))
 
     # Limits
-    max_candles: int = int(os.getenv("TB_MAX_CANDLES", "450"))  # ~full session of 1m
+    max_candles: int = int(os.getenv("TB_MAX_CANDLES", "240"))  # ~4 hours of 1m
     max_ticks_per_candle: int = int(os.getenv("TB_MAX_TICKS_PER_CANDLE", "20000"))  # loop safety
     min_ready_candles: int = int(os.getenv("TB_MIN_READY_CANDLES", "10"))
 
@@ -208,20 +192,6 @@ class TradeBrainConfig:
             raise ValueError("climax_anchor_atr must be >= 0")
         if not (0.0 <= self.flow_bias_veto <= 1.0):
             raise ValueError("flow_bias_veto must be in [0,1]")
-        if self.support_lookback < 10:
-            raise ValueError("support_lookback must be >= 10")
-        if self.sr_buffer_atr < 0:
-            raise ValueError("sr_buffer_atr must be >= 0")
-        if self.entry_rr_min < 0:
-            raise ValueError("entry_rr_min must be >= 0")
-        if not (0.0 < self.absorb_wick_pct <= 1.0):
-            raise ValueError("absorb_wick_pct must be in (0,1]")
-        if not (0.0 <= self.absorb_clv_min <= 1.0):
-            raise ValueError("absorb_clv_min must be in [0,1]")
-        if self.absorb_cooldown_ms < 0:
-            raise ValueError("absorb_cooldown_ms must be >= 0")
-        if self.entry_latency_max_ms < 0:
-            raise ValueError("entry_latency_max_ms must be >= 0")
         if not (0.0 <= self.ready_margin <= 1.0):
             raise ValueError("ready_margin must be in [0,1]")
         if not (0.0 <= self.flip_margin <= 1.0):
@@ -358,11 +328,6 @@ class TradeBrain:
         self.candles: Deque[Dict[str, Any]] = deque(maxlen=self.cfg.max_candles)
         self.current_candle: Optional[Dict[str, Any]] = None
 
-        # Session structure (HOD/LOD) + scalper cooldown (used by absorption veto)
-        self.session_high: float = -float("inf")
-        self.session_low: float = float("inf")
-        self._entry_cooldown_until_ms: int = 0
-
         self.pos: Optional[Position] = None
         self.bias: Optional[str] = None  # "LONG" or "SHORT" or None
         self.pending_shock: Optional[PendingShock] = None
@@ -452,19 +417,6 @@ class TradeBrain:
         log_dir = os.path.dirname(self.cfg.log_file)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
-
-        candle_path = str(getattr(self.cfg, "candle_db_file", "") or "")
-        candle_dir = os.path.dirname(candle_path)
-        if candle_dir:
-            os.makedirs(candle_dir, exist_ok=True)
-
-        # Hydrate today's session candles on startup so SR survives restarts.
-        if bool(getattr(self.cfg, "persist_candles", False)):
-            try:
-                with self._lock:
-                    self._load_session_candles_locked()
-            except Exception:
-                self.log.exception("load_session_candles failed")
 
         self._write_lock = threading.Lock()
         self.jsonl_file = open(self.cfg.jsonl_path, "a", encoding="utf-8", buffering=1)
@@ -630,150 +582,6 @@ class TradeBrain:
         except Exception:
             self.log.exception("close failed")
 
-    # ------------------------ Candle Persistence / Session SR ------------------------
-    def _update_session_extremes_locked(self, candle: Dict[str, Any]) -> None:
-        """Update session HOD/LOD from a confirmed 1m candle."""
-        try:
-            h = float(candle.get("high", 0.0) or 0.0)
-            l = float(candle.get("low", 0.0) or 0.0)
-            if _is_finite_pos(h):
-                self.session_high = max(float(self.session_high), h)
-            if _is_finite_pos(l):
-                self.session_low = min(float(self.session_low), l)
-        except Exception:
-            pass
-
-    def _persist_candle_locked(self, candle: Dict[str, Any]) -> None:
-        """Append confirmed 1m candle to JSONL (for restart-safe session SR)."""
-        if not bool(getattr(self.cfg, "persist_candles", False)):
-            return
-        path = str(getattr(self.cfg, "candle_db_file", "") or "")
-        if not path:
-            return
-        ts = candle.get("ts")
-        if not isinstance(ts, datetime):
-            return
-
-        rec = {
-            "stream": "candle",
-            "tf": "1m",
-            "ts_utc": ts.astimezone(timezone.utc).isoformat(),
-            "ts_ist": _iso_ist(ts),
-            "open": float(candle.get("open", 0.0) or 0.0),
-            "high": float(candle.get("high", 0.0) or 0.0),
-            "low": float(candle.get("low", 0.0) or 0.0),
-            "close": float(candle.get("close", 0.0) or 0.0),
-            "ticks": int(candle.get("ticks", 0) or 0),
-            "total_travel": float(candle.get("total_travel", 0.0) or 0.0),
-            "rv2": float(candle.get("rv2", 0.0) or 0.0),
-        }
-
-        try:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
-        except Exception:
-            self.log.exception("persist_candle failed")
-
-    def _load_session_candles_locked(self) -> None:
-        """Hydrate today's candles from JSONL into self.candles + session extremes.
-
-        Assumes self._lock is held.
-        """
-        path = str(getattr(self.cfg, "candle_db_file", "") or "")
-        if not path or not os.path.exists(path):
-            return
-
-        today = datetime.now(IST_TZ).strftime("%Y-%m-%d")
-        loaded = 0
-
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except Exception:
-                        continue
-
-                    ts_ist = str(rec.get("ts_ist") or "")
-                    if not ts_ist.startswith(today):
-                        continue
-
-                    ts_utc_s = rec.get("ts_utc")
-                    if not ts_utc_s:
-                        continue
-                    try:
-                        ts_utc = datetime.fromisoformat(str(ts_utc_s))
-                        if ts_utc.tzinfo is None:
-                            ts_utc = ts_utc.replace(tzinfo=timezone.utc)
-                        ts_utc = ts_utc.astimezone(timezone.utc)
-                    except Exception:
-                        continue
-
-                    c = {
-                        "ts": ts_utc.replace(second=0, microsecond=0),
-                        "open": float(rec.get("open", 0.0) or 0.0),
-                        "high": float(rec.get("high", 0.0) or 0.0),
-                        "low": float(rec.get("low", 0.0) or 0.0),
-                        "close": float(rec.get("close", 0.0) or 0.0),
-                        "ticks": int(rec.get("ticks", 0) or 0),
-                        "total_travel": float(rec.get("total_travel", 0.0) or 0.0),
-                        "rv2": float(rec.get("rv2", 0.0) or 0.0),
-                        "last_px": float(rec.get("close", 0.0) or 0.0),
-                    }
-
-                    # Basic sanity: ignore broken records
-                    if not _is_finite_pos(float(c.get("high", 0.0) or 0.0)):
-                        continue
-                    if not _is_finite_pos(float(c.get("low", 0.0) or 0.0)):
-                        continue
-
-                    self.candles.append(c)
-                    self._update_session_extremes_locked(c)
-                    loaded += 1
-
-        except Exception:
-            self.log.exception("load_session_candles read failed")
-            return
-
-        if loaded > 0:
-            try:
-                self.log.info(
-                    "hydrated_session_candles=%s session_high=%.2f session_low=%.2f",
-                    int(loaded),
-                    float(self.session_high),
-                    float(self.session_low),
-                )
-            except Exception:
-                pass
-
-    def _get_sr_levels_locked(self, *, lb: Optional[int] = None) -> Tuple[float, float, float, float]:
-        """Return (local_support, local_resistance, session_support, session_resistance).
-
-        Assumes self._lock is held.
-        """
-        lookback = int(lb if lb is not None else int(getattr(self.cfg, "support_lookback", 45)))
-        lookback = max(20, lookback)
-
-        if not self.candles:
-            p = float(self._last_px or 0.0)
-            return p, p, p, p
-
-        recent = list(self.candles)[-lookback:]
-        p = float(self._last_px or float(recent[-1].get("close", 0.0) or 0.0))
-
-        try:
-            loc_sup = min(float(c.get("low", p) or p) for c in recent)
-            loc_res = max(float(c.get("high", p) or p) for c in recent)
-        except Exception:
-            loc_sup, loc_res = p, p
-
-        sess_sup = float(self.session_low) if math.isfinite(float(self.session_low)) else loc_sup
-        sess_res = float(self.session_high) if math.isfinite(float(self.session_high)) else loc_res
-        return float(loc_sup), float(loc_res), float(sess_sup), float(sess_res)
-
     # ------------------------ Candle Close ------------------------
     def _close_candle_locked(self) -> None:
         """Assumes self._lock is held."""
@@ -783,8 +591,6 @@ class TradeBrain:
         candle = self.current_candle
         self.candles.append(candle)
         self.current_candle = None
-        self._update_session_extremes_locked(candle)
-        self._persist_candle_locked(candle)
 
         metrics = self._compute_metrics_locked()
         # Optional futures flow snapshot (sidecar). Read once per candle close.
@@ -1654,14 +1460,6 @@ class TradeBrain:
         if side not in ("LONG", "SHORT"):
             return None
 
-        # Cooldown after absorption traps (prevents immediate re-fire on tiny ticks).
-        now_ms = int(time.time() * 1000)
-        try:
-            if now_ms < int(getattr(self, "_entry_cooldown_until_ms", 0) or 0):
-                return "cooldown_wait"
-        except Exception:
-            pass
-
         atr = float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK)
         if not _is_finite_pos(atr):
             return None
@@ -1669,76 +1467,6 @@ class TradeBrain:
 
         px = float(intent.entry_px)
         hma = float(m.get("hma", px) or px)
-
-        # Latency guard (only for tick engines: micro/ema915). 0 disables.
-        try:
-            max_lat = int(getattr(self.cfg, "entry_latency_max_ms", 0) or 0)
-            eng = str(getattr(intent, "engine", "") or "")
-            if max_lat > 0 and eng in ("micro", "ema915"):
-                lat = int(m.get("latency_ms", 0) or 0)
-                if lat > max_lat:
-                    return f"high_latency_{lat}ms"
-        except Exception:
-            pass
-
-        # Squeeze + low efficiency => wait for expansion/confirmation.
-        try:
-            if bool(m.get("squeeze", False)) and float(m.get("path_eff", 0.0) or 0.0) < float(self.cfg.min_path_eff_filter):
-                return "squeeze_chop_wait"
-        except Exception:
-            pass
-
-        # Absorption trap veto (wick rejection + CLV). If triggered, also arm a short cooldown.
-        try:
-            clv0 = float(m.get("clv", 0.0) or 0.0)
-            lw = float(m.get("lower_wick_pct", 0.0) or 0.0)
-            uw = float(m.get("upper_wick_pct", 0.0) or 0.0)
-            wick_th = float(getattr(self.cfg, "absorb_wick_pct", 0.0) or 0.0)
-            clv_th = float(getattr(self.cfg, "absorb_clv_min", 0.0) or 0.0)
-            if wick_th > 0.0:
-                if side == "SHORT" and lw >= wick_th and clv0 >= clv_th:
-                    cd = int(getattr(self.cfg, "absorb_cooldown_ms", 0) or 0)
-                    if cd > 0:
-                        self._entry_cooldown_until_ms = now_ms + cd
-                    return "bullish_absorption_wait"
-                if side == "LONG" and uw >= wick_th and clv0 <= (-clv_th):
-                    cd = int(getattr(self.cfg, "absorb_cooldown_ms", 0) or 0)
-                    if cd > 0:
-                        self._entry_cooldown_until_ms = now_ms + cd
-                    return "bearish_absorption_wait"
-        except Exception:
-            pass
-
-        # SR / RR veto (anti-greed guard): don't short the floor / long the ceiling unless there's room.
-        try:
-            loc_sup, loc_res, sess_sup, sess_res = self._get_sr_levels_locked(lb=int(getattr(self.cfg, "support_lookback", 45)))
-            hard_min = float(self.cfg.hard_stop_points)
-            hard_mult = float(getattr(self.cfg, "hard_stop_atr_mult", 1.5))
-            risk_pts = max(hard_min, hard_mult * atr)
-
-            buf = float(getattr(self.cfg, "sr_buffer_atr", 0.0) or 0.0)
-            rr_min = float(getattr(self.cfg, "entry_rr_min", 0.0) or 0.0)
-
-            if side == "SHORT":
-                floor = loc_sup if px >= loc_sup else sess_sup
-                reward = max(0.0, px - floor)
-                dist_atr = reward / max(_EPS, atr)
-                rr = reward / max(_EPS, risk_pts)
-                if buf > 0.0 and dist_atr < buf:
-                    return "too_close_to_support"
-                if rr_min > 0.0 and rr < rr_min:
-                    return f"poor_rr_{rr:.2f}"
-            else:
-                ceil = loc_res if px <= loc_res else sess_res
-                reward = max(0.0, ceil - px)
-                dist_atr = reward / max(_EPS, atr)
-                rr = reward / max(_EPS, risk_pts)
-                if buf > 0.0 and dist_atr < buf:
-                    return "too_close_to_resistance"
-                if rr_min > 0.0 and rr < rr_min:
-                    return f"poor_rr_{rr:.2f}"
-        except Exception:
-            pass
 
         # If the intent didn't carry anchor_dist, compute it.
         anchor_dist_signed = m.get("anchor_dist_atr_signed")

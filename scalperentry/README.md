@@ -15,15 +15,15 @@ The design goal is to predict the next 1-minute candle with higher confidence by
 
 Terminal 1 (sidecar): connects to Dhan WS, subscribes to the futures instrument (one month), and continuously writes:
 
-- `trained_models/production/fut_ticks_vwap_cvd.csv`
-- `trained_models/production/fut_candles_vwap_cvd.csv` (this is what `tradebrain.py` reads)
+- `/home/hanumanth/Documents/sunflower-group/scalperentry/data/fut_ticks_candles.csv`
+- `/home/hanumanth/Documents/sunflower-group/scalperentry/data/fut_candles.csv` (this is what `tradebrain.py` reads)
 
 Run:
 ```bash
 python futures_sidecar.py
 ```
 
-Terminal 2 (tradebrain): your main brain. On every 1-minute candle close it does a tiny tail-read of the last line of `fut_candles_vwap_cvd.csv` and attaches that snapshot into the emitted JSONL (and computes a simple `fut_cvd_delta`).
+Terminal 2 (tradebrain): your main brain. On every 1-minute candle close it does a tiny tail-read of the last line of `fut_candles.csv` and attaches that snapshot into the emitted JSONL (and computes a simple `fut_cvd_delta`).
 
 Run:
 ```bash
@@ -42,18 +42,24 @@ export DHAN_CLIENT_ID="..."
 export DHAN_ACCESS_TOKEN="..."
 export FUT_EXCHANGE_SEGMENT="NSE_FNO"
 export FUT_SECURITY_ID="..."           # one-month futures security_id
-export FUT_OUTPUT_DIR="trained_models/production"
+export FUT_OUTPUT_DIR="/home/hanumanth/Documents/sunflower-group/scalperentry/data"
 ```
 
 TradeBrain:
 ```bash
 export TB_USE_FUT_FLOW="1"
-export TB_FUT_SIDECAR_PATH="trained_models/production/fut_candles_vwap_cvd.csv"
+export TB_FUT_SIDECAR_PATH="/home/hanumanth/Documents/sunflower-group/scalperentry/data/fut_candles.csv"
 export TB_FUT_FLOW_STALE_SEC="180"
 
 # Optional JSONL paths
 export TB_JSONL="tradebrain_signal.jsonl"
 export TB_ARM_JSONL="tradebrain_arm.jsonl"
+```
+
+Launcher (automation_with_sidecar.sh):
+```bash
+export PYTHON_BIN="/home/hanumanth/Documents/pyvirtualenv/venv/bin/python"
+export AUTO_SHUTDOWN_AT=02
 ```
 
 ---
@@ -282,8 +288,9 @@ Sidecar:
 - `DHAN_CLIENT_ID` (base64 encoded client id)
 - `FUT_SECURITY_ID` (front-month NIFTY futures SecurityId)
 - `FUT_EXCHANGE_SEGMENT` (default `NSE_FNO`)
-- `FUT_TICKS_PATH` (default `trained_models/production/fut_ticks_vwap_cvd.csv`)
-- `FUT_SIDECAR_PATH` (default `trained_models/production/fut_candles_vwap_cvd.csv`)
+- `FUT_OUTPUT_DIR` (optional base dir for your CSV outputs)
+- `FUT_TICKS_PATH` (default `data/fut_ticks_candles.csv`)
+- `FUT_SIDECAR_PATH` (default `data/fut_candles.csv`)
 
 TradeBrain:
 - `TB_USE_FUT_FLOW` (enable sidecar tail-read)
@@ -291,6 +298,10 @@ TradeBrain:
 - `TB_FUT_FLOW_STALE_SEC` (stale cutoff in seconds)
 - `TB_JSONL` (signal stream output)
 - `TB_ARM_JSONL` (arm stream output)
+
+Launcher (automation_with_sidecar.sh):
+- `PYTHON_BIN` (python interpreter path for both processes)
+- `AUTO_SHUTDOWN_AT` (optional shutdown time, e.g. `02` or `02:00`)
 
 ### 4.2 Run
 

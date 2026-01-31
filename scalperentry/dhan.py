@@ -123,6 +123,7 @@ class DhanConfig:
 
     log_every_n: int = 500
     log_ticks: bool = False
+    log_tick_summary_sec: int = 600
 
 
 def _env(key: str, default: str, aliases: Optional[list[str]] = None) -> str:
@@ -326,7 +327,10 @@ async def run_quote_feed(cfg: DhanConfig, tb: Optional[TradeBrain], log: logging
 
     attempt = 0
     tick_count = 0
+    total_tick_count = 0
     first_quote = True
+    last_summary_monotonic = time.monotonic()
+    last_summary_count = 0
 
     while True:
         attempt += 1
@@ -394,6 +398,8 @@ async def run_quote_feed(cfg: DhanConfig, tb: Optional[TradeBrain], log: logging
                         tick["recv_ts"] = recv_ts
                         tick["recv_ts_ns"] = recv_ns
 
+                        total_tick_count += 1
+
                         if tick.get("kind") == "dhan_quote_packet":
                             tick_count += 1
                             if first_quote:
@@ -405,9 +411,23 @@ async def run_quote_feed(cfg: DhanConfig, tb: Optional[TradeBrain], log: logging
                                 )
                                 first_quote = False
 
-                        log.info("[DHAN] tick=%s", json.dumps(tick, default=str, separators=(",", ":")))
+                        if cfg.log_ticks:
+                            log.info("[DHAN] tick=%s", json.dumps(tick, default=str, separators=(",", ":")))
 
-                        if cfg.log_every_n > 0 and (tick_count % cfg.log_every_n == 0) and tick.get("kind") == "dhan_quote_packet":
+                        summary_sec = max(0, int(getattr(cfg, "log_tick_summary_sec", 0) or 0))
+                        if summary_sec > 0:
+                            now_mono = time.monotonic()
+                            if now_mono - last_summary_monotonic >= summary_sec:
+                                log.info(
+                                    "[DHAN] ticks_total=%d ticks_delta=%d interval_sec=%d",
+                                    int(total_tick_count),
+                                    int(total_tick_count - last_summary_count),
+                                    int(summary_sec),
+                                )
+                                last_summary_monotonic = now_mono
+                                last_summary_count = int(total_tick_count)
+
+                        if cfg.log_every_n > 0 and summary_sec <= 0 and (tick_count % cfg.log_every_n == 0) and tick.get("kind") == "dhan_quote_packet":
                             log.info("[DHAN] ticks=%d ltp=%.2f", tick_count, float(tick.get("ltp") or 0.0))
 
                         if tb is not None:
@@ -437,6 +457,7 @@ async def run_system() -> None:
         max_reconnect_attempts=_env_int("MAX_RECONNECTS", 0, aliases=["FULL_MAX_RECONNECTS"]),
         log_every_n=_env_int("LOG_EVERY_N", 500, aliases=["FULL_LOG_EVERY_N"]),
         log_ticks=_env_bool("LOG_TICKS", False, aliases=["FULL_LOG_TICKS"]),
+        log_tick_summary_sec=_env_int("LOG_TICK_SUMMARY_SEC", 600, aliases=["FULL_LOG_TICK_SUMMARY_SEC"]),
     )
 
     log_file = _env("LOG_FILE", "logs/dhan.log", aliases=["FULL_LOG_FILE"])
@@ -457,11 +478,12 @@ async def run_system() -> None:
         log.info("[DHAN] TradeBrain disabled (RUN_TRADEBRAIN=0)")
 
     log.info(
-        "[DHAN] config exchange=%s security_id=%s log_every_n=%d log_ticks=%s log_level=%s",
+        "[DHAN] config exchange=%s security_id=%s log_every_n=%d log_ticks=%s log_tick_summary_sec=%d log_level=%s",
         cfg.exchange_segment,
         cfg.security_id,
         cfg.log_every_n,
         cfg.log_ticks,
+        cfg.log_tick_summary_sec,
         logging.getLevelName(log.level),
     )
 

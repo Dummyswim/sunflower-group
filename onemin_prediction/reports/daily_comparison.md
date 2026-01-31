@@ -84,3 +84,5 @@
 ## Calibration Health (To Track Going Forward)
 - Record brier_before_eval -> brier_after_eval for BUY/SELL after each session.
 - Flag any session where brier_after_eval worsens; skip calibration for that session.
+- 2026-01-20: BUY eval 0.001728 -> 0.000015 (n=91) | SELL eval 0.000909 -> 0.000005 (n=75)
+- 2026-01-24: BUY eval 0.001667 -> 0.000012 (n=90) | SELL eval 0.000975 -> 0.000006 (n=76)

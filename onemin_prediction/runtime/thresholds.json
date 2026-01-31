@@ -1,14 +1,14 @@
 {
   "overrides": {
-    "FLOW_STRONG_MIN": 0.335,
-    "GATE_MARGIN_THR": 0.0825,
-    "LANE_SCORE_MIN": 0.5491734400000001
+    "FLOW_STRONG_MIN": 0.27499999999999997,
+    "GATE_MARGIN_THR": 0.06250000000000001,
+    "LANE_SCORE_MIN": 0.38
   },
   "stats": {
-    "correct": 19,
-    "false_neg": 8,
-    "false_pos": 10,
-    "total": 50
+    "correct": 4,
+    "false_neg": 4,
+    "false_pos": 1,
+    "total": 10
   },
-  "updated_at": "2026-01-14 01:00:00"
+  "updated_at": "2026-01-30 01:40:00"
 }
