@@ -85,7 +85,6 @@ class TradeBrainConfig:
     min_path_eff_filter: float = float(os.getenv("TB_MIN_PATH_EFF_FILTER", "0.18"))  # stay flat if below
     entry_path_eff: float = float(os.getenv("TB_ENTRY_PATH_EFF", "0.70"))  # trade only if clean
     entry_anchor_min_atr: float = float(os.getenv("TB_ENTRY_ANCHOR_MIN_ATR", "0.30"))  # keep entries off anchor
-    max_anchor_dist_atr: float = float(os.getenv("TB_MAX_ANCHOR_DIST_ATR", "1.5"))  # max distance from anchor for entries
 
     # Contextual entry vetoes (ATR-normalized; "soft" vetoes return HOLD_WAIT_CONFIRM)
     late_breakout_anchor_atr: float = float(os.getenv("TB_LATE_BREAKOUT_ANCHOR_ATR", "0.90"))
@@ -148,8 +147,6 @@ class TradeBrainConfig:
     shock_atr_mult: float = float(os.getenv("TB_SHOCK_ATR_MULT", "1.5"))
     shock_points: float = float(os.getenv("TB_SHOCK_POINTS", "35.0"))
     shock_confirm_candles: int = int(os.getenv("TB_SHOCK_CONFIRM_CANDLES", "3"))
-    shock_lock_ms: int = int(os.getenv("TB_SHOCK_LOCK_MS", "60000"))
-    shock_expiry_minutes: int = int(os.getenv("TB_SHOCK_EXPIRY_MINUTES", "3"))
 
     # Exits / Trade Mgmt
     hard_stop_points: float = float(os.getenv("TB_HARD_STOP_POINTS", "20.0"))  # intra-tick hard stop vs entry
@@ -184,8 +181,6 @@ class TradeBrainConfig:
     use_fut_flow: bool = os.getenv("TB_USE_FUT_FLOW", "1") == "1"
     fut_sidecar_path: str = os.getenv("TB_FUT_SIDECAR_PATH", "data/fut_candles.csv")
     fut_flow_stale_sec: int = int(os.getenv("TB_FUT_FLOW_STALE_SEC", "180"))
-    fut_flow_fail_mode: str = os.getenv("TB_FUT_FLOW_FAIL_MODE", "neutral").strip().lower()
-    fut_sidecar_poll_ms: int = int(os.getenv("TB_FUT_SIDECAR_POLL_MS", "1000"))
 
     # Activity-weighted pressure guard (Option B). Prevent CLV from overconfident signals in low-activity tape.
     activity_w_low: float = float(os.getenv("TB_ACTIVITY_W_LOW", "0.70"))
@@ -203,17 +198,6 @@ class TradeBrainConfig:
     # EMA915
     ema915_arm_min_age_ms: int = int(os.getenv("TB_EMA915_ARM_MIN_AGE_MS", "200"))
 
-    # Tick/micro params
-    tick_size: float = float(os.getenv("TB_TICK_SIZE", "0.05"))
-    micro_atr_fallback: float = float(os.getenv("TB_MICRO_ATR_FALLBACK", "12.0"))
-    micro_accept_vel_z: float = float(os.getenv("TB_MICRO_ACCEPT_VEL_Z", "1.0"))
-    micro_accept_acc_z_max_against: float = float(os.getenv("TB_MICRO_ACCEPT_ACC_Z_MAX_AGAINST", "3.0"))
-    micro_arm_buffer_atr: float = float(os.getenv("TB_MICRO_ARM_BUFFER_ATR", "0.12"))
-    micro_arm_buffer_ticks: int = int(os.getenv("TB_MICRO_ARM_BUFFER_TICKS", "20"))
-
-    # Timebase
-    use_exchange_timestamps: bool = os.getenv("TB_USE_EXCHANGE_TIMESTAMPS", "0") == "1"
-
     def validate(self) -> None:
         if self.hma_period < 5:
             raise ValueError("hma_period must be >= 5")
@@ -227,8 +211,6 @@ class TradeBrainConfig:
             raise ValueError("entry_path_eff must be in (0,1)")
         if self.entry_anchor_min_atr < 0:
             raise ValueError("entry_anchor_min_atr must be >= 0")
-        if self.max_anchor_dist_atr <= 0:
-            raise ValueError("max_anchor_dist_atr must be > 0")
 
         # Contextual entry veto sanity
         if self.late_breakout_anchor_atr < 0:
@@ -279,10 +261,6 @@ class TradeBrainConfig:
             raise ValueError("shock_points must be > 0")
         if self.shock_confirm_candles < 1:
             raise ValueError("shock_confirm_candles must be >= 1")
-        if self.shock_lock_ms < 0:
-            raise ValueError("shock_lock_ms must be >= 0")
-        if self.shock_expiry_minutes < 1:
-            raise ValueError("shock_expiry_minutes must be >= 1")
         if self.hard_stop_points <= 0:
             raise ValueError("hard_stop_points must be > 0")
         if self.tp_atr_mult <= 0:
@@ -329,26 +307,10 @@ class TradeBrainConfig:
         # Sidecar / activity validation
         if self.fut_flow_stale_sec < 1:
             raise ValueError("TB_FUT_FLOW_STALE_SEC must be >= 1")
-        if self.fut_flow_fail_mode not in ("neutral", "hold"):
-            raise ValueError("TB_FUT_FLOW_FAIL_MODE must be 'neutral' or 'hold'")
-        if self.fut_sidecar_poll_ms < 100:
-            raise ValueError("TB_FUT_SIDECAR_POLL_MS must be >= 100")
         if self.activity_w_high <= self.activity_w_low:
             raise ValueError("TB_ACTIVITY_W_HIGH must be > TB_ACTIVITY_W_LOW")
         if not (0.0 <= self.min_activity_w_confirm <= 1.0):
             raise ValueError("TB_MIN_ACTIVITY_W_CONFIRM must be between 0 and 1")
-        if self.tick_size <= 0:
-            raise ValueError("TB_TICK_SIZE must be > 0")
-        if self.micro_atr_fallback <= 0:
-            raise ValueError("TB_MICRO_ATR_FALLBACK must be > 0")
-        if self.micro_accept_vel_z < 0:
-            raise ValueError("TB_MICRO_ACCEPT_VEL_Z must be >= 0")
-        if self.micro_accept_acc_z_max_against < 0:
-            raise ValueError("TB_MICRO_ACCEPT_ACC_Z_MAX_AGAINST must be >= 0")
-        if self.micro_arm_buffer_atr < 0:
-            raise ValueError("TB_MICRO_ARM_BUFFER_ATR must be >= 0")
-        if self.micro_arm_buffer_ticks < 0:
-            raise ValueError("TB_MICRO_ARM_BUFFER_TICKS must be >= 0")
 
     @staticmethod
     def from_env() -> "TradeBrainConfig":
@@ -423,7 +385,6 @@ class TradeBrain:
         self.cfg = cfg
         self.log = log
 
-        self._process_lock = threading.Lock()
         self._lock = threading.Lock()
         self.candles: Deque[Dict[str, Any]] = deque(maxlen=self.cfg.max_candles)
         self.current_candle: Optional[Dict[str, Any]] = None
@@ -431,8 +392,7 @@ class TradeBrain:
         # Session structure (HOD/LOD) + scalper cooldown (used by absorption veto)
         self.session_high: float = -float("inf")
         self.session_low: float = float("inf")
-        self._entry_cooldown_until_ms_by_side: Dict[str, int] = {"LONG": 0, "SHORT": 0}
-        self._session_day_ist: Optional[str] = None
+        self._entry_cooldown_until_ms: int = 0
 
         self.pos: Optional[Position] = None
         self.bias: Optional[str] = None  # "LONG" or "SHORT" or None
@@ -442,10 +402,6 @@ class TradeBrain:
         # Latest futures snapshot carried into tick-level gating (stale-checked)
         self._last_fut_flow_snapshot: Optional[Dict[str, Any]] = None
         self._last_fut_flow_ts_utc: Optional[datetime] = None
-        self._fut_sidecar_cache_lock = threading.Lock()
-        self._fut_sidecar_cache: Optional[Dict[str, Any]] = None
-        self._fut_sidecar_cache_status: str = "UNSET"
-        self._fut_sidecar_cache_fetch_ms: int = 0
 
         # Flip-control: never flip within the same 1m candle bucket
         self._last_exit_bucket_utc: Optional[datetime] = None
@@ -468,7 +424,6 @@ class TradeBrain:
         # Conflict logging de-dupe (avoid spamming HOLD_CONFLICT)
         self._hold_conflict_key: Optional[str] = None
         self._intent_conflict_info: Optional[Dict[str, Any]] = None
-        self._retest_ctx: Optional[Dict[str, Any]] = None
 
         # Diagnostic state
         self._last_diag: Dict[str, Any] = {}
@@ -487,9 +442,9 @@ class TradeBrain:
         self._ARM_TIMEOUT_MS = 1500
         self._HOLD_FAST_MS = 150
         self._HOLD_SLOW_MS = 400
-        self._MICRO_ATR_FALLBACK = float(cfg.micro_atr_fallback)
+        self._MICRO_ATR_FALLBACK = float(getattr(cfg, "micro_atr_fallback", 12.0))
         self._last_px: float = 0.0
-        self._TICK_SIZE = float(cfg.tick_size)
+        self._TICK_SIZE = float(getattr(cfg, "tick_size", 0.05))
         self._arm_log_key: Optional[Tuple[str, str, str]] = None
         self._last_entry_side: Optional[str] = None
         self._last_entry_ms: int = 0
@@ -499,8 +454,6 @@ class TradeBrain:
         self._shock_lock_until_ms: int = 0
         self._fut_flow_warn_min: Optional[str] = None
         self._last_recv_ms: Optional[int] = None
-        self._hold_wait_candle_key: Optional[str] = None
-        self._hold_wait_reasons: set[str] = set()
 
         # EMA915 tick engine state (micro-bars + EMAs)
         self._ema915_bar_ms = int(getattr(cfg, "ema915_bar_ms", 1000))
@@ -548,10 +501,6 @@ class TradeBrain:
                     self._load_session_candles_locked()
             except Exception:
                 self.log.exception("load_session_candles failed")
-        if self.candles:
-            cts = self.candles[-1].get("ts")
-            if isinstance(cts, datetime):
-                self._session_day_ist = cts.astimezone(IST_TZ).strftime("%Y-%m-%d")
 
         self._write_lock = threading.Lock()
         self.jsonl_file = open(self.cfg.jsonl_path, "a", encoding="utf-8", buffering=1)
@@ -563,11 +512,6 @@ class TradeBrain:
         self.process_tick(tick)
 
     def process_tick(self, tick: Dict[str, Any]) -> None:
-        """Single-threaded wrapper for main tick pipeline."""
-        with self._process_lock:
-            self._process_tick_unsafe(tick)
-
-    def _process_tick_unsafe(self, tick: Dict[str, Any]) -> None:
         """Main entry point for incoming ticks. Safe under bad packets."""
         try:
             ltp = _safe_float(tick.get("ltp"))
@@ -578,10 +522,6 @@ class TradeBrain:
             recv_ms = int(tick.get("recv_ms") or (recv_ns // 1_000_000))
             recv_ts_utc = datetime.fromtimestamp(recv_ms / 1000.0, tz=timezone.utc)
             self._last_recv_ms = recv_ms
-            try:
-                self._refresh_fut_sidecar_cache(recv_ms)
-            except Exception:
-                self.log.exception("refresh_fut_sidecar_cache failed")
 
             raw_tick_ts = tick.get("timestamp")
             tick_ts_utc = _parse_ts(raw_tick_ts) if raw_tick_ts is not None else None
@@ -593,20 +533,11 @@ class TradeBrain:
                 max_abs_latency_ms=int(getattr(self.cfg, "max_abs_latency_ms", 300000)),
             )
 
-            # Internal timebase is configurable:
-            # - recv_ts_utc (default; execution-coherent)
-            # - corrected exchange tick time (optional)
-            if bool(getattr(self.cfg, "use_exchange_timestamps", False)) and tick_ts_fixed is not None:
-                ts = tick_ts_fixed
-            else:
-                ts = recv_ts_utc
+            # SINGLE RULE: internal timebase = recv_ts_utc
+            ts = recv_ts_utc
             candle_ts = ts.replace(second=0, microsecond=0)
 
             with self._lock:
-                self._maybe_roll_session_locked(candle_ts)
-                if self._shock_lock_side is not None and recv_ms >= int(self._shock_lock_until_ms):
-                    self._shock_lock_side = None
-
                 # Guard against out-of-order ticks (prevents stale exits/candle corruption)
                 latest_ts = None
                 if self.current_candle is not None:
@@ -686,17 +617,6 @@ class TradeBrain:
                     m0["tick_ts_raw"] = raw_tick_ts
                     m0["latency_ms"] = latency_ms
                     m0["latency_status"] = latency_status
-                    fut0, fut_age0 = self._get_fut_flow_snapshot(ts)
-                    if fut0 is not None:
-                        m0["fut_flow"] = fut0
-                        m0["fut_flow_status"] = "OK"
-                    else:
-                        if fut_age0 is None:
-                            m0["fut_flow_status"] = "MISSING"
-                        elif fut_age0 < 0:
-                            m0["fut_flow_status"] = "FUTURE_TS"
-                        else:
-                            m0["fut_flow_status"] = "STALE"
                     prev = None
                     if self.candles:
                         prev = dict(self.candles[-1])
@@ -745,89 +665,6 @@ class TradeBrain:
                 self.arm_jsonl_file.close()
         except Exception:
             self.log.exception("close failed")
-
-    def _maybe_roll_session_locked(self, ts: datetime) -> None:
-        """Reset session-bound state when IST trading date changes."""
-        day_key = ts.astimezone(IST_TZ).strftime("%Y-%m-%d")
-        if self._session_day_ist is None:
-            self._session_day_ist = day_key
-            return
-        if day_key == self._session_day_ist:
-            return
-
-        self._session_day_ist = day_key
-        self.candles.clear()
-        self.current_candle = None
-        self.session_high = -float("inf")
-        self.session_low = float("inf")
-        self._range_hist.clear()
-        self._travel_hist.clear()
-        self._tpt_hist.clear()
-        self.bias = None
-        self.pending_shock = None
-        self._setup_side = None
-        self._setup_margin = 0.0
-        self._setup_candle_key = None
-        self._htf_long_rev_level = None
-        self._htf_long_rev_hold = 0
-        self._htf_long_rev_key = None
-        self._hold_conflict_key = None
-        self._hold_wait_candle_key = None
-        self._hold_wait_reasons.clear()
-        self._retest_ctx = None
-        self._last_diag = {}
-        self._last_fut_cvd = 0.0
-        self._last_fut_flow_snapshot = None
-        self._last_fut_flow_ts_utc = None
-        self.log.info("session_rollover_ist=%s reset_session_state=1", day_key)
-
-    def _should_emit_hold_wait_locked(self, reason: str, candle_key: str, *, engine: str = "", want_side: str = "") -> bool:
-        """Rate limit HOLD_WAIT_CONFIRM to once per (reason,engine,side) per candle."""
-        if self._hold_wait_candle_key != candle_key:
-            self._hold_wait_candle_key = candle_key
-            self._hold_wait_reasons.clear()
-        dedupe_key = f"{reason}|{engine}|{want_side}"
-        if dedupe_key in self._hold_wait_reasons:
-            return False
-        self._hold_wait_reasons.add(dedupe_key)
-        return True
-
-    def _refresh_fut_sidecar_cache(self, recv_ms: int) -> None:
-        """Prefetch sidecar line outside main trading lock to reduce lock-held file I/O."""
-        if not bool(getattr(self.cfg, "use_fut_flow", False)):
-            return
-        poll_ms = int(getattr(self.cfg, "fut_sidecar_poll_ms", 1000) or 1000)
-        poll_ms = max(100, poll_ms)
-
-        with self._fut_sidecar_cache_lock:
-            if (int(recv_ms) - int(self._fut_sidecar_cache_fetch_ms)) < poll_ms:
-                return
-            self._fut_sidecar_cache_fetch_ms = int(recv_ms)
-
-        status = "MISSING_FILE"
-        fut: Optional[Dict[str, Any]] = None
-        fut_path = str(getattr(self.cfg, "fut_sidecar_path", "") or "")
-        if fut_path and os.path.exists(fut_path):
-            line = _tail_last_line(fut_path)
-            if not line:
-                status = "EMPTY_FILE"
-            else:
-                parsed = _parse_fut_candle_row(line)
-                if isinstance(parsed, dict) and isinstance(parsed.get("ts"), datetime):
-                    fut = parsed
-                    status = "OK"
-                else:
-                    status = "PARSE_ERROR"
-
-        with self._fut_sidecar_cache_lock:
-            self._fut_sidecar_cache = dict(fut) if isinstance(fut, dict) else None
-            self._fut_sidecar_cache_status = status
-
-    def _get_fut_sidecar_cache(self) -> Tuple[Optional[Dict[str, Any]], str]:
-        with self._fut_sidecar_cache_lock:
-            fut = dict(self._fut_sidecar_cache) if isinstance(self._fut_sidecar_cache, dict) else None
-            status = str(self._fut_sidecar_cache_status or "UNSET")
-        return fut, status
 
     # ------------------------ Candle Persistence / Session SR ------------------------
     def _update_session_extremes_locked(self, candle: Dict[str, Any]) -> None:
@@ -973,204 +810,9 @@ class TradeBrain:
         sess_res = float(self.session_high) if math.isfinite(float(self.session_high)) else loc_res
         return float(loc_sup), float(loc_res), float(sess_sup), float(sess_res)
 
-    def _apply_metric_state_locked(self, state: Dict[str, Any]) -> None:
-        """Apply metric-state updates. Assumes self._lock is held."""
-        if not isinstance(state, dict):
-            return
-        self.bias = state.get("bias")
-        self._range_hist = deque(
-            [float(x) for x in state.get("range_hist", [])],
-            maxlen=self.cfg.squeeze_lookback,
-        )
-        self._travel_hist = deque(
-            [float(x) for x in state.get("travel_hist", [])],
-            maxlen=60,
-        )
-        self._tpt_hist = deque(
-            [float(x) for x in state.get("tpt_hist", [])],
-            maxlen=60,
-        )
-
-    def _compute_metrics_from_snapshot(
-        self,
-        candles_snapshot: List[Dict[str, Any]],
-        *,
-        prev_bias: Optional[str],
-        range_hist_snapshot: List[float],
-        travel_hist_snapshot: List[float],
-        tpt_hist_snapshot: List[float],
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Pure metric compute from snapshots (no shared-state mutation)."""
-        state_out: Dict[str, Any] = {
-            "bias": prev_bias,
-            "range_hist": list(range_hist_snapshot),
-            "travel_hist": list(travel_hist_snapshot),
-            "tpt_hist": list(tpt_hist_snapshot),
-        }
-        if len(candles_snapshot) < self.cfg.min_ready_candles:
-            return {}, state_out
-
-        df = pd.DataFrame(list(candles_snapshot))
-        for col in ("open", "high", "low", "close", "ticks", "total_travel", "rv2", "ts"):
-            if col not in df.columns:
-                return {}, state_out
-
-        close = pd.to_numeric(df["close"], errors="coerce")
-        high = pd.to_numeric(df["high"], errors="coerce")
-        low = pd.to_numeric(df["low"], errors="coerce")
-        open_ = pd.to_numeric(df["open"], errors="coerce")
-        if close.isna().any() or high.isna().any() or low.isna().any() or open_.isna().any():
-            return {}, state_out
-
-        hma_series = _hma_series(close, self.cfg.hma_period)
-        if hma_series.isna().iloc[-1]:
-            return {}, state_out
-        hma = float(hma_series.iloc[-1])
-
-        prev_close = close.shift(1).fillna(close)
-        tr = np.maximum(
-            (high - low).to_numpy(),
-            np.maximum(
-                np.abs((high - prev_close).to_numpy()),
-                np.abs((low - prev_close).to_numpy()),
-            ),
-        )
-        tr_s = pd.Series(tr, index=df.index)
-        atr = float(tr_s.rolling(self.cfg.atr_period, min_periods=1).mean().iloc[-1])
-        if not _is_finite_pos(atr):
-            return {}, state_out
-
-        curr_px = float(close.iloc[-1])
-        dist_signed = (curr_px - hma) / atr
-        dist_abs = abs(dist_signed)
-        upper_band = hma + self.cfg.stretch_limit * atr
-        lower_band = hma - self.cfg.stretch_limit * atr
-
-        rng = max(self._TICK_SIZE, float(high.iloc[-1] - low.iloc[-1]))
-        clv = float((2.0 * curr_px - float(high.iloc[-1]) - float(low.iloc[-1])) / rng)
-        body_pct = float(abs(curr_px - float(open_.iloc[-1])) / rng)
-
-        upper_wick = float(high.iloc[-1] - max(open_.iloc[-1], close.iloc[-1]))
-        lower_wick = float(min(open_.iloc[-1], close.iloc[-1]) - low.iloc[-1])
-        upper_wick_pct = float(upper_wick / rng)
-        lower_wick_pct = float(lower_wick / rng)
-
-        last = candles_snapshot[-1]
-        total_travel = float(last.get("total_travel", 0.0))
-        ticks = int(last.get("ticks", 0))
-        path_eff = float(abs(curr_px - float(last.get("open", curr_px))) / max(_EPS, total_travel))
-        travel_per_tick = float(total_travel / max(1, ticks))
-        rv2 = float(last.get("rv2", 0.0))
-        smoothness = float(abs(curr_px - float(last.get("open", curr_px))) / max(_EPS, math.sqrt(max(_EPS, rv2))))
-
-        travel_hist = deque([float(x) for x in travel_hist_snapshot], maxlen=60)
-        travel_hist.append(total_travel)
-        baseline_travel = float(np.mean(travel_hist)) if len(travel_hist) >= 10 else max(_EPS, total_travel)
-        pav_mult = float(total_travel / max(_EPS, baseline_travel))
-
-        aw_lo = float(self.cfg.activity_w_low)
-        aw_hi = float(self.cfg.activity_w_high)
-        if pav_mult <= aw_lo:
-            activity_w = 0.0
-        elif pav_mult >= aw_hi:
-            activity_w = 1.0
-        else:
-            activity_w = float((pav_mult - aw_lo) / max(_EPS, (aw_hi - aw_lo)))
-
-        tpt_hist = deque([float(x) for x in tpt_hist_snapshot], maxlen=60)
-        avg_tpt = float(np.mean(tpt_hist)) if len(tpt_hist) >= 1 else travel_per_tick
-        tpt_hist.append(travel_per_tick)
-
-        curr_range = float(high.iloc[-1] - low.iloc[-1])
-        range_hist = deque([float(x) for x in range_hist_snapshot], maxlen=self.cfg.squeeze_lookback)
-        range_hist.append(curr_range)
-        is_squeeze = False
-        if len(range_hist) >= self.cfg.squeeze_lookback:
-            perc = float(np.percentile(np.array(range_hist, dtype=float), self.cfg.squeeze_pct))
-            is_squeeze = curr_range <= max(_EPS, perc)
-
-        slope = 0.0
-        if len(hma_series) >= 6:
-            slope = float((hma_series.iloc[-1] - hma_series.iloc[-6]) / (5.0 * atr))
-
-        def _norm_slope(n_bars: int) -> float:
-            if len(hma_series) < (n_bars + 1):
-                return 0.0
-            try:
-                delta = float(hma_series.iloc[-1] - hma_series.iloc[-(n_bars + 1)])
-                return float(delta / max(_EPS, float(n_bars) * atr))
-            except Exception:
-                return 0.0
-
-        htf_slope_15 = _norm_slope(15)
-        htf_slope_25 = _norm_slope(25)
-
-        local_res = float(high.iloc[-1])
-        try:
-            lb_local = int(getattr(self.cfg, "htf_local_lookback", 15) or 15)
-        except Exception:
-            lb_local = 15
-        if lb_local > 0 and len(high) >= 2:
-            hist_highs = high.iloc[:-1]
-            if not hist_highs.empty:
-                local_res = float(hist_highs.tail(lb_local).max())
-
-        new_bias = _update_bias(prev_bias, slope, pos_th=0.05, neg_th=-0.05)
-
-        prev_c = float(close.iloc[-2])
-        shock_move = float(curr_px - prev_c)
-        shock_thresh = float(max(self.cfg.shock_points, self.cfg.shock_atr_mult * atr))
-        is_shock = abs(shock_move) >= shock_thresh
-        shock_side = "LONG" if shock_move > 0 else "SHORT"
-        shock_mid = float((prev_c + curr_px) / 2.0)
-
-        candle_ts = candles_snapshot[-1].get("ts") if candles_snapshot else None
-        metrics = {
-            "px": curr_px,
-            "ts_ist": _now_iso_ist(),
-            "ts": candle_ts,
-            "hma": hma,
-            "atr": atr,
-            "upper_band": upper_band,
-            "lower_band": lower_band,
-            "anchor_dist_atr_signed": dist_signed,
-            "anchor_dist_atr_abs": dist_abs,
-            "clv": clv,
-            "body_pct": body_pct,
-            "upper_wick_pct": upper_wick_pct,
-            "lower_wick_pct": lower_wick_pct,
-            "path_eff": path_eff,
-            "travel_per_tick": travel_per_tick,
-            "avg_travel_per_tick": avg_tpt,
-            "smoothness": smoothness,
-            "pav_mult": pav_mult,
-            "activity_w": activity_w,
-            "squeeze": is_squeeze,
-            "bias": new_bias or "NONE",
-            "htf_slope_15": htf_slope_15,
-            "htf_slope_25": htf_slope_25,
-            "local_res": local_res,
-            "shock": is_shock,
-            "shock_side": shock_side,
-            "shock_thresh": shock_thresh,
-            "tick_overrun": bool(last.get("_tick_overrun", False)),
-            "shock_mid": shock_mid,
-        }
-        state_out = {
-            "bias": new_bias,
-            "range_hist": list(range_hist),
-            "travel_hist": list(travel_hist),
-            "tpt_hist": list(tpt_hist),
-        }
-        return metrics, state_out
-
     # ------------------------ Candle Close ------------------------
     def _close_candle_locked(self) -> None:
-        """Assumes self._lock is held under process-thread serialization."""
-        if not self._process_lock.locked():
-            raise RuntimeError("_close_candle_locked requires _process_lock")
-        if not self._lock.locked():
-            raise RuntimeError("_close_candle_locked requires _lock")
+        """Assumes self._lock is held."""
         if self.current_candle is None:
             return
 
@@ -1178,70 +820,40 @@ class TradeBrain:
         self.candles.append(candle)
         self.current_candle = None
         self._update_session_extremes_locked(candle)
-        candles_snapshot = list(self.candles)
-        prev_bias = self.bias
-        range_hist_snapshot = list(self._range_hist)
-        travel_hist_snapshot = list(self._travel_hist)
-        tpt_hist_snapshot = list(self._tpt_hist)
+        self._persist_candle_locked(candle)
 
-        metric_state = {
-            "bias": prev_bias,
-            "range_hist": range_hist_snapshot,
-            "travel_hist": travel_hist_snapshot,
-            "tpt_hist": tpt_hist_snapshot,
-        }
-        metrics: Dict[str, Any] = {}
-        lock_released = False
-        try:
-            self._lock.release()
-            lock_released = True
-            self._persist_candle_locked(candle)
-            metrics, metric_state = self._compute_metrics_from_snapshot(
-                candles_snapshot,
-                prev_bias=prev_bias,
-                range_hist_snapshot=range_hist_snapshot,
-                travel_hist_snapshot=travel_hist_snapshot,
-                tpt_hist_snapshot=tpt_hist_snapshot,
-            )
-        except Exception:
-            self.log.exception("compute_metrics_from_snapshot failed")
-            metrics = {}
-        finally:
-            if lock_released:
-                self._lock.acquire()
-
-        self._apply_metric_state_locked(metric_state)
+        metrics = self._compute_metrics_locked()
         # Optional futures flow snapshot (sidecar). Read once per candle close.
         if bool(getattr(self.cfg, "use_fut_flow", False)):
-            fut, cached_status = self._get_fut_sidecar_cache()
-            fut_flow_status = str(cached_status or "UNSET")
-            if isinstance(fut, dict) and isinstance(fut.get("ts"), datetime):
-                fut_ts_utc = fut["ts"].astimezone(timezone.utc)
-                age = (_now_utc() - fut_ts_utc).total_seconds()
-                if 0.0 <= age <= float(getattr(self.cfg, "fut_flow_stale_sec", 180)):
-                    cvd_prev = float(getattr(self, "_last_fut_cvd", 0.0) or 0.0)
-                    try:
-                        cvd_now = float(fut.get("cvd", 0.0) or 0.0)
-                    except Exception:
-                        cvd_now = cvd_prev
-                    if not math.isfinite(cvd_now):
-                        cvd_now = cvd_prev
-                    cvd_delta = cvd_now - cvd_prev
-                    fut["cvd_delta"] = cvd_delta
-                    metrics["fut_flow"] = fut
-                    metrics["fut_cvd_delta"] = cvd_delta
-                    self._last_fut_cvd = cvd_now
-
-                    # carry into tick-level gating (stale-checked again per tick)
-                    self._last_fut_flow_snapshot = dict(fut)
-                    self._last_fut_flow_ts_utc = fut_ts_utc
-                    fut_flow_status = "OK"
-                elif age < 0.0:
+            fut_flow_status = "MISSING_FILE"
+            fut_path = str(getattr(self.cfg, "fut_sidecar_path", "") or "")
+            if fut_path and os.path.exists(fut_path):
+                line = _tail_last_line(fut_path)
+                if not line:
+                    fut_flow_status = "EMPTY_FILE"
                     metrics["fut_flow"] = None
-                    fut_flow_status = "FUTURE_TS"
                 else:
-                    metrics["fut_flow"] = None
-                    fut_flow_status = "STALE"
+                    fut = _parse_fut_candle_row(line)
+                    if isinstance(fut, dict) and isinstance(fut.get("ts"), datetime):
+                        fut_ts_utc = fut["ts"].astimezone(timezone.utc)
+                        age = abs((_now_utc() - fut_ts_utc).total_seconds())
+                        if age <= float(getattr(self.cfg, "fut_flow_stale_sec", 180)):
+                            metrics["fut_flow"] = fut
+                            cvd_now = float(fut.get("cvd", 0.0) or 0.0)
+                            cvd_prev = float(getattr(self, "_last_fut_cvd", 0.0) or 0.0)
+                            metrics["fut_cvd_delta"] = cvd_now - cvd_prev
+                            self._last_fut_cvd = cvd_now
+
+                            # carry into tick-level gating (stale-checked again per tick)
+                            self._last_fut_flow_snapshot = dict(fut)
+                            self._last_fut_flow_ts_utc = fut_ts_utc
+                            fut_flow_status = "OK"
+                        else:
+                            metrics["fut_flow"] = None
+                            fut_flow_status = "STALE"
+                    else:
+                        metrics["fut_flow"] = None
+                        fut_flow_status = "PARSE_ERROR"
             else:
                 metrics["fut_flow"] = None
 
@@ -1250,7 +862,6 @@ class TradeBrain:
                 warn_min = _now_utc().strftime("%Y%m%d%H%M")
                 if self._fut_flow_warn_min != warn_min:
                     self._fut_flow_warn_min = warn_min
-                    fut_path = str(getattr(self.cfg, "fut_sidecar_path", "") or "")
                     self.log.warning("fut_flow_status=%s path=%s", fut_flow_status, fut_path)
 
         metrics["_candle_ts"] = candle.get("ts")
@@ -1292,16 +903,168 @@ class TradeBrain:
         self._write_signal(decision, metrics)
 
     def _compute_metrics_locked(self) -> Dict[str, Any]:
-        """Compute indicators from current state. Assumes self._lock is held."""
-        metrics, state = self._compute_metrics_from_snapshot(
-            list(self.candles),
-            prev_bias=self.bias,
-            range_hist_snapshot=list(self._range_hist),
-            travel_hist_snapshot=list(self._travel_hist),
-            tpt_hist_snapshot=list(self._tpt_hist),
-        )
-        self._apply_metric_state_locked(state)
-        return metrics
+        """Compute indicators from candles. Assumes self._lock is held."""
+        if len(self.candles) < self.cfg.min_ready_candles:
+            return {}
+
+        df = pd.DataFrame(list(self.candles))
+        # Ensure required columns exist
+        for col in ("open", "high", "low", "close", "ticks", "total_travel", "rv2", "ts"):
+            if col not in df.columns:
+                return {}
+
+        close = pd.to_numeric(df["close"], errors="coerce")
+        high = pd.to_numeric(df["high"], errors="coerce")
+        low = pd.to_numeric(df["low"], errors="coerce")
+        open_ = pd.to_numeric(df["open"], errors="coerce")
+
+        if close.isna().any() or high.isna().any() or low.isna().any() or open_.isna().any():
+            return {}
+
+        # HMA series + last value
+        hma_series = _hma_series(close, self.cfg.hma_period)
+        if hma_series.isna().iloc[-1]:
+            return {}
+        hma = float(hma_series.iloc[-1])
+
+        # ATR
+        prev_close = close.shift(1).fillna(close)
+        tr = np.maximum((high - low).to_numpy(), np.maximum(np.abs((high - prev_close).to_numpy()), np.abs((low - prev_close).to_numpy())))
+        tr_s = pd.Series(tr, index=df.index)
+        atr = float(tr_s.rolling(self.cfg.atr_period, min_periods=1).mean().iloc[-1])
+        if not _is_finite_pos(atr):
+            return {}
+
+        curr_px = float(close.iloc[-1])
+
+        # Signed anchor distance & bands
+        dist_signed = (curr_px - hma) / atr
+        dist_abs = abs(dist_signed)
+        upper_band = hma + self.cfg.stretch_limit * atr
+        lower_band = hma - self.cfg.stretch_limit * atr
+
+        # Pressure (CLV) + body%
+        rng = max(self._TICK_SIZE, float(high.iloc[-1] - low.iloc[-1]))
+        clv = float((2.0 * curr_px - float(high.iloc[-1]) - float(low.iloc[-1])) / rng)
+        body_pct = float(abs(curr_px - float(open_.iloc[-1])) / rng)
+
+        # Wick %
+        upper_wick = float(high.iloc[-1] - max(open_.iloc[-1], close.iloc[-1]))
+        lower_wick = float(min(open_.iloc[-1], close.iloc[-1]) - low.iloc[-1])
+        upper_wick_pct = float(upper_wick / rng)
+        lower_wick_pct = float(lower_wick / rng)
+
+        # Efficiency metrics (price-only)
+        last = self.candles[-1]
+        total_travel = float(last.get("total_travel", 0.0))
+        ticks = int(last.get("ticks", 0))
+
+        path_eff = float(abs(curr_px - float(last.get("open", curr_px))) / max(_EPS, total_travel))
+        travel_per_tick = float(total_travel / max(1, ticks))
+
+        rv2 = float(last.get("rv2", 0.0))
+        smoothness = float(abs(curr_px - float(last.get("open", curr_px))) / max(_EPS, math.sqrt(max(_EPS, rv2))))
+
+        # PAV proxy (travel vs baseline)
+        self._travel_hist.append(total_travel)
+        baseline_travel = float(np.mean(self._travel_hist)) if len(self._travel_hist) >= 10 else max(_EPS, total_travel)
+        pav_mult = float(total_travel / max(_EPS, baseline_travel))
+
+        # Activity weight (0..1): map pav_mult to a stable participation proxy.
+        # Low tape activity => weight near 0; high activity => weight near 1.
+        aw_lo = float(self.cfg.activity_w_low)
+        aw_hi = float(self.cfg.activity_w_high)
+        if pav_mult <= aw_lo:
+            activity_w = 0.0
+        elif pav_mult >= aw_hi:
+            activity_w = 1.0
+        else:
+            activity_w = float((pav_mult - aw_lo) / max(_EPS, (aw_hi - aw_lo)))
+
+        self._tpt_hist.append(travel_per_tick)
+        avg_tpt = float(np.mean(self._tpt_hist)) if len(self._tpt_hist) >= 10 else travel_per_tick
+
+        # Squeeze: candle range bottom percentile of lookback
+        curr_range = float(high.iloc[-1] - low.iloc[-1])
+        self._range_hist.append(curr_range)
+        is_squeeze = False
+        if len(self._range_hist) >= self.cfg.squeeze_lookback:
+            perc = float(np.percentile(np.array(self._range_hist, dtype=float), self.cfg.squeeze_pct))
+            is_squeeze = curr_range <= max(_EPS, perc)
+
+        # HMA hysteresis: 5-bar normalized slope
+        slope = 0.0
+        if len(hma_series) >= 6:
+            slope = float((hma_series.iloc[-1] - hma_series.iloc[-6]) / (5.0 * atr))
+
+        # --- HTF proxy metrics & local structure (for LONG reversal proof) ---
+        # 15-bar and 25-bar normalized slopes approximate your 3m/5m read when trading 1m.
+        def _norm_slope(n_bars: int) -> float:
+            if len(hma_series) < (n_bars + 1):
+                return 0.0
+            try:
+                delta = float(hma_series.iloc[-1] - hma_series.iloc[-(n_bars + 1)])
+                return float(delta / max(_EPS, float(n_bars) * atr))
+            except Exception:
+                return 0.0
+
+        htf_slope_15 = _norm_slope(15)
+        htf_slope_25 = _norm_slope(25)
+
+        # Local resistance shelf: highest high of last N closed candles (exclude current forming/last candle)
+        local_res = float(high.iloc[-1])
+        try:
+            lb_local = int(getattr(self.cfg, "htf_local_lookback", 15) or 15)
+        except Exception:
+            lb_local = 15
+        if lb_local > 0 and len(high) >= 2:
+            hist_highs = high.iloc[:-1]  # exclude last candle
+            if not hist_highs.empty:
+                local_res = float(hist_highs.tail(lb_local).max())
+
+        # Bias state update (hysteresis)
+        self.bias = _update_bias(self.bias, slope, pos_th=0.05, neg_th=-0.05)
+
+        # Shock (close - prev_close)
+        prev_c = float(close.iloc[-2])
+        shock_move = float(curr_px - prev_c)
+        shock_thresh = float(max(self.cfg.shock_points, self.cfg.shock_atr_mult * atr))
+        is_shock = abs(shock_move) >= shock_thresh
+        shock_side = "LONG" if shock_move > 0 else "SHORT"
+        shock_mid = float((prev_c + curr_px) / 2.0)
+
+        candle_ts = self.candles[-1].get("ts") if self.candles else None
+        return {
+            "px": curr_px,
+            "ts_ist": _now_iso_ist(),
+            "ts": candle_ts,
+            "hma": hma,
+            "atr": atr,
+            "upper_band": upper_band,
+            "lower_band": lower_band,
+            "anchor_dist_atr_signed": dist_signed,
+            "anchor_dist_atr_abs": dist_abs,
+            "clv": clv,
+            "body_pct": body_pct,
+            "upper_wick_pct": upper_wick_pct,
+            "lower_wick_pct": lower_wick_pct,
+            "path_eff": path_eff,
+            "travel_per_tick": travel_per_tick,
+            "avg_travel_per_tick": avg_tpt,
+            "smoothness": smoothness,
+            "pav_mult": pav_mult,
+            "activity_w": activity_w,
+            "squeeze": is_squeeze,
+            "bias": self.bias or "NONE",
+            "htf_slope_15": htf_slope_15,
+            "htf_slope_25": htf_slope_25,
+            "local_res": local_res,
+            "shock": is_shock,
+            "shock_side": shock_side,
+            "shock_thresh": shock_thresh,
+            "tick_overrun": bool(last.get("_tick_overrun", False)),
+            "shock_mid": shock_mid,
+        }
 
     
     def _update_htf_long_reversal_state_locked(self, metrics: Dict[str, Any]) -> None:
@@ -1473,6 +1236,7 @@ class TradeBrain:
         flip_short = margin <= -float(self.cfg.flip_margin)
 
         if conflict:
+            self._setup_side = None
             self._setup_margin = margin
             return {
                 "suggestion": "HOLD_CONFLICT",
@@ -1480,7 +1244,7 @@ class TradeBrain:
                 "margin": margin,
                 "score_long": long_score,
                 "score_short": short_score,
-                "setup_side": self._setup_side,
+                "setup_side": None,
                 **ema_info,
             }
 
@@ -1600,7 +1364,6 @@ class TradeBrain:
 
         # If in a position: manage state + candle-close exits (intrabar exits handled elsewhere)
         if self.pos is not None:
-            self._retest_ctx = None
             return self._manage_open_position(m)
 
         # --- FLAT: entry selection ---
@@ -1627,15 +1390,15 @@ class TradeBrain:
             return shock_decision
 
         # Dist gate: enter only when still "fresh" (within 1.5 ATR of anchor)
-        if m["anchor_dist_atr_abs"] > float(getattr(self.cfg, "max_anchor_dist_atr", 1.5)):
+        if m["anchor_dist_atr_abs"] > 1.5:
             return {"suggestion": "HOLD", "reason": "too_far_from_anchor"}
 
         # Patterns: Clean Sweep / Inside Break / Squeeze Engulfing
         # 1) Clean Sweep (institutional-like)
         if m["path_eff"] >= self.cfg.entry_path_eff and m["travel_per_tick"] >= (m["avg_travel_per_tick"] * 1.05):
-            if (not over_up) and (not anti_climax_block_long) and m["clv"] >= self.cfg.strong_clv and (m["bias"] == "LONG") and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
+            if (not over_up) and (not anti_climax_block_long) and m["clv"] >= self.cfg.strong_clv and (m["bias"] == "LONG"):
                 return self._execute_entry("LONG", m, reason="clean_sweep")
-            if (not over_dn) and (not anti_climax_block_short) and m["clv"] <= -self.cfg.strong_clv and (m["bias"] == "SHORT") and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
+            if (not over_dn) and (not anti_climax_block_short) and m["clv"] <= -self.cfg.strong_clv and (m["bias"] == "SHORT"):
                 return self._execute_entry("SHORT", m, reason="clean_sweep")
 
         # 2) Inside Bar Break (fresh break near anchor)
@@ -1643,18 +1406,13 @@ class TradeBrain:
         if inside_decision is not None:
             return inside_decision
 
-        # 3) Break-retest-hold continuation.
-        retest_decision = self._retest_entry(m, over_up, over_dn, anti_climax_block_long, anti_climax_block_short)
-        if retest_decision is not None:
-            return retest_decision
-
-        # 4) Engulfing after squeeze (expansion scalp)
+        # 3) Engulfing after squeeze (expansion scalp)
         engulf_decision = self._squeeze_engulf_entry(m, over_up, over_dn, anti_climax_block_long, anti_climax_block_short)
         if engulf_decision is not None:
             return engulf_decision
 
         # Default: pressure + bias + confirm
-        if (not over_up) and (not anti_climax_block_long) and (m["bias"] == "LONG") and m["clv"] >= self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm and m["path_eff"] >= 0.40:
+        if (not over_up) and (m["bias"] == "LONG") and m["clv"] >= self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm and m["path_eff"] >= 0.40:
             return self._execute_entry("LONG", m, reason="bias_pressure")
         if (not over_dn) and (m["bias"] == "SHORT") and m["clv"] <= -self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm and m["path_eff"] >= 0.40 and not anti_climax_block_short:
             return self._execute_entry("SHORT", m, reason="bias_pressure")
@@ -1662,47 +1420,35 @@ class TradeBrain:
         # Anti-climax explicitly explains why we didn't short
         if anti_climax_block_short:
             return {"suggestion": "HOLD", "reason": "anti_climax_block_short"}
-        if anti_climax_block_long:
-            return {"suggestion": "HOLD", "reason": "anti_climax_block_long"}
 
         return {"suggestion": "HOLD", "reason": "scanning"}
 
     def _handle_shock_system(self, m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """WATCH shock candle, then confirm in same direction with clean efficiency."""
         now = _now_utc()
-        max_dist = float(getattr(self.cfg, "max_anchor_dist_atr", 1.5))
-        anti_climax_block_short = (float(m.get("pav_mult", 0.0) or 0.0) > 2.5 and float(m.get("lower_wick_pct", 0.0) or 0.0) > 0.20)
-        anti_climax_block_long = (float(m.get("pav_mult", 0.0) or 0.0) > 2.5 and float(m.get("upper_wick_pct", 0.0) or 0.0) > 0.20)
 
         if self.pending_shock is not None:
             if self.pending_shock.expires_at is not None and now > self.pending_shock.expires_at:
                 self.pending_shock = None
                 return {"suggestion": "HOLD", "reason": "shock_expired_time"}
 
+            self.pending_shock.remaining_candles -= 1
+            if self.pending_shock.remaining_candles <= 0:
+                self.pending_shock = None
+                return {"suggestion": "HOLD", "reason": "shock_expired"}
+
             if self.pending_shock.side == "LONG":
                 if m["px"] > self.pending_shock.mid_px and m["path_eff"] >= self.cfg.entry_path_eff and m["clv"] >= self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
-                    if float(m.get("anchor_dist_atr_abs", 0.0) or 0.0) > max_dist:
-                        return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_too_far_from_anchor"}
-                    if bool(m.get("px", 0.0) > m.get("upper_band", float("inf"))):
-                        return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_overextended_long"}
-                    if anti_climax_block_long:
-                        return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_anti_climax_long"}
                     ps = self.pending_shock
                     self.pending_shock = None
                     return {"suggestion": "ENTRY_LONG", "reason": "shock_confirm", "shock_mid": ps.mid_px}
             else:
                 if m["px"] < self.pending_shock.mid_px and m["path_eff"] >= self.cfg.entry_path_eff and m["clv"] <= -self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
-                    if float(m.get("anchor_dist_atr_abs", 0.0) or 0.0) > max_dist:
-                        return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_too_far_from_anchor"}
-                    if bool(m.get("px", 0.0) < m.get("lower_band", -float("inf"))):
-                        return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_overextended_short"}
-                    if anti_climax_block_short:
-                        return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_anti_climax_short"}
                     ps = self.pending_shock
                     self.pending_shock = None
                     return {"suggestion": "ENTRY_SHORT", "reason": "shock_confirm", "shock_mid": ps.mid_px}
 
-            # Decrement once per confirmation candle.
+            # Decrement after failed confirmation attempt (prevents off-by-one expiry).
             self.pending_shock.remaining_candles = int(self.pending_shock.remaining_candles) - 1
             if self.pending_shock.remaining_candles <= 0:
                 self.pending_shock = None
@@ -1715,11 +1461,11 @@ class TradeBrain:
                 side=str(m.get("shock_side", "LONG")),
                 mid_px=float(m.get("shock_mid", m["px"])),
                 remaining_candles=self.cfg.shock_confirm_candles,
-                expires_at=now + timedelta(minutes=int(self.cfg.shock_expiry_minutes)),
+                expires_at=now + timedelta(minutes=int(getattr(self.cfg, "shock_expiry_minutes", 3))),
             )
             now_ms = int(time.time_ns() // 1_000_000)
             self._shock_lock_side = self.pending_shock.side
-            self._shock_lock_until_ms = now_ms + int(self.cfg.shock_lock_ms)
+            self._shock_lock_until_ms = now_ms + int(getattr(self.cfg, "shock_lock_ms", 60000))
             return {"suggestion": f"WATCH_SHOCK_{self.pending_shock.side}", "reason": "shock_detected"}
 
         return None
@@ -1752,72 +1498,6 @@ class TradeBrain:
         if (not over_dn) and (not anti_climax_block_short) and m["px"] < prev_low and m["bias"] == "SHORT" and m["path_eff"] >= 0.40 and m["clv"] <= -self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
             return self._execute_entry("SHORT", m, reason="break_prev_low")
 
-        return None
-
-    def _retest_entry(
-        self,
-        m: Dict[str, Any],
-        over_up: bool,
-        over_dn: bool,
-        anti_climax_block_long: bool,
-        anti_climax_block_short: bool,
-    ) -> Optional[Dict[str, Any]]:
-        """Break -> retest -> hold continuation entry (candle-close, short-lived state)."""
-        if len(self.candles) < 2:
-            self._retest_ctx = None
-            return None
-
-        prev = self.candles[-2]
-        curr = self.candles[-1]
-        prev_high = float(prev.get("high", m["px"]) or m["px"])
-        prev_low = float(prev.get("low", m["px"]) or m["px"])
-        close_px = float(curr.get("close", m["px"]) or m["px"])
-        low_px = float(curr.get("low", close_px) or close_px)
-        high_px = float(curr.get("high", close_px) or close_px)
-        atr = max(self._TICK_SIZE, float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK))
-        act_w = float(m.get("activity_w", 0.0) or 0.0)
-
-        # Arm retest state on clean break.
-        if self._retest_ctx is None:
-            if close_px > (prev_high + self._TICK_SIZE) and m.get("bias") == "LONG" and not over_up:
-                self._retest_ctx = {"side": "LONG", "level": prev_high, "ttl": 2}
-            elif close_px < (prev_low - self._TICK_SIZE) and m.get("bias") == "SHORT" and not over_dn:
-                self._retest_ctx = {"side": "SHORT", "level": prev_low, "ttl": 2}
-            return None
-
-        side = str(self._retest_ctx.get("side", "") or "")
-        level = float(self._retest_ctx.get("level", close_px) or close_px)
-        ttl = int(self._retest_ctx.get("ttl", 0) or 0)
-
-        if side == "LONG":
-            touched = low_px <= (level + 2.0 * self._TICK_SIZE)
-            held = close_px >= (level + self._TICK_SIZE)
-            invalid = close_px < (level - 0.25 * atr)
-            if touched and held and (not over_up) and (not anti_climax_block_long) and m.get("bias") == "LONG" and float(m.get("path_eff", 0.0) or 0.0) >= 0.35 and float(m.get("clv", 0.0) or 0.0) >= float(self.cfg.min_clv_confirm) and act_w >= float(self.cfg.min_activity_w_confirm):
-                self._retest_ctx = None
-                return self._execute_entry("LONG", m, reason="retest_hold")
-            if invalid:
-                self._retest_ctx = None
-                return None
-        elif side == "SHORT":
-            touched = high_px >= (level - 2.0 * self._TICK_SIZE)
-            held = close_px <= (level - self._TICK_SIZE)
-            invalid = close_px > (level + 0.25 * atr)
-            if touched and held and (not over_dn) and (not anti_climax_block_short) and m.get("bias") == "SHORT" and float(m.get("path_eff", 0.0) or 0.0) >= 0.35 and float(m.get("clv", 0.0) or 0.0) <= -float(self.cfg.min_clv_confirm) and act_w >= float(self.cfg.min_activity_w_confirm):
-                self._retest_ctx = None
-                return self._execute_entry("SHORT", m, reason="retest_hold")
-            if invalid:
-                self._retest_ctx = None
-                return None
-        else:
-            self._retest_ctx = None
-            return None
-
-        ttl -= 1
-        if ttl <= 0:
-            self._retest_ctx = None
-        else:
-            self._retest_ctx["ttl"] = ttl
         return None
 
     def _squeeze_engulf_entry(
@@ -1874,13 +1554,10 @@ class TradeBrain:
         ts_exit = _now_utc()
 
         # Harvest mode: overextension switches to tighter trailing, no panic exit
-        dist_abs = float(m.get("anchor_dist_atr_abs", 0.0) or 0.0)
-        enter_harvest = float(self.cfg.stretch_limit)
-        exit_harvest = float(self.cfg.stretch_limit) * 0.8
-        if dist_abs >= enter_harvest:
+        if m["anchor_dist_atr_abs"] >= self.cfg.stretch_limit:
             p.is_harvest = True
             p.trail_atr_current = self.cfg.harvest_trail_atr
-        elif dist_abs <= exit_harvest:
+        else:
             p.is_harvest = False
             p.trail_atr_current = self.cfg.trail_atr
 
@@ -1929,7 +1606,6 @@ class TradeBrain:
         tick_ts: Optional[datetime] = None,
         tick_px: Optional[float] = None,
         engine: str = "candle",
-        sl_hint: Optional[float] = None,
     ) -> Dict[str, Any]:
         if tick_ts is not None:
             ts = tick_ts
@@ -1946,29 +1622,10 @@ class TradeBrain:
         hard_pts = max(hard_min, hard_mult * atr)
         tp_pts = float(self.cfg.tp_atr_mult * atr)
 
-        hard_sl_raw = (px - hard_pts) if side == "LONG" else (px + hard_pts)
-        hard_sl = _snap_price(hard_sl_raw, self._TICK_SIZE, kind=("stop_long" if side == "LONG" else "stop_short"))
+        hard_sl = (px - hard_pts) if side == "LONG" else (px + hard_pts)
         sl = hard_sl
         is_runner = bool(m.get("runner", getattr(self.cfg, "default_runner", False)))
-        if is_runner:
-            tp = None
-        else:
-            tp_raw = (px + tp_pts) if side == "LONG" else (px - tp_pts)
-            tp = _snap_price(tp_raw, self._TICK_SIZE, kind=("tp_long" if side == "LONG" else "tp_short"))
-
-        # Use structural stop hint (EMA915) when valid, but never loosen beyond hard stop.
-        if sl_hint is not None:
-            try:
-                slh = float(sl_hint)
-                if math.isfinite(slh):
-                    if side == "LONG" and slh < (px - self._TICK_SIZE):
-                        slh = _snap_price(slh, self._TICK_SIZE, kind="stop_long")
-                        sl = max(hard_sl, slh)
-                    elif side == "SHORT" and slh > (px + self._TICK_SIZE):
-                        slh = _snap_price(slh, self._TICK_SIZE, kind="stop_short")
-                        sl = min(hard_sl, slh)
-            except Exception:
-                pass
+        tp = None if is_runner else ((px + tp_pts) if side == "LONG" else (px - tp_pts))
 
         new_pos = Position(
             side=side,
@@ -2102,20 +1759,12 @@ class TradeBrain:
         if not isinstance(fut_flow, dict):
             return 0.0
 
-        def _finite(v: Any, default: float = 0.0) -> float:
-            try:
-                f = float(v)
-                return f if math.isfinite(f) else float(default)
-            except Exception:
-                return float(default)
-
         def _clamp(x: float) -> float:
-            xx = _finite(x, 0.0)
-            return max(-1.0, min(1.0, xx))
+            return max(-1.0, min(1.0, float(x)))
 
-        depth_imb = _finite(fut_flow.get("depth_imb", 0.0), 0.0)
-        buy_q = _finite(fut_flow.get("buy_qty", 0.0), 0.0)
-        sell_q = _finite(fut_flow.get("sell_qty", 0.0), 0.0)
+        depth_imb = float(fut_flow.get("depth_imb", 0.0) or 0.0)
+        buy_q = float(fut_flow.get("buy_qty", 0.0) or 0.0)
+        sell_q = float(fut_flow.get("sell_qty", 0.0) or 0.0)
         denom = max(_EPS, buy_q + sell_q)
         qty_imb = (buy_q - sell_q) / denom
 
@@ -2124,8 +1773,7 @@ class TradeBrain:
         cvd_sign = 0.0
         try:
             if cvd_delta is not None:
-                cvd_v = _finite(cvd_delta, 0.0)
-                cvd_sign = 1.0 if cvd_v > 0 else (-1.0 if cvd_v < 0 else 0.0)
+                cvd_sign = 1.0 if float(cvd_delta) > 0 else (-1.0 if float(cvd_delta) < 0 else 0.0)
         except Exception:
             cvd_sign = 0.0
 
@@ -2143,27 +1791,13 @@ class TradeBrain:
         if side not in ("LONG", "SHORT"):
             return None
 
-        def _veto_exception(gate: str, exc: Exception) -> str:
-            try:
-                self.log.warning(
-                    "entry_veto_gate_exception gate=%s side=%s engine=%s err=%s",
-                    gate,
-                    side,
-                    str(getattr(intent, "engine", "") or ""),
-                    str(exc),
-                )
-            except Exception:
-                pass
-            return f"veto_exception_{gate}"
-
-        # Cooldown after absorption traps (side-specific; prevents immediate re-fire).
+        # Cooldown after absorption traps (prevents immediate re-fire on tiny ticks).
         now_ms = int(time.time() * 1000)
         try:
-            cd_until = int(getattr(self, "_entry_cooldown_until_ms_by_side", {}).get(side, 0) or 0)
-            if now_ms < cd_until:
+            if now_ms < int(getattr(self, "_entry_cooldown_until_ms", 0) or 0):
                 return "cooldown_wait"
-        except Exception as e:
-            return _veto_exception("cooldown_state", e)
+        except Exception:
+            pass
 
         atr = float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK)
         if not _is_finite_pos(atr):
@@ -2178,33 +1812,18 @@ class TradeBrain:
             max_lat = int(getattr(self.cfg, "entry_latency_max_ms", 0) or 0)
             eng = str(getattr(intent, "engine", "") or "")
             if max_lat > 0 and eng in ("micro", "ema915"):
-                lat_raw = m.get("latency_ms", None)
-                if lat_raw is not None:
-                    lat = int(lat_raw)
-                    if abs(lat) > max_lat:
-                        return f"high_latency_{lat}ms"
-        except Exception as e:
-            return _veto_exception("latency_guard", e)
-
-        # Optional strict futures-flow dependency for tick engines.
-        try:
-            eng = str(getattr(intent, "engine", "") or "")
-            if eng in ("micro", "ema915") and bool(getattr(self.cfg, "use_fut_flow", False)):
-                ff_mode = str(getattr(self.cfg, "fut_flow_fail_mode", "neutral") or "neutral").lower()
-                ff_status = str(m.get("fut_flow_status", "") or "")
-                has_flow = isinstance(m.get("fut_flow"), dict)
-                if ff_mode == "hold":
-                    if (not has_flow) or (ff_status and ff_status != "OK"):
-                        return f"fut_flow_{(ff_status or 'missing').lower()}"
-        except Exception as e:
-            return _veto_exception("fut_flow_guard", e)
+                lat = int(m.get("latency_ms", 0) or 0)
+                if lat > max_lat:
+                    return f"high_latency_{lat}ms"
+        except Exception:
+            pass
 
         # Squeeze + low efficiency => wait for expansion/confirmation.
         try:
             if bool(m.get("squeeze", False)) and float(m.get("path_eff", 0.0) or 0.0) < float(self.cfg.min_path_eff_filter):
                 return "squeeze_chop_wait"
-        except Exception as e:
-            return _veto_exception("squeeze_guard", e)
+        except Exception:
+            pass
 
         # Absorption trap veto (wick rejection + CLV). If triggered, also arm a short cooldown.
         try:
@@ -2217,15 +1836,15 @@ class TradeBrain:
                 if side == "SHORT" and lw >= wick_th and clv0 >= clv_th:
                     cd = int(getattr(self.cfg, "absorb_cooldown_ms", 0) or 0)
                     if cd > 0:
-                        self._entry_cooldown_until_ms_by_side["SHORT"] = now_ms + cd
+                        self._entry_cooldown_until_ms = now_ms + cd
                     return "bullish_absorption_wait"
                 if side == "LONG" and uw >= wick_th and clv0 <= (-clv_th):
                     cd = int(getattr(self.cfg, "absorb_cooldown_ms", 0) or 0)
                     if cd > 0:
-                        self._entry_cooldown_until_ms_by_side["LONG"] = now_ms + cd
+                        self._entry_cooldown_until_ms = now_ms + cd
                     return "bearish_absorption_wait"
-        except Exception as e:
-            return _veto_exception("absorption_guard", e)
+        except Exception:
+            pass
 
         # SR / RR veto (anti-greed guard): don't short the floor / long the ceiling unless there's room.
         try:
@@ -2255,8 +1874,8 @@ class TradeBrain:
                     return "too_close_to_resistance"
                 if rr_min > 0.0 and rr < rr_min:
                     return f"poor_rr_{rr:.2f}"
-        except Exception as e:
-            return _veto_exception("sr_rr_guard", e)
+        except Exception:
+            pass
 
         # If the intent didn't carry anchor_dist, compute it.
         anchor_dist_signed = m.get("anchor_dist_atr_signed")
@@ -2264,8 +1883,8 @@ class TradeBrain:
             if anchor_dist_signed is None:
                 anchor_dist_signed = (px - hma) / max(_EPS, atr)
             anchor_dist_signed = float(anchor_dist_signed)
-        except Exception as e:
-            return _veto_exception("anchor_dist", e)
+        except Exception:
+            anchor_dist_signed = 0.0
 
         dir_sign = 1.0 if side == "LONG" else -1.0
         dist_in_favor = float(anchor_dist_signed) * dir_sign
@@ -2275,8 +1894,8 @@ class TradeBrain:
             min_anchor_atr = float(getattr(self.cfg, "entry_anchor_min_atr", 0.0))
             if min_anchor_atr > 0.0 and abs(float(anchor_dist_signed)) < min_anchor_atr:
                 return "near_anchor"
-        except Exception as e:
-            return _veto_exception("near_anchor_guard", e)
+        except Exception:
+            pass
 
         # Lip-touch breakout detection against dynamic ATR band around anchor.
         upper = hma + float(self.cfg.stretch_limit) * atr
@@ -2322,8 +1941,8 @@ class TradeBrain:
                         return f"micro_proactive_flow_opposes_{flow_bias:.2f}"
                     if side == "SHORT" and flow_bias > req_flow:
                         return f"micro_proactive_flow_opposes_{flow_bias:.2f}"
-        except Exception as e:
-            return _veto_exception("micro_proactive_guard", e)
+        except Exception:
+            pass
 
         # --- FEATURE 2: HTF bearish filter for LONGs (requires reversal proven) ---
         # If the HTF proxy is bearish, do NOT allow LONG unless:
@@ -2360,8 +1979,8 @@ class TradeBrain:
                         return f"htf_bear_wait_reversal_hold_{hold}/{need}"
                     if px <= (float(lvl) + buf):
                         return "htf_bear_wait_reversal_hold"
-            except Exception as e:
-                return _veto_exception("htf_bear_guard", e)
+            except Exception:
+                pass
 
         # Buy/sell climax streak filter (scaled with anchor distance). Only strict when flow isn't confirming.
         streak = self._recent_candle_streak_locked("GREEN" if side == "LONG" else "RED", max_lookback=6)
@@ -2385,31 +2004,6 @@ class TradeBrain:
     def _commit_entry_intent_locked(self, intent: EntryIntent, m0: Dict[str, Any]) -> None:
         extra = dict(m0)
         extra.update(intent.extra)
-        ckey = str(
-            extra.get("_candle_ts_utc")
-            or extra.get("_candle_ts")
-            or intent.ts.astimezone(timezone.utc).replace(second=0, microsecond=0).isoformat()
-        )
-
-        def _emit_hold(reason: str, **more: Any) -> None:
-            if not self._should_emit_hold_wait_locked(
-                str(reason),
-                ckey,
-                engine=str(intent.engine),
-                want_side=str(intent.side),
-            ):
-                return
-            hold = {
-                "channel": "tick",
-                "engine": intent.engine,
-                "ts": intent.ts.astimezone(timezone.utc).isoformat(),
-                "suggestion": "HOLD_WAIT_CONFIRM",
-                "reason": str(reason),
-                "want_side": intent.side,
-                "px": float(intent.entry_px),
-            }
-            hold.update(more)
-            self._write_signal(hold, extra)
 
         if bool(getattr(self.cfg, "respect_bias", False)):
             bias = str(extra.get("bias") or "")
@@ -2424,7 +2018,16 @@ class TradeBrain:
                 if intent.side != self._last_exit_side:
                     curr_bucket_utc = intent.ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
                     if curr_bucket_utc == self._last_exit_bucket_utc:
-                        _emit_hold("flip_cooldown_same_candle")
+                        hold = {
+                            "channel": "tick",
+                            "engine": intent.engine,
+                            "ts": intent.ts.astimezone(timezone.utc).isoformat(),
+                            "suggestion": "HOLD_WAIT_CONFIRM",
+                            "reason": "flip_cooldown_same_candle",
+                            "want_side": intent.side,
+                            "px": float(intent.entry_px),
+                        }
+                        self._write_signal(hold, extra)
                         return
         except Exception:
             pass
@@ -2433,12 +2036,20 @@ class TradeBrain:
         try:
             veto = self._entry_context_veto_locked(intent, extra)
             if veto:
-                _emit_hold(str(veto))
+                hold = {
+                    "channel": "tick",
+                    "engine": intent.engine,
+                    "ts": intent.ts.astimezone(timezone.utc).isoformat(),
+                    "suggestion": "HOLD_WAIT_CONFIRM",
+                    "reason": veto,
+                    "want_side": intent.side,
+                    "px": float(intent.entry_px),
+                }
+                self._write_signal(hold, extra)
                 return
-        except Exception as e:
-            # Fail closed for scalper safety when gating logic errors out.
-            _emit_hold("veto_check_error", error=str(e)[:120])
-            return
+        except Exception:
+            # Never block on a gating exception; fail open.
+            pass
 
         # Reversal-proof: if we just exited and the next entry is opposite, require evidence.
         if self._last_exit_side and self._last_exit_px is not None and intent.side != self._last_exit_side:
@@ -2460,14 +2071,19 @@ class TradeBrain:
             setup_strong = abs(float(self._setup_margin)) >= float(self.cfg.flip_margin)
 
             if (move_atr < float(self.cfg.reverse_min_move_atr)) or (not anchor_ok) or (not setup_strong):
-                _emit_hold(
-                    "reversal_not_proven",
-                    move_atr=float(move_atr),
-                    need_move_atr=float(self.cfg.reverse_min_move_atr),
-                    anchor_ok=bool(anchor_ok),
-                    setup_margin=float(self._setup_margin),
-                    setup_side=self._setup_side,
-                    blocked_entry_side=intent.side,
+                # Emit a single HOLD_WAIT_CONFIRM (not a timer; just "not proven yet")
+                self._write_signal(
+                    {
+                        "suggestion": "HOLD_WAIT_CONFIRM",
+                        "reason": "reversal_not_proven",
+                        "move_atr": float(move_atr),
+                        "need_move_atr": float(self.cfg.reverse_min_move_atr),
+                        "anchor_ok": bool(anchor_ok),
+                        "setup_margin": float(self._setup_margin),
+                        "setup_side": self._setup_side,
+                        "blocked_entry_side": intent.side,
+                    },
+                    extra,
                 )
                 return
         self._execute_entry(
@@ -2477,7 +2093,6 @@ class TradeBrain:
             tick_ts=intent.ts,
             tick_px=float(intent.entry_px),
             engine=intent.engine,
-            sl_hint=intent.sl_hint,
         )
         try:
             self._last_entry_side = intent.side
@@ -2525,16 +2140,8 @@ class TradeBrain:
         fut, fut_age = self._get_fut_flow_snapshot(ts)
         if fut is not None:
             out["fut_flow"] = fut
-            out["fut_flow_status"] = "OK"
             if fut_age is not None:
                 out["fut_flow_age_sec"] = float(fut_age)
-        elif bool(getattr(self.cfg, "use_fut_flow", False)):
-            if fut_age is None:
-                out["fut_flow_status"] = "MISSING"
-            elif fut_age < 0:
-                out["fut_flow_status"] = "FUTURE_TS"
-            else:
-                out["fut_flow_status"] = "STALE"
         if recv_ms is not None:
             out["recv_ms"] = int(recv_ms)
             if "latency_ms" not in out:
@@ -2565,12 +2172,10 @@ class TradeBrain:
         except Exception:
             return None, None
         try:
-            age_sec = (ts_utc - fut_ts).total_seconds()
+            age_sec = abs((ts_utc - fut_ts).total_seconds())
         except Exception:
             return None, None
 
-        if age_sec < 0:
-            return None, age_sec
         if age_sec > float(getattr(self.cfg, "fut_flow_stale_sec", 180)):
             return None, age_sec
         return dict(fut), age_sec
@@ -2681,15 +2286,15 @@ class TradeBrain:
         acc_z = max(-clip, min(clip, acc_z))
 
         def _accept_ok(side: str) -> bool:
-            min_v = float(self.cfg.micro_accept_vel_z)
-            max_against = float(self.cfg.micro_accept_acc_z_max_against)
+            min_v = float(getattr(self.cfg, "micro_accept_vel_z", 1.0))
+            max_against = float(getattr(self.cfg, "micro_accept_acc_z_max_against", 3.0))
             if side == "LONG":
                 return not (vel_z < min_v or acc_z < -max_against)
             return not (vel_z > -min_v or acc_z > max_against)
 
         prev_h = float(prev.get("high", ltp))
         prev_l = float(prev.get("low", ltp))
-        buffer = max(float(self.cfg.micro_arm_buffer_atr) * atr, float(self._TICK_SIZE) * float(self.cfg.micro_arm_buffer_ticks))
+        buffer = max(0.12 * atr, 1.0)
 
         if self._armed is None:
             if vel_z > 2.5 and acc_z > 0.0 and (prev_h - ltp) <= buffer:
@@ -3027,7 +2632,6 @@ class TradeBrain:
 
     def _check_intra_tick_exits(self, ltp: float, ts: datetime, *, recv_ms: int) -> Optional[Dict[str, Any]]:
         """Tick-level hard stop, SL/TP fills, BE + trailing."""
-        assert self._lock.locked(), "_check_intra_tick_exits must run under self._lock"
         p = self.pos
         if p is None:
             return None
@@ -3103,9 +2707,7 @@ class TradeBrain:
 
             # Move to BE
             if (not p.is_be) and ((p.best_px - p.entry_px) >= (self.cfg.move_to_be_atr * atr)):
-                be_raw = p.entry_px + self.cfg.be_buffer_points
-                be_sl = _snap_price(be_raw, self._TICK_SIZE, kind="stop_long")
-                p.sl = max(p.sl, be_sl)
+                p.sl = max(p.sl, p.entry_px + self.cfg.be_buffer_points)
                 p.is_be = True
 
             # Trailing (arm only after a proven move)
@@ -3120,7 +2722,7 @@ class TradeBrain:
 
             if bool(getattr(p, "trail_armed", False)):
                 trail_atr = p.trail_atr_current if p.trail_atr_current > 0 else self.cfg.trail_atr
-                trail_sl = _snap_price(p.best_px - (trail_atr * atr), self._TICK_SIZE, kind="stop_long")
+                trail_sl = p.best_px - (trail_atr * atr)
                 p.sl = max(p.sl, trail_sl)
 
         else:  # SHORT
@@ -3139,9 +2741,7 @@ class TradeBrain:
                 return _do_exit("EXIT_TP", p.tp)
 
             if (not p.is_be) and ((p.entry_px - p.best_px) >= (self.cfg.move_to_be_atr * atr)):
-                be_raw = p.entry_px - self.cfg.be_buffer_points
-                be_sl = _snap_price(be_raw, self._TICK_SIZE, kind="stop_short")
-                p.sl = min(p.sl, be_sl)
+                p.sl = min(p.sl, p.entry_px - self.cfg.be_buffer_points)
                 p.is_be = True
 
             # Trailing (arm only after a proven move)
@@ -3156,7 +2756,7 @@ class TradeBrain:
 
             if bool(getattr(p, "trail_armed", False)):
                 trail_atr = p.trail_atr_current if p.trail_atr_current > 0 else self.cfg.trail_atr
-                trail_sl = _snap_price(p.best_px + (trail_atr * atr), self._TICK_SIZE, kind="stop_short")
+                trail_sl = p.best_px + (trail_atr * atr)
                 p.sl = min(p.sl, trail_sl)
 
         return None
@@ -3416,17 +3016,14 @@ def _parse_fut_candle_row(line: str) -> Optional[Dict[str, Any]]:
         return None
     try:
         ts = datetime.fromisoformat(parts[0])
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
     def _f(i: int) -> float:
         try:
-            v = float(parts[i])
-            return v if math.isfinite(v) else 0.0
+            return float(parts[i])
         except Exception:
-            return 0.0
+            return float("nan")
 
     out: Dict[str, Any] = {
         "ts": ts,
@@ -3587,38 +3184,6 @@ def _now_iso_ist() -> str:
 
 def _is_finite_pos(x: float) -> bool:
     return isinstance(x, (int, float)) and math.isfinite(float(x)) and float(x) > 0.0
-
-
-def _snap_price(px: float, tick_size: float, *, kind: str = "nearest") -> float:
-    """Snap price to tradable tick based on intent.
-
-    Rules:
-    - `stop_long`: round up (toward entry; tighter/more protective).
-    - `stop_short`: round down (toward entry; tighter/more protective).
-    - `tp_long`: round down (conservative take-profit).
-    - `tp_short`: round up (conservative take-profit).
-    - `nearest`: standard nearest-tick.
-    """
-    try:
-        p = float(px)
-        t = float(tick_size)
-    except Exception:
-        return px
-    if not math.isfinite(p) or not math.isfinite(t) or t <= 0:
-        return px
-
-    q = p / t
-    if kind == "stop_long":
-        out = math.ceil(q - 1e-12) * t
-    elif kind == "stop_short":
-        out = math.floor(q + 1e-12) * t
-    elif kind == "tp_long":
-        out = math.floor(q + 1e-12) * t
-    elif kind == "tp_short":
-        out = math.ceil(q - 1e-12) * t
-    else:
-        out = round(q) * t
-    return float(round(out, 10))
 
 
 def _hma_series(series: pd.Series, period: int) -> pd.Series:
