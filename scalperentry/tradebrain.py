@@ -21,6 +21,8 @@ import math
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone, timedelta
@@ -82,8 +84,8 @@ class TradeBrainConfig:
     stretch_limit: float = float(os.getenv("TB_STRETCH_LIMIT_ATR", "2.0"))  # band = HMA ± stretch_limit*ATR
 
     # Directionality / chop filter
-    min_path_eff_filter: float = float(os.getenv("TB_MIN_PATH_EFF_FILTER", "0.18"))  # stay flat if below
-    entry_path_eff: float = float(os.getenv("TB_ENTRY_PATH_EFF", "0.70"))  # trade only if clean
+    min_path_eff_filter: float = float(os.getenv("TB_MIN_PATH_EFF_FILTER", "0.03"))  # tuned for NIFTY 1m tick-travel PE
+    entry_path_eff: float = float(os.getenv("TB_ENTRY_PATH_EFF", "0.12"))  # tuned for NIFTY 1m tick-travel PE
     entry_anchor_min_atr: float = float(os.getenv("TB_ENTRY_ANCHOR_MIN_ATR", "0.30"))  # keep entries off anchor
     max_anchor_dist_atr: float = float(os.getenv("TB_MAX_ANCHOR_DIST_ATR", "1.5"))  # max distance from anchor for entries
 
@@ -142,11 +144,11 @@ class TradeBrainConfig:
     # Pressure thresholds
     min_clv_confirm: float = float(os.getenv("TB_MIN_CLV_CONFIRM", "0.20"))  # momentum confirm
     strong_clv: float = float(os.getenv("TB_STRONG_CLV", "0.80"))  # clean sweep pattern
-    min_body_pct: float = float(os.getenv("TB_MIN_BODY_PCT", "0.18"))  # avoid doji/indecision
+    min_body_pct: float = float(os.getenv("TB_MIN_BODY_PCT", "0.08"))  # allow wick-rejection candles
 
     # Shock system
     shock_atr_mult: float = float(os.getenv("TB_SHOCK_ATR_MULT", "1.5"))
-    shock_points: float = float(os.getenv("TB_SHOCK_POINTS", "35.0"))
+    shock_points: float = float(os.getenv("TB_SHOCK_POINTS", "15.0"))
     shock_confirm_candles: int = int(os.getenv("TB_SHOCK_CONFIRM_CANDLES", "3"))
     shock_lock_ms: int = int(os.getenv("TB_SHOCK_LOCK_MS", "60000"))
     shock_expiry_minutes: int = int(os.getenv("TB_SHOCK_EXPIRY_MINUTES", "3"))
@@ -154,14 +156,61 @@ class TradeBrainConfig:
     # Exits / Trade Mgmt
     hard_stop_points: float = float(os.getenv("TB_HARD_STOP_POINTS", "20.0"))  # intra-tick hard stop vs entry
     tp_atr_mult: float = float(os.getenv("TB_TP_ATR_MULT", "2.5"))  # fixed TP when not runner
-    move_to_be_atr: float = float(os.getenv("TB_MOVE_TO_BE_ATR", "1.0"))
-    be_buffer_points: float = float(os.getenv("TB_BE_BUFFER_POINTS", "1.0"))
+    move_to_be_atr: float = float(os.getenv("TB_MOVE_TO_BE_ATR", "0.35"))
+    be_buffer_points: float = float(os.getenv("TB_BE_BUFFER_POINTS", "0.5"))
     trail_atr: float = float(os.getenv("TB_TRAIL_ATR", "2.0"))
     harvest_trail_atr: float = float(os.getenv("TB_HARVEST_TRAIL_ATR", "0.5"))
+    min_init_sl_points: float = float(os.getenv("TB_MIN_INIT_SL_POINTS", "4.0"))
+    min_init_sl_atr: float = float(os.getenv("TB_MIN_INIT_SL_ATR", "0.45"))
+    hard_stop_atr_mult: float = float(os.getenv("TB_HARD_STOP_ATR_MULT", "1.5"))
+    cooldown_reclaim_atr: float = float(os.getenv("TB_COOLDOWN_RECLAIM_ATR", "0.25"))
+    cooldown_min_bars: int = int(os.getenv("TB_COOLDOWN_MIN_BARS", "1"))
+    stall_bars: int = int(os.getenv("TB_STALL_BARS", "3"))
+    stall_min_mfe_atr: float = float(os.getenv("TB_STALL_MIN_MFE_ATR", "0.15"))
+
+    # ------------------------ Regime-aware, non-erratic enhancements ------------------------
+    # A) Proactive Break Acceptance Lite
+    proactive_lite_enable: bool = os.getenv("TB_PROACTIVE_LITE_ENABLE", "1") == "1"
+    proactive_lite_energy_min: float = float(os.getenv("TB_PROACTIVE_LITE_ENERGY_MIN", "0.52"))
+    proactive_lite_abs_margin_min: float = float(os.getenv("TB_PROACTIVE_LITE_ABS_MARGIN_MIN", "0.25"))
+    proactive_lite_abs_margin_min_ext: float = float(os.getenv("TB_PROACTIVE_LITE_ABS_MARGIN_MIN_EXT", "0.18"))
+    proactive_lite_extension_atr_min: float = float(os.getenv("TB_PROACTIVE_LITE_EXTENSION_ATR_MIN", "1.5"))
+    proactive_lite_path_eff_min: float = float(os.getenv("TB_PROACTIVE_LITE_PATH_EFF_MIN", "0.08"))
+    proactive_lite_conf_min: float = float(os.getenv("TB_PROACTIVE_LITE_CONF_MIN", "0.30"))
+    proactive_lite_latency_max_ms: int = int(os.getenv("TB_PROACTIVE_LITE_LATENCY_MAX_MS", "600"))
+
+    # B) Exit-type aware cooldown + reclaim override
+    cooldown_exit_init_sl_bars: int = int(os.getenv("TB_COOLDOWN_EXIT_INIT_SL_BARS", "1"))
+    cooldown_exit_be_bars: int = int(os.getenv("TB_COOLDOWN_EXIT_BE_BARS", "1"))
+    cooldown_exit_hard_stop_bars: int = int(os.getenv("TB_COOLDOWN_EXIT_HARD_STOP_BARS", "3"))
+    cooldown_exit_trail_bars: int = int(os.getenv("TB_COOLDOWN_EXIT_TRAIL_BARS", "0"))
+    cooldown_reclaim_override_energy_min: float = float(os.getenv("TB_COOLDOWN_RECLAIM_OVERRIDE_ENERGY_MIN", "0.55"))
+    cooldown_reclaim_override_abs_margin_min: float = float(os.getenv("TB_COOLDOWN_RECLAIM_OVERRIDE_ABS_MARGIN_MIN", "0.25"))
+
+    # C) Flip Firewall + margin floors
+    flip_lockout_candles: int = int(os.getenv("TB_FLIP_LOCKOUT_CANDLES", "3"))
+    min_abs_margin_entry: float = float(os.getenv("TB_MIN_ABS_MARGIN_ENTRY", "0.15"))
+    min_abs_margin_entry_flip: float = float(os.getenv("TB_MIN_ABS_MARGIN_ENTRY_FLIP", "0.20"))
+    flip_override_energy_min: float = float(os.getenv("TB_FLIP_OVERRIDE_ENERGY_MIN", "0.60"))
+    flip_override_abs_margin_min: float = float(os.getenv("TB_FLIP_OVERRIDE_ABS_MARGIN_MIN", "0.20"))
+    flip_override_ema915_age_ms: int = int(os.getenv("TB_FLIP_OVERRIDE_EMA915_AGE_MS", "350"))
+
+    # D) SL sanity hard gates
+    max_sl_points: float = float(os.getenv("TB_MAX_SL_POINTS", "12.0"))
+    max_sl_atr_mult: float = float(os.getenv("TB_MAX_SL_ATR_MULT", "1.5"))
+    block_on_sl_hint_rejected: bool = os.getenv("TB_BLOCK_ON_SL_HINT_REJECTED", "1") == "1"
 
     # Trailing arming and early-hit debounce (hard stop always enforced)
     trail_start_atr: float = float(os.getenv("TB_TRAIL_START_ATR", "0.8"))
     trail_debounce_ms: int = int(os.getenv("TB_TRAIL_DEBOUNCE_MS", "25000"))
+
+    # E) Regime-aware trailing profile
+    regime_trailing_enable: bool = os.getenv("TB_REGIME_TRAILING_ENABLE", "1") == "1"
+    trail_breakout_start_atr: float = float(os.getenv("TB_TRAIL_BREAKOUT_START_ATR", "0.9"))
+    trail_breakout_dist_atr: float = float(os.getenv("TB_TRAIL_BREAKOUT_DIST_ATR", "0.9"))
+    trail_trend_start_atr: float = float(os.getenv("TB_TRAIL_TREND_START_ATR", "0.7"))
+    trail_trend_dist_atr: float = float(os.getenv("TB_TRAIL_TREND_DIST_ATR", "0.7"))
+    trail_disable_in_chop: bool = os.getenv("TB_TRAIL_DISABLE_IN_CHOP", "1") == "1"
 
     # Wick exit gating (reduce churn in strong trends)
     wick_exit_min_profit_atr: float = float(os.getenv("TB_WICK_EXIT_MIN_PROFIT_ATR", "0.35"))
@@ -179,6 +228,22 @@ class TradeBrainConfig:
 
     # Optional: duplicate ARM stream into main JSONL for unified analysis
     dup_arm_to_main: bool = os.getenv("TB_DUP_ARM_TO_MAIN", "0") == "1"
+
+    # F) Anti-overtrade limiter after impulse exits (TRAIL/TP)
+    impulse_reentry_window_min: int = int(os.getenv("TB_IMPULSE_REENTRY_WINDOW_MIN", "5"))
+    impulse_reentry_max: int = int(os.getenv("TB_IMPULSE_REENTRY_MAX", "1"))
+    impulse_reentry_energy_min: float = float(os.getenv("TB_IMPULSE_REENTRY_ENERGY_MIN", "0.60"))
+    impulse_reentry_abs_margin_min: float = float(os.getenv("TB_IMPULSE_REENTRY_ABS_MARGIN_MIN", "0.15"))
+
+    # Tiered notifications (best-effort webhook)
+    notify_enable: bool = os.getenv("TB_NOTIFY_ENABLE", "1") == "1"
+    notify_webhook_url: str = os.getenv("TB_NOTIFY_WEBHOOK_URL", "").strip()
+    notify_debounce_arm_s: int = int(os.getenv("TB_NOTIFY_DEBOUNCE_ARM_S", "60"))
+    notify_debounce_go_s: int = int(os.getenv("TB_NOTIFY_DEBOUNCE_GO_S", "60"))
+    notify_debounce_manage_s: int = int(os.getenv("TB_NOTIFY_DEBOUNCE_MANAGE_S", "20"))
+    notify_latency_downgrade_ms: int = int(os.getenv("TB_NOTIFY_LATENCY_DOWNGRADE_MS", "600"))
+    notify_arm_edgescore: float = float(os.getenv("TB_NOTIFY_ARM_EDGESCORE", "0.55"))
+    notify_go_edgescore: float = float(os.getenv("TB_NOTIFY_GO_EDGESCORE", "0.70"))
 
     # Optional: Futures sidecar (Option C). Read once per 1m candle close.
     use_fut_flow: bool = os.getenv("TB_USE_FUT_FLOW", "1") == "1"
@@ -202,6 +267,8 @@ class TradeBrainConfig:
 
     # EMA915
     ema915_arm_min_age_ms: int = int(os.getenv("TB_EMA915_ARM_MIN_AGE_MS", "200"))
+    ema915_break_buffer_atr: float = float(os.getenv("TB_EMA915_BREAK_BUFFER_ATR", "0.12"))
+    ema915_break_buffer_ticks: int = int(os.getenv("TB_EMA915_BREAK_BUFFER_TICKS", "3"))
 
     # Tick/micro params
     tick_size: float = float(os.getenv("TB_TICK_SIZE", "0.05"))
@@ -213,6 +280,61 @@ class TradeBrainConfig:
 
     # Timebase
     use_exchange_timestamps: bool = os.getenv("TB_USE_EXCHANGE_TIMESTAMPS", "0") == "1"
+    allow_chop_trades: bool = os.getenv("TB_ALLOW_CHOP_TRADES", "0") == "1"
+
+    # ------------------------ Price Action Engine (3-candle) ------------------------
+    pa_enable: bool = os.getenv("TB_PA_ENABLE", "1") == "1"
+    pa_min_strength: float = float(os.getenv("TB_PA_MIN_STRENGTH", "0.62"))
+    pa_veto_strength: float = float(os.getenv("TB_PA_VETO_STRENGTH", "0.78"))
+    pa_dom_body_pct: float = float(os.getenv("TB_PA_DOM_BODY_PCT", "0.55"))
+    pa_dom_clv: float = float(os.getenv("TB_PA_DOM_CLV", "0.65"))
+    pa_dom_range_atr: float = float(os.getenv("TB_PA_DOM_RANGE_ATR", "0.75"))
+    pa_rej_wick_pct: float = float(os.getenv("TB_PA_REJ_WICK_PCT", "0.45"))
+    pa_rej_clv_max: float = float(os.getenv("TB_PA_REJ_CLV_MAX", "0.25"))
+    pa_uturn_sweep_atr: float = float(os.getenv("TB_PA_UTURN_SWEEP_ATR", "0.18"))
+    pa_uturn_reclaim_clv: float = float(os.getenv("TB_PA_UTURN_RECLAIM_CLV", "0.35"))
+    allow_chop_pa_exceptions: bool = os.getenv("TB_ALLOW_CHOP_PA_EXCEPTIONS", "1") == "1"
+    chop_pa_min_strength: float = float(os.getenv("TB_CHOP_PA_MIN_STRENGTH", "0.72"))
+    pa_countertrend_min_energy: float = float(os.getenv("TB_PA_COUNTERTREND_MIN_ENERGY", "0.72"))
+    pa_countertrend_min_margin: float = float(os.getenv("TB_PA_COUNTERTREND_MIN_MARGIN", "0.28"))
+    pa_countertrend_allow_chop: bool = os.getenv("TB_PA_COUNTERTREND_ALLOW_CHOP", "0") == "1"
+
+    # ------------------------ Breakout Energy Window ------------------------
+    breakout_enable: bool = os.getenv("TB_BREAKOUT_ENABLE", "1") == "1"
+    breakout_energy_entry_min: float = float(os.getenv("TB_BREAKOUT_ENERGY_ENTRY_MIN", "0.62"))
+    breakout_energy_keep_min: float = float(os.getenv("TB_BREAKOUT_ENERGY_KEEP_MIN", "0.42"))
+    breakout_energy_decay_base: float = float(os.getenv("TB_BREAKOUT_ENERGY_DECAY_BASE", "0.74"))
+    breakout_energy_decay_eff_w: float = float(os.getenv("TB_BREAKOUT_ENERGY_DECAY_EFF_W", "0.22"))
+    breakout_energy_decay_smooth_w: float = float(os.getenv("TB_BREAKOUT_ENERGY_DECAY_SMOOTH_W", "0.10"))
+    breakout_kill_reclaim_atr: float = float(os.getenv("TB_BREAKOUT_KILL_RECLAIM_ATR", "0.35"))
+    breakout_runaway_atr: float = float(os.getenv("TB_BREAKOUT_RUNAWAY_ATR", "1.25"))
+
+    # ------------------------ Retest State ------------------------
+    retest_runaway_atr_min: float = float(os.getenv("TB_RETEST_RUNAWAY_ATR_MIN", "0.85"))
+    retest_runaway_atr_max: float = float(os.getenv("TB_RETEST_RUNAWAY_ATR_MAX", "1.55"))
+    retest_invalid_atr: float = float(os.getenv("TB_RETEST_INVALID_ATR", "0.25"))
+    retest_touch_ticks: int = int(os.getenv("TB_RETEST_TOUCH_TICKS", "2"))
+
+    # ------------------------ Shock Energy ------------------------
+    shock_energy_min: float = float(os.getenv("TB_SHOCK_ENERGY_MIN", "0.25"))
+    shock_energy_decay_base: float = float(os.getenv("TB_SHOCK_ENERGY_DECAY_BASE", "0.78"))
+    shock_energy_decay_eff_w: float = float(os.getenv("TB_SHOCK_ENERGY_DECAY_EFF_W", "0.18"))
+    shock_energy_decay_act_w: float = float(os.getenv("TB_SHOCK_ENERGY_DECAY_ACT_W", "0.12"))
+
+    # ------------------------ Dynamic TP/Runner ------------------------
+    tp_mult_chop_min: float = float(os.getenv("TB_TP_MULT_CHOP_MIN", "0.9"))
+    tp_mult_chop_max: float = float(os.getenv("TB_TP_MULT_CHOP_MAX", "1.4"))
+    tp_mult_trend_min: float = float(os.getenv("TB_TP_MULT_TREND_MIN", "1.4"))
+    tp_mult_trend_max: float = float(os.getenv("TB_TP_MULT_TREND_MAX", "2.4"))
+    tp_mult_break_min: float = float(os.getenv("TB_TP_MULT_BREAK_MIN", "1.8"))
+    tp_mult_break_max: float = float(os.getenv("TB_TP_MULT_BREAK_MAX", "3.2"))
+    runner_conf_break: float = float(os.getenv("TB_RUNNER_CONF_BREAK", "0.78"))
+    runner_conf_trend: float = float(os.getenv("TB_RUNNER_CONF_TREND", "0.82"))
+    runner_energy_min: float = float(os.getenv("TB_RUNNER_ENERGY_MIN", "0.72"))
+    runner_pa_min: float = float(os.getenv("TB_RUNNER_PA_MIN", "0.70"))
+
+    # ------------------------ Tick engine anchor alignment ------------------------
+    anchor_align_max_against_atr: float = float(os.getenv("TB_ANCHOR_ALIGN_MAX_AGAINST_ATR", "0.60"))
 
     def validate(self) -> None:
         if self.hma_period < 5:
@@ -289,12 +411,82 @@ class TradeBrainConfig:
             raise ValueError("tp_atr_mult must be > 0")
         if self.move_to_be_atr <= 0:
             raise ValueError("move_to_be_atr must be > 0")
+        if self.be_buffer_points < 0:
+            raise ValueError("be_buffer_points must be >= 0")
+        if self.min_init_sl_points <= 0:
+            raise ValueError("min_init_sl_points must be > 0")
+        if self.min_init_sl_atr < 0:
+            raise ValueError("min_init_sl_atr must be >= 0")
+        if self.hard_stop_atr_mult <= 0:
+            raise ValueError("hard_stop_atr_mult must be > 0")
+        if self.cooldown_reclaim_atr < 0:
+            raise ValueError("cooldown_reclaim_atr must be >= 0")
+        if self.cooldown_min_bars < 0:
+            raise ValueError("cooldown_min_bars must be >= 0")
+        if self.stall_bars < 0:
+            raise ValueError("stall_bars must be >= 0")
+        if self.stall_min_mfe_atr < 0:
+            raise ValueError("stall_min_mfe_atr must be >= 0")
+        if not (0.0 <= self.proactive_lite_energy_min <= 1.0):
+            raise ValueError("proactive_lite_energy_min must be in [0,1]")
+        if not (0.0 <= self.proactive_lite_abs_margin_min <= 1.0):
+            raise ValueError("proactive_lite_abs_margin_min must be in [0,1]")
+        if not (0.0 <= self.proactive_lite_abs_margin_min_ext <= 1.0):
+            raise ValueError("proactive_lite_abs_margin_min_ext must be in [0,1]")
+        if self.proactive_lite_extension_atr_min < 0:
+            raise ValueError("proactive_lite_extension_atr_min must be >= 0")
+        if not (0.0 <= self.proactive_lite_path_eff_min <= 1.0):
+            raise ValueError("proactive_lite_path_eff_min must be in [0,1]")
+        if not (0.0 <= self.proactive_lite_conf_min <= 1.0):
+            raise ValueError("proactive_lite_conf_min must be in [0,1]")
+        if self.proactive_lite_latency_max_ms < 0:
+            raise ValueError("proactive_lite_latency_max_ms must be >= 0")
+        for k, v in (
+            ("cooldown_exit_init_sl_bars", self.cooldown_exit_init_sl_bars),
+            ("cooldown_exit_be_bars", self.cooldown_exit_be_bars),
+            ("cooldown_exit_hard_stop_bars", self.cooldown_exit_hard_stop_bars),
+            ("cooldown_exit_trail_bars", self.cooldown_exit_trail_bars),
+            ("flip_lockout_candles", self.flip_lockout_candles),
+            ("flip_override_ema915_age_ms", self.flip_override_ema915_age_ms),
+            ("impulse_reentry_window_min", self.impulse_reentry_window_min),
+            ("impulse_reentry_max", self.impulse_reentry_max),
+            ("notify_debounce_arm_s", self.notify_debounce_arm_s),
+            ("notify_debounce_go_s", self.notify_debounce_go_s),
+            ("notify_debounce_manage_s", self.notify_debounce_manage_s),
+            ("notify_latency_downgrade_ms", self.notify_latency_downgrade_ms),
+        ):
+            if int(v) < 0:
+                raise ValueError(f"{k} must be >= 0")
+        if not (0.0 <= self.cooldown_reclaim_override_energy_min <= 1.0):
+            raise ValueError("cooldown_reclaim_override_energy_min must be in [0,1]")
+        if not (0.0 <= self.cooldown_reclaim_override_abs_margin_min <= 1.0):
+            raise ValueError("cooldown_reclaim_override_abs_margin_min must be in [0,1]")
+        if not (0.0 <= self.min_abs_margin_entry <= 1.0):
+            raise ValueError("min_abs_margin_entry must be in [0,1]")
+        if not (0.0 <= self.min_abs_margin_entry_flip <= 1.0):
+            raise ValueError("min_abs_margin_entry_flip must be in [0,1]")
+        if not (0.0 <= self.flip_override_energy_min <= 1.0):
+            raise ValueError("flip_override_energy_min must be in [0,1]")
+        if not (0.0 <= self.flip_override_abs_margin_min <= 1.0):
+            raise ValueError("flip_override_abs_margin_min must be in [0,1]")
+        if self.max_sl_points <= 0:
+            raise ValueError("max_sl_points must be > 0")
+        if self.max_sl_atr_mult <= 0:
+            raise ValueError("max_sl_atr_mult must be > 0")
         if self.trail_atr <= 0 or self.harvest_trail_atr <= 0:
             raise ValueError("trail_atr and harvest_trail_atr must be > 0")
         if self.trail_start_atr < 0:
             raise ValueError("trail_start_atr must be >= 0")
         if self.trail_debounce_ms < 0:
             raise ValueError("trail_debounce_ms must be >= 0")
+        if self.trail_breakout_start_atr < 0:
+            raise ValueError("trail_breakout_start_atr must be >= 0")
+        if self.trail_breakout_dist_atr <= 0:
+            raise ValueError("trail_breakout_dist_atr must be > 0")
+        if self.trail_trend_start_atr < 0:
+            raise ValueError("trail_trend_start_atr must be >= 0")
+        if self.trail_trend_dist_atr <= 0:
+            raise ValueError("trail_trend_dist_atr must be > 0")
         if self.wick_exit_min_profit_atr < 0:
             raise ValueError("wick_exit_min_profit_atr must be >= 0")
         if not (0.05 <= self.wick_threshold <= 0.90):
@@ -349,6 +541,87 @@ class TradeBrainConfig:
             raise ValueError("TB_MICRO_ARM_BUFFER_ATR must be >= 0")
         if self.micro_arm_buffer_ticks < 0:
             raise ValueError("TB_MICRO_ARM_BUFFER_TICKS must be >= 0")
+        if self.ema915_break_buffer_atr < 0:
+            raise ValueError("TB_EMA915_BREAK_BUFFER_ATR must be >= 0")
+        if self.ema915_break_buffer_ticks < 0:
+            raise ValueError("TB_EMA915_BREAK_BUFFER_TICKS must be >= 0")
+        if not (0.0 <= self.pa_min_strength <= 1.0):
+            raise ValueError("pa_min_strength must be in [0,1]")
+        if not (0.0 <= self.pa_veto_strength <= 1.0):
+            raise ValueError("pa_veto_strength must be in [0,1]")
+        if not (0.0 < self.pa_dom_body_pct <= 1.0):
+            raise ValueError("pa_dom_body_pct must be in (0,1]")
+        if not (0.0 <= self.pa_dom_clv <= 1.0):
+            raise ValueError("pa_dom_clv must be in [0,1]")
+        if self.pa_dom_range_atr < 0:
+            raise ValueError("pa_dom_range_atr must be >= 0")
+        if not (0.0 < self.pa_rej_wick_pct <= 1.0):
+            raise ValueError("pa_rej_wick_pct must be in (0,1]")
+        if not (0.0 <= self.pa_rej_clv_max <= 1.0):
+            raise ValueError("pa_rej_clv_max must be in [0,1]")
+        if self.pa_uturn_sweep_atr < 0:
+            raise ValueError("pa_uturn_sweep_atr must be >= 0")
+        if not (0.0 <= self.pa_uturn_reclaim_clv <= 1.0):
+            raise ValueError("pa_uturn_reclaim_clv must be in [0,1]")
+        if not (0.0 <= self.chop_pa_min_strength <= 1.0):
+            raise ValueError("chop_pa_min_strength must be in [0,1]")
+        if not (0.0 <= self.pa_countertrend_min_energy <= 1.0):
+            raise ValueError("pa_countertrend_min_energy must be in [0,1]")
+        if not (0.0 <= self.pa_countertrend_min_margin <= 1.0):
+            raise ValueError("pa_countertrend_min_margin must be in [0,1]")
+        if not (0.0 <= self.breakout_energy_entry_min <= 1.0):
+            raise ValueError("breakout_energy_entry_min must be in [0,1]")
+        if not (0.0 <= self.breakout_energy_keep_min <= 1.0):
+            raise ValueError("breakout_energy_keep_min must be in [0,1]")
+        if not (0.0 < self.breakout_energy_decay_base <= 1.0):
+            raise ValueError("breakout_energy_decay_base must be in (0,1]")
+        if self.breakout_energy_decay_eff_w < 0 or self.breakout_energy_decay_smooth_w < 0:
+            raise ValueError("breakout_energy_decay_* weights must be >= 0")
+        if self.breakout_kill_reclaim_atr < 0:
+            raise ValueError("breakout_kill_reclaim_atr must be >= 0")
+        if self.breakout_runaway_atr < 0:
+            raise ValueError("breakout_runaway_atr must be >= 0")
+        if self.retest_runaway_atr_min < 0 or self.retest_runaway_atr_max < 0:
+            raise ValueError("retest_runaway_atr_* must be >= 0")
+        if self.retest_runaway_atr_min > self.retest_runaway_atr_max:
+            raise ValueError("retest_runaway_atr_min must be <= retest_runaway_atr_max")
+        if self.retest_invalid_atr < 0:
+            raise ValueError("retest_invalid_atr must be >= 0")
+        if self.retest_touch_ticks < 0:
+            raise ValueError("retest_touch_ticks must be >= 0")
+        if not (0.0 <= self.shock_energy_min <= 1.0):
+            raise ValueError("shock_energy_min must be in [0,1]")
+        if not (0.0 < self.shock_energy_decay_base <= 1.0):
+            raise ValueError("shock_energy_decay_base must be in (0,1]")
+        if self.shock_energy_decay_eff_w < 0 or self.shock_energy_decay_act_w < 0:
+            raise ValueError("shock_energy_decay_* weights must be >= 0")
+        for a, b, nm in [
+            (self.tp_mult_chop_min, self.tp_mult_chop_max, "tp_mult_chop"),
+            (self.tp_mult_trend_min, self.tp_mult_trend_max, "tp_mult_trend"),
+            (self.tp_mult_break_min, self.tp_mult_break_max, "tp_mult_break"),
+        ]:
+            if a <= 0 or b <= 0:
+                raise ValueError(f"{nm}_min/max must be > 0")
+            if a > b:
+                raise ValueError(f"{nm}_min must be <= {nm}_max")
+        if not (0.0 <= self.runner_conf_break <= 1.0):
+            raise ValueError("runner_conf_break must be in [0,1]")
+        if not (0.0 <= self.runner_conf_trend <= 1.0):
+            raise ValueError("runner_conf_trend must be in [0,1]")
+        if not (0.0 <= self.runner_energy_min <= 1.0):
+            raise ValueError("runner_energy_min must be in [0,1]")
+        if not (0.0 <= self.runner_pa_min <= 1.0):
+            raise ValueError("runner_pa_min must be in [0,1]")
+        if self.anchor_align_max_against_atr < 0:
+            raise ValueError("anchor_align_max_against_atr must be >= 0")
+        if not (0.0 <= self.impulse_reentry_energy_min <= 1.0):
+            raise ValueError("impulse_reentry_energy_min must be in [0,1]")
+        if not (0.0 <= self.impulse_reentry_abs_margin_min <= 1.0):
+            raise ValueError("impulse_reentry_abs_margin_min must be in [0,1]")
+        if not (0.0 <= self.notify_arm_edgescore <= 1.0):
+            raise ValueError("notify_arm_edgescore must be in [0,1]")
+        if not (0.0 <= self.notify_go_edgescore <= 1.0):
+            raise ValueError("notify_go_edgescore must be in [0,1]")
 
     @staticmethod
     def from_env() -> "TradeBrainConfig":
@@ -394,11 +667,19 @@ class Position:
     side: str  # "LONG" or "SHORT"
     entry_px: float
     entry_ts: datetime
+    entry_bucket_utc: Optional[datetime]
     hard_sl: float
     sl: float
     sl_init: float
     tp: Optional[float]
     best_px: float
+    entry_atr: float = 0.0
+    be_trigger_points: float = 0.0
+    trail_arm_points: float = 0.0
+    rr_est: Optional[float] = None
+    regime: str = "UNKNOWN"
+    setup_quality: str = "C"
+    confidence: float = 0.0
     is_be: bool = False
     is_runner: bool = False
     is_harvest: bool = False
@@ -413,8 +694,21 @@ class Position:
 class PendingShock:
     side: str  # "LONG" or "SHORT"
     mid_px: float
-    remaining_candles: int
+    energy: float
+    origin: str = "shock"
+    best_px: float = 0.0
     expires_at: Optional[datetime] = None
+    last_candle_key: Optional[str] = None
+
+
+@dataclass
+class BreakoutState:
+    side: str  # "LONG" or "SHORT"
+    level: float
+    origin: str
+    energy: float
+    best_px: float
+    last_candle_key: Optional[str] = None
 
 
 class TradeBrain:
@@ -437,6 +731,8 @@ class TradeBrain:
         self.pos: Optional[Position] = None
         self.bias: Optional[str] = None  # "LONG" or "SHORT" or None
         self.pending_shock: Optional[PendingShock] = None
+        self._breakout_state: Optional[BreakoutState] = None
+        self._last_pa: Optional[Dict[str, Any]] = None
         self._last_fut_cvd: float = 0.0
 
         # Latest futures snapshot carried into tick-level gating (stale-checked)
@@ -459,6 +755,7 @@ class TradeBrain:
         self._last_exit_side: Optional[str] = None
         self._last_exit_px: Optional[float] = None
         self._last_exit_ms: int = 0
+        self._stopout_cooldown_by_side: Dict[str, Optional[Dict[str, Any]]] = {"LONG": None, "SHORT": None}
 
         # HTF LONG reversal proof state (break + hold above shelf)
         self._htf_long_rev_level: Optional[float] = None
@@ -501,6 +798,8 @@ class TradeBrain:
         self._last_recv_ms: Optional[int] = None
         self._hold_wait_candle_key: Optional[str] = None
         self._hold_wait_reasons: set[str] = set()
+        self._impulse_reentry_guard_by_side: Dict[str, Optional[Dict[str, Any]]] = {"LONG": None, "SHORT": None}
+        self._notify_last_sent_by_key: Dict[str, int] = {}
 
         # EMA915 tick engine state (micro-bars + EMAs)
         self._ema915_bar_ms = int(getattr(cfg, "ema915_bar_ms", 1000))
@@ -779,6 +1078,11 @@ class TradeBrain:
         self._last_fut_cvd = 0.0
         self._last_fut_flow_snapshot = None
         self._last_fut_flow_ts_utc = None
+        self._stopout_cooldown_by_side = {"LONG": None, "SHORT": None}
+        self._impulse_reentry_guard_by_side = {"LONG": None, "SHORT": None}
+        self._notify_last_sent_by_key.clear()
+        self._breakout_state = None
+        self._last_pa = None
         self.log.info("session_rollover_ist=%s reset_session_state=1", day_key)
 
     def _should_emit_hold_wait_locked(self, reason: str, candle_key: str, *, engine: str = "", want_side: str = "") -> bool:
@@ -991,6 +1295,291 @@ class TradeBrain:
             maxlen=60,
         )
 
+    def _classify_regime(self, metrics: Dict[str, Any]) -> str:
+        """Classify tape into TREND / CHOP / BREAKOUT_WINDOW.
+
+        BREAKOUT_WINDOW is driven by breakout energy when available; otherwise it can still arm from
+        shock/distance-quality fallback for back-compat.
+        """
+        try:
+            path_eff = float(metrics.get("path_eff", 0.0) or 0.0)
+            smoothness = float(metrics.get("smoothness", 0.0) or 0.0)
+            range_atr = float(metrics.get("range_atr", 0.0) or 0.0)
+            dist_abs = abs(float(metrics.get("anchor_dist_atr_signed", 0.0) or 0.0))
+            shock = bool(metrics.get("shock", False))
+            bo_energy = float(metrics.get("breakout_energy", 0.0) or 0.0)
+            chop_low = (path_eff < float(self.cfg.min_path_eff_filter)) and (smoothness < 0.18) and (range_atr < 0.90)
+
+            if bool(getattr(self.cfg, "breakout_enable", True)) and bo_energy >= float(getattr(self.cfg, "breakout_energy_entry_min", 0.62)):
+                if chop_low:
+                    return "CHOP_BREAKOUT_WINDOW"
+                return "BREAKOUT_WINDOW"
+            if shock or (dist_abs >= 0.90 and path_eff >= float(self.cfg.entry_path_eff) * 0.85):
+                return "BREAKOUT_WINDOW"
+            if chop_low:
+                return "CHOP"
+            return "TREND"
+        except Exception:
+            return "UNKNOWN"
+
+    @staticmethod
+    def _clamp01(x: float) -> float:
+        try:
+            xx = float(x)
+        except Exception:
+            return 0.0
+        if not math.isfinite(xx):
+            return 0.0
+        return 0.0 if xx < 0.0 else (1.0 if xx > 1.0 else xx)
+
+    def _candle_features(self, c: Dict[str, Any]) -> Dict[str, float]:
+        o = float(c.get("open", 0.0) or 0.0)
+        h = float(c.get("high", o) or o)
+        l = float(c.get("low", o) or o)
+        cl = float(c.get("close", o) or o)
+        r = max(self._TICK_SIZE, h - l)
+        body_pct = abs(cl - o) / max(_EPS, r)
+        upper_wick_pct = max(0.0, h - max(o, cl)) / max(_EPS, r)
+        lower_wick_pct = max(0.0, min(o, cl) - l) / max(_EPS, r)
+        clv = ((cl - l) - (h - cl)) / max(_EPS, r)
+        return {
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": cl,
+            "range": r,
+            "body_pct": body_pct,
+            "upper_wick_pct": upper_wick_pct,
+            "lower_wick_pct": lower_wick_pct,
+            "clv": clv,
+        }
+
+    def _price_action_signal_locked(self, m: Dict[str, Any]) -> Dict[str, Any]:
+        """3-candle PA detector for dominance / rejection / sweep+reclaim u-turn."""
+        if not bool(getattr(self.cfg, "pa_enable", True)) or len(self.candles) < 3:
+            return {"pa_side": None, "pa_mode": None, "pa_strength": 0.0, "pa_tags": [], "pa_level": None}
+
+        atr = max(self._TICK_SIZE, float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK))
+        c1 = self._candle_features(self.candles[-3])
+        c2 = self._candle_features(self.candles[-2])
+        c3 = self._candle_features(self.candles[-1])
+
+        tags: List[str] = []
+        side: Optional[str] = None
+        mode: Optional[str] = None
+        level: Optional[float] = None
+        strength = 0.0
+
+        dom_body = float(getattr(self.cfg, "pa_dom_body_pct", 0.55))
+        dom_clv = float(getattr(self.cfg, "pa_dom_clv", 0.65))
+        dom_range_atr = float(getattr(self.cfg, "pa_dom_range_atr", 0.75))
+        range_atr = c3["range"] / max(_EPS, atr)
+        if c3["body_pct"] >= dom_body and abs(c3["clv"]) >= dom_clv and range_atr >= dom_range_atr:
+            mode = "dominance"
+            side = "LONG" if c3["clv"] > 0 else "SHORT"
+            level = float(c2["high"] if side == "LONG" else c2["low"])
+            strength = self._clamp01(
+                0.40 * (c3["body_pct"] / max(_EPS, dom_body))
+                + 0.35 * (abs(c3["clv"]) / max(_EPS, dom_clv))
+                + 0.25 * (range_atr / max(_EPS, dom_range_atr))
+            )
+            tags.append("dominance")
+
+        rej_w = float(getattr(self.cfg, "pa_rej_wick_pct", 0.45))
+        rej_clv_max = float(getattr(self.cfg, "pa_rej_clv_max", 0.25))
+        if mode is None:
+            if c3["lower_wick_pct"] >= rej_w and c3["clv"] >= -rej_clv_max:
+                mode = "rejection"
+                side = "LONG"
+                level = float(c3["low"])
+                strength = self._clamp01(
+                    0.55 * (c3["lower_wick_pct"] / max(_EPS, rej_w))
+                    + 0.45 * self._clamp01((c3["clv"] + 1.0) / 2.0)
+                )
+                tags.append("rejection")
+            elif c3["upper_wick_pct"] >= rej_w and c3["clv"] <= rej_clv_max:
+                mode = "rejection"
+                side = "SHORT"
+                level = float(c3["high"])
+                strength = self._clamp01(
+                    0.55 * (c3["upper_wick_pct"] / max(_EPS, rej_w))
+                    + 0.45 * self._clamp01((-c3["clv"] + 1.0) / 2.0)
+                )
+                tags.append("rejection")
+
+        if mode is None:
+            sweep_atr = float(getattr(self.cfg, "pa_uturn_sweep_atr", 0.18))
+            reclaim_clv = float(getattr(self.cfg, "pa_uturn_reclaim_clv", 0.35))
+            prior_low = min(c1["low"], c2["low"])
+            prior_high = max(c1["high"], c2["high"])
+
+            sweep_down = c2["low"] < (prior_low - sweep_atr * atr)
+            reclaim_up = (c3["close"] > prior_low) and (c3["clv"] >= reclaim_clv)
+            if sweep_down and reclaim_up:
+                mode = "uturn"
+                side = "LONG"
+                level = float(c2["low"])
+                sweep_depth = (prior_low - c2["low"]) / max(_EPS, atr)
+                strength = self._clamp01(
+                    0.50 * self._clamp01(sweep_depth / max(_EPS, sweep_atr))
+                    + 0.50 * self._clamp01(c3["clv"] / max(_EPS, reclaim_clv))
+                )
+                tags.extend(["uturn", "sweep_reclaim"])
+
+            sweep_up = c2["high"] > (prior_high + sweep_atr * atr)
+            reclaim_dn = (c3["close"] < prior_high) and (c3["clv"] <= -reclaim_clv)
+            if mode is None and sweep_up and reclaim_dn:
+                mode = "uturn"
+                side = "SHORT"
+                level = float(c2["high"])
+                sweep_depth = (c2["high"] - prior_high) / max(_EPS, atr)
+                strength = self._clamp01(
+                    0.50 * self._clamp01(sweep_depth / max(_EPS, sweep_atr))
+                    + 0.50 * self._clamp01((-c3["clv"]) / max(_EPS, reclaim_clv))
+                )
+                tags.extend(["uturn", "sweep_reclaim"])
+
+        if strength > 0.0 and strength >= float(getattr(self.cfg, "pa_min_strength", 0.62)):
+            tags.append("pa_ok")
+        return {"pa_side": side, "pa_mode": mode, "pa_strength": float(strength), "pa_tags": tags, "pa_level": level}
+
+    def _update_breakout_state_locked(self, m: Dict[str, Any]) -> Dict[str, Any]:
+        if not bool(getattr(self.cfg, "breakout_enable", True)) or not isinstance(m, dict):
+            self._breakout_state = None
+            return {"breakout_side": None, "breakout_level": None, "breakout_energy": 0.0, "breakout_origin": None}
+
+        ckey = str(m.get("_candle_ts_utc") or m.get("_candle_ts") or m.get("ts") or "")
+        if self._breakout_state is not None and self._breakout_state.last_candle_key == ckey:
+            bs = self._breakout_state
+            return {"breakout_side": bs.side, "breakout_level": bs.level, "breakout_energy": bs.energy, "breakout_origin": bs.origin}
+
+        atr = max(self._TICK_SIZE, float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK))
+        px = float(m.get("px", 0.0) or 0.0)
+        bo_side: Optional[str] = None
+        bo_level: Optional[float] = None
+        origin: Optional[str] = None
+
+        if len(self.candles) >= 2:
+            prev = self.candles[-2]
+            prev_high = float(prev.get("high", px) or px)
+            prev_low = float(prev.get("low", px) or px)
+            if px > (prev_high + self._TICK_SIZE):
+                bo_side, bo_level, origin = "LONG", prev_high, "bos"
+            elif px < (prev_low - self._TICK_SIZE):
+                bo_side, bo_level, origin = "SHORT", prev_low, "bos"
+
+        if bool(m.get("shock", False)):
+            ss = str(m.get("shock_side", "") or "")
+            if ss in ("LONG", "SHORT"):
+                bo_side, bo_level, origin = ss, float(m.get("shock_mid", px) or px), "shock"
+
+        pa_mode = str(m.get("pa_mode") or "")
+        pa_side = str(m.get("pa_side") or "")
+        pa_strength = float(m.get("pa_strength", 0.0) or 0.0)
+        if origin is None and pa_mode == "dominance" and pa_side in ("LONG", "SHORT") and pa_strength >= float(getattr(self.cfg, "pa_min_strength", 0.62)):
+            bo_side, bo_level, origin = pa_side, float(m.get("pa_level", px) or px), "pa_dom"
+
+        path_eff = self._clamp01(float(m.get("path_eff", 0.0) or 0.0))
+        smoothness = self._clamp01(float(m.get("smoothness", 0.0) or 0.0))
+        act_w = self._clamp01(float(m.get("activity_w", 0.0) or 0.0))
+        clv = float(m.get("clv", 0.0) or 0.0)
+        dir_sign = 1.0 if bo_side == "LONG" else (-1.0 if bo_side == "SHORT" else 0.0)
+        clv_dir = self._clamp01(abs(clv * dir_sign))
+        range_atr = self._clamp01(float(m.get("range_atr", 0.0) or 0.0) / 1.6)
+        init_energy = self._clamp01(0.35 * path_eff + 0.25 * smoothness + 0.20 * act_w + 0.20 * clv_dir + 0.10 * range_atr)
+
+        if bo_side in ("LONG", "SHORT") and bo_level is not None:
+            self._breakout_state = BreakoutState(
+                side=bo_side,
+                level=float(bo_level),
+                origin=str(origin or "bos"),
+                energy=float(max(init_energy, 0.30)),
+                best_px=float(px),
+                last_candle_key=ckey,
+            )
+        elif self._breakout_state is None:
+            return {"breakout_side": None, "breakout_level": None, "breakout_energy": 0.0, "breakout_origin": None}
+        else:
+            self._breakout_state.last_candle_key = ckey
+
+        bs = self._breakout_state
+        if bs is None:
+            return {"breakout_side": None, "breakout_level": None, "breakout_energy": 0.0, "breakout_origin": None}
+
+        bs.best_px = max(float(bs.best_px), px) if bs.side == "LONG" else min(float(bs.best_px), px)
+        kill_buf = float(getattr(self.cfg, "breakout_kill_reclaim_atr", 0.35)) * atr
+        if bs.side == "LONG" and px < (bs.level - kill_buf):
+            self._breakout_state = None
+            return {"breakout_side": None, "breakout_level": None, "breakout_energy": 0.0, "breakout_origin": None}
+        if bs.side == "SHORT" and px > (bs.level + kill_buf):
+            self._breakout_state = None
+            return {"breakout_side": None, "breakout_level": None, "breakout_energy": 0.0, "breakout_origin": None}
+
+        base = float(getattr(self.cfg, "breakout_energy_decay_base", 0.74))
+        w_eff = float(getattr(self.cfg, "breakout_energy_decay_eff_w", 0.22))
+        w_sm = float(getattr(self.cfg, "breakout_energy_decay_smooth_w", 0.10))
+        keep = max(0.35, min(0.98, base + w_eff * path_eff + w_sm * smoothness))
+        runaway_atr = float(getattr(self.cfg, "breakout_runaway_atr", 1.25))
+        dist_atr = abs(px - float(bs.level)) / max(_EPS, atr)
+        if dist_atr >= runaway_atr and path_eff < float(self.cfg.entry_path_eff):
+            keep *= 0.80
+        bs.energy = float(self._clamp01(float(bs.energy) * keep + 0.15 * init_energy))
+        if bs.energy < float(getattr(self.cfg, "breakout_energy_keep_min", 0.42)):
+            self._breakout_state = None
+            return {"breakout_side": None, "breakout_level": None, "breakout_energy": 0.0, "breakout_origin": None}
+        return {"breakout_side": bs.side, "breakout_level": bs.level, "breakout_energy": bs.energy, "breakout_origin": bs.origin}
+
+    def _select_tp_mult(self, m: Dict[str, Any], side: str, reason: str) -> float:
+        regime = str(m.get("regime", "UNKNOWN") or "UNKNOWN")
+        conf = self._clamp01(float(m.get("confidence", 0.0) or 0.0))
+        bo_e = self._clamp01(float(m.get("breakout_energy", 0.0) or 0.0))
+        pa_s = self._clamp01(float(m.get("pa_strength", 0.0) or 0.0))
+        if regime == "CHOP":
+            lo, hi = float(self.cfg.tp_mult_chop_min), float(self.cfg.tp_mult_chop_max)
+        elif regime in ("BREAKOUT_WINDOW", "CHOP_BREAKOUT_WINDOW"):
+            lo, hi = float(self.cfg.tp_mult_break_min), float(self.cfg.tp_mult_break_max)
+        else:
+            lo, hi = float(self.cfg.tp_mult_trend_min), float(self.cfg.tp_mult_trend_max)
+        score = self._clamp01(0.40 * conf + 0.45 * bo_e + 0.15 * pa_s)
+        try:
+            dist_abs = float(m.get("anchor_dist_atr_abs", 0.0) or 0.0)
+            if dist_abs > float(getattr(self.cfg, "late_breakout_anchor_atr", 0.90)):
+                score *= 0.85
+        except Exception:
+            pass
+        return float(max(0.10, lo + (hi - lo) * score))
+
+    def _select_runner(self, m: Dict[str, Any]) -> bool:
+        regime = str(m.get("regime", "UNKNOWN") or "UNKNOWN")
+        conf = self._clamp01(float(m.get("confidence", 0.0) or 0.0))
+        bo_e = self._clamp01(float(m.get("breakout_energy", 0.0) or 0.0))
+        pa_s = self._clamp01(float(m.get("pa_strength", 0.0) or 0.0))
+        if regime in ("BREAKOUT_WINDOW", "CHOP_BREAKOUT_WINDOW"):
+            return conf >= float(self.cfg.runner_conf_break) and bo_e >= float(self.cfg.runner_energy_min) and pa_s >= float(self.cfg.runner_pa_min)
+        if regime == "TREND":
+            return conf >= float(self.cfg.runner_conf_trend) and bo_e >= float(self.cfg.runner_energy_min) and pa_s >= float(self.cfg.runner_pa_min)
+        return False
+
+    @staticmethod
+    def _quality_and_confidence(metrics: Dict[str, Any]) -> Tuple[str, float]:
+        """Produce a compact setup quality grade and normalized confidence [0..1]."""
+        try:
+            path_eff = max(0.0, min(1.0, float(metrics.get("path_eff", 0.0) or 0.0)))
+            activity_w = max(0.0, min(1.0, float(metrics.get("activity_w", 0.0) or 0.0)))
+            clv_abs = max(0.0, min(1.0, abs(float(metrics.get("clv", 0.0) or 0.0))))
+            smoothness = max(0.0, min(1.0, float(metrics.get("smoothness", 0.0) or 0.0)))
+        except Exception:
+            return "C", 0.0
+
+        confidence = float(max(0.0, min(1.0, (0.40 * path_eff) + (0.25 * activity_w) + (0.20 * clv_abs) + (0.15 * smoothness))))
+        if confidence >= 0.72:
+            quality = "A"
+        elif confidence >= 0.52:
+            quality = "B"
+        else:
+            quality = "C"
+        return quality, confidence
+
     def _compute_metrics_from_snapshot(
         self,
         candles_snapshot: List[Dict[str, Any]],
@@ -1082,6 +1671,7 @@ class TradeBrain:
         tpt_hist.append(travel_per_tick)
 
         curr_range = float(high.iloc[-1] - low.iloc[-1])
+        range_atr = float(curr_range / max(_EPS, atr))
         range_hist = deque([float(x) for x in range_hist_snapshot], maxlen=self.cfg.squeeze_lookback)
         range_hist.append(curr_range)
         is_squeeze = False
@@ -1121,13 +1711,17 @@ class TradeBrain:
         shock_move = float(curr_px - prev_c)
         shock_thresh = float(max(self.cfg.shock_points, self.cfg.shock_atr_mult * atr))
         is_shock = abs(shock_move) >= shock_thresh
+        shock_size = abs(shock_move)
         shock_side = "LONG" if shock_move > 0 else "SHORT"
         shock_mid = float((prev_c + curr_px) / 2.0)
 
         candle_ts = candles_snapshot[-1].get("ts") if candles_snapshot else None
+        candle_ts_utc = candle_ts.astimezone(timezone.utc).isoformat() if isinstance(candle_ts, datetime) else None
+        candle_ts_ist = _iso_ist(candle_ts) if isinstance(candle_ts, datetime) else _now_iso_ist()
         metrics = {
             "px": curr_px,
-            "ts_ist": _now_iso_ist(),
+            "ts_utc": candle_ts_utc,
+            "ts_ist": candle_ts_ist,
             "ts": candle_ts,
             "hma": hma,
             "atr": atr,
@@ -1143,6 +1737,7 @@ class TradeBrain:
             "travel_per_tick": travel_per_tick,
             "avg_travel_per_tick": avg_tpt,
             "smoothness": smoothness,
+            "range_atr": range_atr,
             "pav_mult": pav_mult,
             "activity_w": activity_w,
             "squeeze": is_squeeze,
@@ -1153,9 +1748,16 @@ class TradeBrain:
             "shock": is_shock,
             "shock_side": shock_side,
             "shock_thresh": shock_thresh,
+            "shock_size": shock_size,
             "tick_overrun": bool(last.get("_tick_overrun", False)),
             "shock_mid": shock_mid,
+            "slope": slope,
         }
+        regime = self._classify_regime(metrics)
+        quality, confidence = self._quality_and_confidence(metrics)
+        metrics["regime"] = regime
+        metrics["setup_quality"] = quality
+        metrics["confidence"] = confidence
         state_out = {
             "bias": new_bias,
             "range_hist": list(range_hist),
@@ -1257,6 +1859,24 @@ class TradeBrain:
         cts = candle.get("ts")
         metrics["_candle_ts_utc"] = cts.astimezone(timezone.utc).isoformat() if isinstance(cts, datetime) else None
         metrics["_candle_ts_ist"] = _iso_ist(cts) if isinstance(cts, datetime) else None
+        metrics["candle_bucket_id"] = metrics.get("_candle_ts_utc")
+
+        # Price action + breakout energy state at candle close.
+        try:
+            pa = self._price_action_signal_locked(metrics)
+            if isinstance(pa, dict):
+                metrics.update(pa)
+                self._last_pa = dict(pa)
+        except Exception:
+            self.log.exception("price_action_signal_failed")
+        try:
+            br = self._update_breakout_state_locked(metrics)
+            if isinstance(br, dict):
+                metrics.update(br)
+                regime2 = self._classify_regime(metrics)
+                metrics["regime"] = regime2
+        except Exception:
+            self.log.exception("update_breakout_state_failed")
 
         # Update HTF reversal-proof state (break + hold above local shelf)
         self._update_htf_long_reversal_state_locked(metrics)
@@ -1290,6 +1910,50 @@ class TradeBrain:
             self._commit_entry_intent_locked(intent, metrics)
 
         self._write_signal(decision, metrics)
+
+        # Deterministic minute-close summary for chart-by-chart audit.
+        summary = {
+            "suggestion": "MARKET_UPDATE",
+            "state": "CLOSE",
+            "reason": "candle_close_summary",
+            "stream": "signal",
+            "channel": "candle",
+            "engine": "candle",
+            "ts": metrics.get("ts"),
+            "ts_utc": metrics.get("ts_utc"),
+            "ts_ist": metrics.get("ts_ist"),
+            "candle_bucket_id": metrics.get("candle_bucket_id"),
+            "open": float(candle.get("open", 0.0) or 0.0),
+            "high": float(candle.get("high", 0.0) or 0.0),
+            "low": float(candle.get("low", 0.0) or 0.0),
+            "close": float(candle.get("close", 0.0) or 0.0),
+            "regime": metrics.get("regime"),
+            "pa_side": metrics.get("pa_side"),
+            "pa_mode": metrics.get("pa_mode"),
+            "pa_strength": metrics.get("pa_strength"),
+            "pa_tags": metrics.get("pa_tags"),
+            "breakout_side": metrics.get("breakout_side"),
+            "breakout_level": metrics.get("breakout_level"),
+            "breakout_energy": metrics.get("breakout_energy"),
+            "breakout_origin": metrics.get("breakout_origin"),
+            "final_decision": decision.get("suggestion"),
+            "final_reason": decision.get("reason"),
+            "final_state": _signal_state(str(decision.get("suggestion") or "")),
+            "tp_model": {
+                "tp_atr_mult_default": float(self.cfg.tp_atr_mult),
+                "tp_mult_chop": [float(self.cfg.tp_mult_chop_min), float(self.cfg.tp_mult_chop_max)],
+                "tp_mult_trend": [float(self.cfg.tp_mult_trend_min), float(self.cfg.tp_mult_trend_max)],
+                "tp_mult_breakout": [float(self.cfg.tp_mult_break_min), float(self.cfg.tp_mult_break_max)],
+            },
+            "sl_model": {
+                "min_init_sl_points": float(self.cfg.min_init_sl_points),
+                "min_init_sl_atr": float(self.cfg.min_init_sl_atr),
+                "hard_stop_atr_mult": float(self.cfg.hard_stop_atr_mult),
+                "hard_stop_points": float(self.cfg.hard_stop_points),
+            },
+            "veto_or_override": decision.get("reason"),
+        }
+        self._write_signal(summary, metrics)
 
     def _compute_metrics_locked(self) -> Dict[str, Any]:
         """Compute indicators from current state. Assumes self._lock is held."""
@@ -1473,6 +2137,24 @@ class TradeBrain:
         flip_short = margin <= -float(self.cfg.flip_margin)
 
         if conflict:
+            try:
+                pa_mode = str(metrics.get("pa_mode") or "")
+                pa_side = str(metrics.get("pa_side") or "")
+                pa_strength = float(metrics.get("pa_strength", 0.0) or 0.0)
+                if pa_mode == "dominance" and pa_side in ("LONG", "SHORT") and pa_strength >= float(getattr(self.cfg, "pa_min_strength", 0.62)):
+                    self._setup_side = pa_side
+                    self._setup_margin = margin
+                    return {
+                        "suggestion": f"READY_{pa_side}",
+                        "reason": "pa_override_conflict",
+                        "margin": margin,
+                        "score_long": long_score,
+                        "score_short": short_score,
+                        "setup_side": pa_side,
+                        **ema_info,
+                    }
+            except Exception:
+                pass
             self._setup_margin = margin
             return {
                 "suggestion": "HOLD_CONFLICT",
@@ -1595,6 +2277,30 @@ class TradeBrain:
         if not m:
             return {"suggestion": "HOLD", "reason": "warmup"}
 
+        # Guard: during warmup/partial-metrics minutes, avoid KeyError cascades.
+        # This can happen when metric dict is truthy but core fields are incomplete.
+        core_keys = (
+            "px",
+            "atr",
+            "body_pct",
+            "path_eff",
+            "clv",
+            "pav_mult",
+            "upper_wick_pct",
+            "lower_wick_pct",
+            "upper_band",
+            "lower_band",
+            "anchor_dist_atr_abs",
+        )
+        missing = [k for k in core_keys if k not in m]
+        if missing:
+            return {
+                "suggestion": "HOLD",
+                "reason": "warmup_missing_core",
+                "missing_core": missing[:5],
+                "missing_core_n": len(missing),
+            }
+
         # Always keep last diag for tick engine
         self._last_diag = m
 
@@ -1603,13 +2309,23 @@ class TradeBrain:
             self._retest_ctx = None
             return self._manage_open_position(m)
 
+        regime = str(m.get("regime", "UNKNOWN") or "UNKNOWN")
+        if regime == "CHOP" and (not bool(getattr(self.cfg, "allow_chop_trades", False))):
+            if not bool(getattr(self.cfg, "allow_chop_pa_exceptions", True)):
+                return {"suggestion": "NO_TRADE_CHOP", "reason": "regime_chop", "regime": regime}
+            bo_e = float(m.get("breakout_energy", 0.0) or 0.0)
+            pa_s = float(m.get("pa_strength", 0.0) or 0.0)
+            if (bo_e < float(getattr(self.cfg, "breakout_energy_entry_min", 0.62))) and (pa_s < float(getattr(self.cfg, "chop_pa_min_strength", 0.72))):
+                return {"suggestion": "NO_TRADE_CHOP", "reason": "regime_chop", "regime": regime}
+            m["_chop_restricted"] = True
+
         # --- FLAT: entry selection ---
         # Global safety: doji / indecision filter
         if m["body_pct"] < self.cfg.min_body_pct:
             return {"suggestion": "HOLD", "reason": "doji_body"}
 
-        # Chop safety (the bullet filter)
-        if m["path_eff"] < self.cfg.min_path_eff_filter:
+        # Chop safety (the bullet filter): block only if inefficient and jagged.
+        if (m["path_eff"] < self.cfg.min_path_eff_filter) and (float(m.get("smoothness", 0.0) or 0.0) < 0.12):
             return {"suggestion": "HOLD", "reason": "chop_low_path_eff"}
 
         # Anti-FOMO: if outside bands, block entries in that direction
@@ -1625,6 +2341,154 @@ class TradeBrain:
         shock_decision = self._handle_shock_system(m)
         if shock_decision is not None:
             return shock_decision
+
+        # Price action engine priority: breakout-energy and PA-mode entries.
+        pa_mode = str(m.get("pa_mode") or "")
+        pa_side = str(m.get("pa_side") or "")
+        pa_strength = float(m.get("pa_strength", 0.0) or 0.0)
+        pa_level = m.get("pa_level")
+        bo_side = str(m.get("breakout_side") or "")
+        bo_level = m.get("breakout_level")
+        bo_energy = float(m.get("breakout_energy", 0.0) or 0.0)
+        margin_now = self._margin_from_metrics_safe(m)
+        margin_abs = abs(float(margin_now))
+        conf_now = float(m.get("confidence", 0.0) or 0.0)
+        path_now = float(m.get("path_eff", 0.0) or 0.0)
+        lat_ms = int(m.get("latency_ms", 0) or 0)
+        dvwap_atr = self._abs_dvwap_atr(m, float(m.get("px", 0.0) or 0.0))
+
+        def _pa_countertrend_hold() -> Optional[Dict[str, Any]]:
+            """Require stronger proof when PA dominance fights active setup-side memory."""
+            if pa_mode != "dominance" or pa_side not in ("LONG", "SHORT"):
+                return None
+            setup_side = str(self._setup_side or "")
+            if setup_side not in ("LONG", "SHORT") or setup_side == pa_side:
+                return None
+
+            regime_now = str(m.get("regime") or "")
+            allow_chop = bool(getattr(self.cfg, "pa_countertrend_allow_chop", False))
+            energy_min = float(getattr(self.cfg, "pa_countertrend_min_energy", 0.72))
+            margin_min = float(getattr(self.cfg, "pa_countertrend_min_margin", self.cfg.flip_margin) or self.cfg.flip_margin)
+            margin_min = max(0.0, min(1.0, margin_min))
+            energy_ok = bo_energy >= energy_min
+
+            margin_now = 0.0
+            try:
+                margin_now = float(self._dir_margin_from_metrics(m, ema915_bias=0.0).get("margin", 0.0))
+            except Exception:
+                margin_now = 0.0
+            margin_ok = margin_now >= margin_min if pa_side == "LONG" else margin_now <= -margin_min
+            chop_blocked = (regime_now == "CHOP") and (not allow_chop)
+
+            if energy_ok and margin_ok and (not chop_blocked):
+                return None
+            return {
+                "suggestion": "HOLD_WAIT_CONFIRM",
+                "reason": "pa_vs_setup_side",
+                "setup_side": setup_side,
+                "setup_margin": float(self._setup_margin),
+                "countertrend_side": pa_side,
+                "countertrend_margin": float(margin_now),
+                "countertrend_margin_min": float(margin_min),
+                "countertrend_energy": float(bo_energy),
+                "countertrend_energy_min": float(energy_min),
+                "countertrend_chop_blocked": bool(chop_blocked),
+            }
+
+        # Proactive Break Acceptance Lite: catch strong structure even when PA engine is neutral.
+        if bool(getattr(self.cfg, "proactive_lite_enable", False)) and bo_side in ("LONG", "SHORT"):
+            ext_min = float(getattr(self.cfg, "proactive_lite_extension_atr_min", 1.5) or 1.5)
+            req_margin = float(getattr(self.cfg, "proactive_lite_abs_margin_min", 0.25) or 0.25)
+            if dvwap_atr >= ext_min:
+                req_margin = float(getattr(self.cfg, "proactive_lite_abs_margin_min_ext", req_margin) or req_margin)
+            req_margin = max(0.0, min(1.0, req_margin))
+            margin_ok = margin_now >= req_margin if bo_side == "LONG" else margin_now <= -req_margin
+            lite_ok = (
+                bo_energy >= float(getattr(self.cfg, "proactive_lite_energy_min", 0.52))
+                and dvwap_atr >= ext_min
+                and margin_ok
+                and path_now >= float(getattr(self.cfg, "proactive_lite_path_eff_min", 0.08))
+                and conf_now >= float(getattr(self.cfg, "proactive_lite_conf_min", 0.30))
+            )
+            if lite_ok:
+                max_lat = int(getattr(self.cfg, "proactive_lite_latency_max_ms", 0) or 0)
+                if max_lat > 0 and abs(lat_ms) > max_lat:
+                    return {
+                        "suggestion": f"ARM_{bo_side}",
+                        "reason": "proactive_lite_high_latency",
+                        "breakout_energy": bo_energy,
+                        "margin": margin_now,
+                        "margin_abs": margin_abs,
+                        "margin_req": req_margin,
+                        "dvwap_atr": dvwap_atr,
+                        "latency_ms": lat_ms,
+                    }
+                if bo_side == "LONG" and (not over_up) and (not anti_climax_block_long):
+                    sl_hint = float(bo_level - 2.0 * self._TICK_SIZE) if bo_level is not None else None
+                    return self._execute_entry("LONG", m, reason="proactive_break_lite", sl_hint=sl_hint)
+                if bo_side == "SHORT" and (not over_dn) and (not anti_climax_block_short):
+                    sl_hint = float(bo_level + 2.0 * self._TICK_SIZE) if bo_level is not None else None
+                    return self._execute_entry("SHORT", m, reason="proactive_break_lite", sl_hint=sl_hint)
+
+        if bo_side in ("LONG", "SHORT") and bo_level is not None and bo_energy >= float(getattr(self.cfg, "breakout_energy_entry_min", 0.62)):
+            if (
+                bo_side == "LONG"
+                and (not over_up)
+                and (not anti_climax_block_long)
+                and m.get("bias") == "LONG"
+                and float(m.get("path_eff", 0.0) or 0.0) >= float(self.cfg.entry_path_eff)
+                and float(m.get("clv", 0.0) or 0.0) >= float(self.cfg.min_clv_confirm)
+            ):
+                sl_hint = float(bo_level - 2.0 * self._TICK_SIZE)
+                return self._execute_entry("LONG", m, reason="breakout_energy", sl_hint=sl_hint)
+            if (
+                bo_side == "SHORT"
+                and (not over_dn)
+                and (not anti_climax_block_short)
+                and m.get("bias") == "SHORT"
+                and float(m.get("path_eff", 0.0) or 0.0) >= float(self.cfg.entry_path_eff)
+                and float(m.get("clv", 0.0) or 0.0) <= -float(self.cfg.min_clv_confirm)
+            ):
+                sl_hint = float(bo_level + 2.0 * self._TICK_SIZE)
+                return self._execute_entry("SHORT", m, reason="breakout_energy", sl_hint=sl_hint)
+
+        if pa_mode in ("uturn", "rejection", "dominance") and pa_side in ("LONG", "SHORT") and pa_strength >= float(getattr(self.cfg, "pa_min_strength", 0.62)):
+            if pa_mode == "uturn":
+                if pa_side == "LONG" and (not over_up) and (not anti_climax_block_long):
+                    sl_hint = float(pa_level - 2.0 * self._TICK_SIZE) if pa_level is not None else None
+                    return self._execute_entry("LONG", m, reason="pa_uturn", sl_hint=sl_hint)
+                if pa_side == "SHORT" and (not over_dn) and (not anti_climax_block_short):
+                    sl_hint = float(pa_level + 2.0 * self._TICK_SIZE) if pa_level is not None else None
+                    return self._execute_entry("SHORT", m, reason="pa_uturn", sl_hint=sl_hint)
+
+            if pa_mode == "rejection":
+                loc_sup, loc_res, _, _ = self._get_sr_levels_locked(lb=int(getattr(self.cfg, "support_lookback", 45)))
+                atrx = max(self._TICK_SIZE, float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK))
+                sr_buf = float(getattr(self.cfg, "sr_buffer_atr", 0.0) or 0.0) * atrx
+                px0 = float(m.get("px", 0.0) or 0.0)
+                if pa_side == "LONG" and (not over_up) and (not anti_climax_block_long) and px0 <= (loc_sup + sr_buf):
+                    sl_hint = float((pa_level if pa_level is not None else loc_sup) - 2.0 * self._TICK_SIZE)
+                    return self._execute_entry("LONG", m, reason="pa_rejection", sl_hint=sl_hint)
+                if pa_side == "SHORT" and (not over_dn) and (not anti_climax_block_short) and px0 >= (loc_res - sr_buf):
+                    sl_hint = float((pa_level if pa_level is not None else loc_res) + 2.0 * self._TICK_SIZE)
+                    return self._execute_entry("SHORT", m, reason="pa_rejection", sl_hint=sl_hint)
+
+            if pa_mode == "dominance":
+                countertrend_hold = _pa_countertrend_hold()
+                if countertrend_hold is not None:
+                    return countertrend_hold
+                if pa_side == "LONG" and (not over_up) and (not anti_climax_block_long) and float(m.get("clv", 0.0) or 0.0) >= float(self.cfg.min_clv_confirm):
+                    sl_hint = float(pa_level - 2.0 * self._TICK_SIZE) if pa_level is not None else None
+                    return self._execute_entry("LONG", m, reason="pa_dominance", sl_hint=sl_hint)
+                if pa_side == "SHORT" and (not over_dn) and (not anti_climax_block_short) and float(m.get("clv", 0.0) or 0.0) <= -float(self.cfg.min_clv_confirm):
+                    sl_hint = float(pa_level + 2.0 * self._TICK_SIZE) if pa_level is not None else None
+                    return self._execute_entry("SHORT", m, reason="pa_dominance", sl_hint=sl_hint)
+
+        if pa_side in ("LONG", "SHORT") and pa_strength >= float(getattr(self.cfg, "pa_veto_strength", 0.78)):
+            if pa_side == "LONG" and m.get("bias") == "SHORT":
+                return {"suggestion": "HOLD", "reason": "pa_veto_vs_short"}
+            if pa_side == "SHORT" and m.get("bias") == "LONG":
+                return {"suggestion": "HOLD", "reason": "pa_veto_vs_long"}
 
         # Dist gate: enter only when still "fresh" (within 1.5 ATR of anchor)
         if m["anchor_dist_atr_abs"] > float(getattr(self.cfg, "max_anchor_dist_atr", 1.5)):
@@ -1654,9 +2518,9 @@ class TradeBrain:
             return engulf_decision
 
         # Default: pressure + bias + confirm
-        if (not over_up) and (not anti_climax_block_long) and (m["bias"] == "LONG") and m["clv"] >= self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm and m["path_eff"] >= 0.40:
+        if (not over_up) and (not anti_climax_block_long) and (m["bias"] == "LONG") and m["clv"] >= self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm and m["path_eff"] >= float(self.cfg.entry_path_eff):
             return self._execute_entry("LONG", m, reason="bias_pressure")
-        if (not over_dn) and (m["bias"] == "SHORT") and m["clv"] <= -self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm and m["path_eff"] >= 0.40 and not anti_climax_block_short:
+        if (not over_dn) and (m["bias"] == "SHORT") and m["clv"] <= -self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm and m["path_eff"] >= float(self.cfg.entry_path_eff) and not anti_climax_block_short:
             return self._execute_entry("SHORT", m, reason="bias_pressure")
 
         # Anti-climax explicitly explains why we didn't short
@@ -1668,59 +2532,99 @@ class TradeBrain:
         return {"suggestion": "HOLD", "reason": "scanning"}
 
     def _handle_shock_system(self, m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """WATCH shock candle, then confirm in same direction with clean efficiency."""
+        """Shock confirmation driven by energy, not by fixed candle-count."""
         now = _now_utc()
         max_dist = float(getattr(self.cfg, "max_anchor_dist_atr", 1.5))
-        anti_climax_block_short = (float(m.get("pav_mult", 0.0) or 0.0) > 2.5 and float(m.get("lower_wick_pct", 0.0) or 0.0) > 0.20)
-        anti_climax_block_long = (float(m.get("pav_mult", 0.0) or 0.0) > 2.5 and float(m.get("upper_wick_pct", 0.0) or 0.0) > 0.20)
+        anti_climax_block_short = (
+            float(m.get("pav_mult", 0.0) or 0.0) > 2.5 and float(m.get("lower_wick_pct", 0.0) or 0.0) > 0.20
+        )
+        anti_climax_block_long = (
+            float(m.get("pav_mult", 0.0) or 0.0) > 2.5 and float(m.get("upper_wick_pct", 0.0) or 0.0) > 0.20
+        )
+        ckey = str(m.get("_candle_ts_utc") or m.get("_candle_ts") or m.get("ts") or "")
 
         if self.pending_shock is not None:
-            if self.pending_shock.expires_at is not None and now > self.pending_shock.expires_at:
+            ps = self.pending_shock
+            if ps.expires_at is not None and now > ps.expires_at:
                 self.pending_shock = None
                 return {"suggestion": "HOLD", "reason": "shock_expired_time"}
 
-            if self.pending_shock.side == "LONG":
-                if m["px"] > self.pending_shock.mid_px and m["path_eff"] >= self.cfg.entry_path_eff and m["clv"] >= self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
+            if ps.last_candle_key != ckey:
+                ps.last_candle_key = ckey
+                path_eff = self._clamp01(float(m.get("path_eff", 0.0) or 0.0))
+                act_w = self._clamp01(float(m.get("activity_w", 0.0) or 0.0))
+                keep = float(getattr(self.cfg, "shock_energy_decay_base", 0.78))
+                keep += float(getattr(self.cfg, "shock_energy_decay_eff_w", 0.18)) * path_eff
+                keep += float(getattr(self.cfg, "shock_energy_decay_act_w", 0.12)) * act_w
+                keep = max(0.35, min(0.98, keep))
+                pxv = float(m.get("px", 0.0) or 0.0)
+                if ps.side == "LONG":
+                    ps.best_px = max(float(ps.best_px), pxv)
+                    if pxv < ps.mid_px:
+                        keep *= 0.85
+                else:
+                    ps.best_px = min(float(ps.best_px), pxv) if ps.best_px > 0 else pxv
+                    if pxv > ps.mid_px:
+                        keep *= 0.85
+                ps.energy = float(self._clamp01(float(ps.energy) * keep))
+
+            if float(ps.energy) < float(getattr(self.cfg, "shock_energy_min", 0.25)):
+                self.pending_shock = None
+                return {"suggestion": "HOLD", "reason": "shock_expired_energy"}
+
+            if ps.side == "LONG":
+                if (
+                    m["px"] > ps.mid_px
+                    and m["path_eff"] >= self.cfg.entry_path_eff
+                    and m["clv"] >= self.cfg.min_clv_confirm
+                    and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm
+                ):
                     if float(m.get("anchor_dist_atr_abs", 0.0) or 0.0) > max_dist:
                         return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_too_far_from_anchor"}
                     if bool(m.get("px", 0.0) > m.get("upper_band", float("inf"))):
                         return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_overextended_long"}
                     if anti_climax_block_long:
                         return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_anti_climax_long"}
-                    ps = self.pending_shock
                     self.pending_shock = None
-                    return {"suggestion": "ENTRY_LONG", "reason": "shock_confirm", "shock_mid": ps.mid_px}
+                    return {"suggestion": "ENTRY_LONG", "reason": "shock_confirm", "shock_mid": ps.mid_px, "shock_energy": float(ps.energy)}
             else:
-                if m["px"] < self.pending_shock.mid_px and m["path_eff"] >= self.cfg.entry_path_eff and m["clv"] <= -self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
+                if (
+                    m["px"] < ps.mid_px
+                    and m["path_eff"] >= self.cfg.entry_path_eff
+                    and m["clv"] <= -self.cfg.min_clv_confirm
+                    and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm
+                ):
                     if float(m.get("anchor_dist_atr_abs", 0.0) or 0.0) > max_dist:
                         return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_too_far_from_anchor"}
                     if bool(m.get("px", 0.0) < m.get("lower_band", -float("inf"))):
                         return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_overextended_short"}
                     if anti_climax_block_short:
                         return {"suggestion": "HOLD_WAIT_CONFIRM", "reason": "shock_confirm_anti_climax_short"}
-                    ps = self.pending_shock
                     self.pending_shock = None
-                    return {"suggestion": "ENTRY_SHORT", "reason": "shock_confirm", "shock_mid": ps.mid_px}
+                    return {"suggestion": "ENTRY_SHORT", "reason": "shock_confirm", "shock_mid": ps.mid_px, "shock_energy": float(ps.energy)}
 
-            # Decrement once per confirmation candle.
-            self.pending_shock.remaining_candles = int(self.pending_shock.remaining_candles) - 1
-            if self.pending_shock.remaining_candles <= 0:
-                self.pending_shock = None
-                return {"suggestion": "HOLD", "reason": "shock_expired"}
-            return {"suggestion": "HOLD", "reason": "watching_shock"}
+            return {"suggestion": "HOLD", "reason": "watching_shock", "shock_energy": float(ps.energy)}
 
         if bool(m.get("shock", False)):
-            now = _now_utc()
+            atr = max(self._TICK_SIZE, float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK))
+            shock_size_atr = abs(float(m.get("shock_size", 0.0) or 0.0)) / max(_EPS, atr)
+            path_eff = self._clamp01(float(m.get("path_eff", 0.0) or 0.0))
+            act_w = self._clamp01(float(m.get("activity_w", 0.0) or 0.0))
+            clv_abs = self._clamp01(abs(float(m.get("clv", 0.0) or 0.0)))
+            init = self._clamp01(0.30 * self._clamp01(shock_size_atr / 1.0) + 0.30 * path_eff + 0.25 * act_w + 0.15 * clv_abs)
+            init = max(0.30, float(init))
             self.pending_shock = PendingShock(
                 side=str(m.get("shock_side", "LONG")),
                 mid_px=float(m.get("shock_mid", m["px"])),
-                remaining_candles=self.cfg.shock_confirm_candles,
+                energy=float(init),
+                best_px=float(m.get("px", 0.0) or 0.0),
                 expires_at=now + timedelta(minutes=int(self.cfg.shock_expiry_minutes)),
+                last_candle_key=ckey,
             )
             now_ms = int(time.time_ns() // 1_000_000)
             self._shock_lock_side = self.pending_shock.side
             self._shock_lock_until_ms = now_ms + int(self.cfg.shock_lock_ms)
-            return {"suggestion": f"WATCH_SHOCK_{self.pending_shock.side}", "reason": "shock_detected"}
+            return {"suggestion": f"WATCH_SHOCK_{self.pending_shock.side}", "reason": "shock_detected", "shock_energy": float(self.pending_shock.energy)}
 
         return None
 
@@ -1745,11 +2649,11 @@ class TradeBrain:
             return None
 
         # Breakout up
-        if (not over_up) and (not anti_climax_block_long) and m["px"] > prev_high and m["bias"] == "LONG" and m["path_eff"] >= 0.40 and m["clv"] >= self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
+        if (not over_up) and (not anti_climax_block_long) and m["px"] > prev_high and m["bias"] == "LONG" and m["path_eff"] >= float(self.cfg.entry_path_eff) and m["clv"] >= self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
             return self._execute_entry("LONG", m, reason="break_prev_high")
 
         # Breakdown down
-        if (not over_dn) and (not anti_climax_block_short) and m["px"] < prev_low and m["bias"] == "SHORT" and m["path_eff"] >= 0.40 and m["clv"] <= -self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
+        if (not over_dn) and (not anti_climax_block_short) and m["px"] < prev_low and m["bias"] == "SHORT" and m["path_eff"] >= float(self.cfg.entry_path_eff) and m["clv"] <= -self.cfg.min_clv_confirm and float(m.get("activity_w", 0.0) or 0.0) >= self.cfg.min_activity_w_confirm:
             return self._execute_entry("SHORT", m, reason="break_prev_low")
 
         return None
@@ -1762,7 +2666,7 @@ class TradeBrain:
         anti_climax_block_long: bool,
         anti_climax_block_short: bool,
     ) -> Optional[Dict[str, Any]]:
-        """Break -> retest -> hold continuation entry (candle-close, short-lived state)."""
+        """Break -> retest -> hold continuation entry with runaway-distance expiry."""
         if len(self.candles) < 2:
             self._retest_ctx = None
             return None
@@ -1776,36 +2680,57 @@ class TradeBrain:
         high_px = float(curr.get("high", close_px) or close_px)
         atr = max(self._TICK_SIZE, float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK))
         act_w = float(m.get("activity_w", 0.0) or 0.0)
+        path_eff = float(m.get("path_eff", 0.0) or 0.0)
+        touch_ticks = max(0, int(getattr(self.cfg, "retest_touch_ticks", 2) or 2))
+        touch_buf = float(touch_ticks) * float(self._TICK_SIZE)
+        invalid_atr = float(getattr(self.cfg, "retest_invalid_atr", 0.25) or 0.25)
+        rmin = float(getattr(self.cfg, "retest_runaway_atr_min", 0.85) or 0.85)
+        rmax = float(getattr(self.cfg, "retest_runaway_atr_max", 1.55) or 1.55)
+        pe = self._clamp01((path_eff - float(self.cfg.min_path_eff_filter)) / max(_EPS, (1.0 - float(self.cfg.min_path_eff_filter))))
+        runaway_atr = rmax - (rmax - rmin) * pe
+        runaway_pts = runaway_atr * atr
 
-        # Arm retest state on clean break.
         if self._retest_ctx is None:
             if close_px > (prev_high + self._TICK_SIZE) and m.get("bias") == "LONG" and not over_up:
-                self._retest_ctx = {"side": "LONG", "level": prev_high, "ttl": 2}
+                self._retest_ctx = {"side": "LONG", "level": prev_high, "best_px": close_px, "runaway_pts": runaway_pts}
             elif close_px < (prev_low - self._TICK_SIZE) and m.get("bias") == "SHORT" and not over_dn:
-                self._retest_ctx = {"side": "SHORT", "level": prev_low, "ttl": 2}
+                self._retest_ctx = {"side": "SHORT", "level": prev_low, "best_px": close_px, "runaway_pts": runaway_pts}
             return None
 
         side = str(self._retest_ctx.get("side", "") or "")
         level = float(self._retest_ctx.get("level", close_px) or close_px)
-        ttl = int(self._retest_ctx.get("ttl", 0) or 0)
+        best_px = float(self._retest_ctx.get("best_px", close_px) or close_px)
+        runaway_pts = float(self._retest_ctx.get("runaway_pts", runaway_pts) or runaway_pts)
 
         if side == "LONG":
-            touched = low_px <= (level + 2.0 * self._TICK_SIZE)
+            best_px = max(best_px, close_px)
+        elif side == "SHORT":
+            best_px = min(best_px, close_px)
+        self._retest_ctx["best_px"] = best_px
+
+        if abs(best_px - level) >= runaway_pts:
+            self._retest_ctx = None
+            return None
+
+        if side == "LONG":
+            touched = low_px <= (level + touch_buf)
             held = close_px >= (level + self._TICK_SIZE)
-            invalid = close_px < (level - 0.25 * atr)
+            invalid = close_px < (level - invalid_atr * atr)
             if touched and held and (not over_up) and (not anti_climax_block_long) and m.get("bias") == "LONG" and float(m.get("path_eff", 0.0) or 0.0) >= 0.35 and float(m.get("clv", 0.0) or 0.0) >= float(self.cfg.min_clv_confirm) and act_w >= float(self.cfg.min_activity_w_confirm):
                 self._retest_ctx = None
-                return self._execute_entry("LONG", m, reason="retest_hold")
+                sl_hint = float(low_px - 2.0 * self._TICK_SIZE)
+                return self._execute_entry("LONG", m, reason="retest_hold", sl_hint=sl_hint)
             if invalid:
                 self._retest_ctx = None
                 return None
         elif side == "SHORT":
-            touched = high_px >= (level - 2.0 * self._TICK_SIZE)
+            touched = high_px >= (level - touch_buf)
             held = close_px <= (level - self._TICK_SIZE)
-            invalid = close_px > (level + 0.25 * atr)
+            invalid = close_px > (level + invalid_atr * atr)
             if touched and held and (not over_dn) and (not anti_climax_block_short) and m.get("bias") == "SHORT" and float(m.get("path_eff", 0.0) or 0.0) >= 0.35 and float(m.get("clv", 0.0) or 0.0) <= -float(self.cfg.min_clv_confirm) and act_w >= float(self.cfg.min_activity_w_confirm):
                 self._retest_ctx = None
-                return self._execute_entry("SHORT", m, reason="retest_hold")
+                sl_hint = float(high_px + 2.0 * self._TICK_SIZE)
+                return self._execute_entry("SHORT", m, reason="retest_hold", sl_hint=sl_hint)
             if invalid:
                 self._retest_ctx = None
                 return None
@@ -1813,11 +2738,6 @@ class TradeBrain:
             self._retest_ctx = None
             return None
 
-        ttl -= 1
-        if ttl <= 0:
-            self._retest_ctx = None
-        else:
-            self._retest_ctx["ttl"] = ttl
         return None
 
     def _squeeze_engulf_entry(
@@ -1938,47 +2858,260 @@ class TradeBrain:
             ts = m_ts if isinstance(m_ts, datetime) else _now_utc()
         px = float(tick_px) if tick_px is not None else float(m.get("px") or self._last_px)
 
+        def _entry_veto_payload(veto_reason: str, *, extra_fields: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            out = {
+                "suggestion": "ENTRY_VETO",
+                "state": "CANCEL",
+                "stream": "signal",
+                "channel": str(engine),
+                "engine": str(engine),
+                "reason": str(veto_reason),
+                "veto_reason": str(veto_reason),
+                "entry_side": str(side),
+                "px": float(px),
+                "entry_px": float(px),
+                "ts_utc": ts.astimezone(timezone.utc).isoformat(),
+                "ts_ist": _iso_ist(ts),
+            }
+            if isinstance(extra_fields, dict):
+                out.update(extra_fields)
+            return out
+
+        # Universal pre-entry gates (applies to both candle and tick engines).
+        margin_signed = self._margin_from_metrics_safe(m)
+        margin_abs = abs(float(margin_signed))
+        min_abs_margin = float(getattr(self.cfg, "min_abs_margin_entry", 0.0) or 0.0)
+        if min_abs_margin > 0.0 and margin_abs < min_abs_margin:
+            return _entry_veto_payload(
+                f"weak_margin_{margin_abs:.2f}",
+                extra_fields={"margin": float(margin_signed), "margin_abs": float(margin_abs), "margin_min": float(min_abs_margin)},
+            )
+
+        same_side_cd = self._same_side_stopout_block_reason_locked(side, ts, m)
+        if same_side_cd:
+            return _entry_veto_payload(
+                str(same_side_cd),
+                extra_fields={"margin": float(margin_signed), "breakout_energy": float(m.get("breakout_energy", 0.0) or 0.0)},
+            )
+
+        try:
+            guard = self._impulse_reentry_guard_by_side.get(side)
+            if isinstance(guard, dict):
+                win_end = guard.get("window_end_utc")
+                if isinstance(win_end, datetime) and ts.astimezone(timezone.utc) <= win_end:
+                    bo_e = float(m.get("breakout_energy", 0.0) or 0.0)
+                    need_bo = float(getattr(self.cfg, "impulse_reentry_energy_min", 0.60) or 0.60)
+                    need_m = float(getattr(self.cfg, "impulse_reentry_abs_margin_min", 0.15) or 0.15)
+                    cnt = int(guard.get("count", 0) or 0)
+                    cap = max(0, int(getattr(self.cfg, "impulse_reentry_max", 1) or 1))
+                    if cnt >= cap:
+                        return _entry_veto_payload(f"impulse_reentry_limit_{cnt}/{cap}", extra_fields={"breakout_energy": bo_e, "margin_abs": margin_abs})
+                    if bo_e < need_bo or margin_abs < need_m:
+                        return _entry_veto_payload(
+                            "impulse_reentry_wait_edge",
+                            extra_fields={"breakout_energy": bo_e, "breakout_energy_min": need_bo, "margin_abs": margin_abs, "margin_min": need_m},
+                        )
+                else:
+                    self._impulse_reentry_guard_by_side[side] = None
+        except Exception:
+            pass
+
+        if self._last_exit_side in ("LONG", "SHORT") and side != self._last_exit_side:
+            min_flip_margin = float(getattr(self.cfg, "min_abs_margin_entry_flip", 0.20) or 0.20)
+            if margin_abs < min_flip_margin:
+                return _entry_veto_payload(
+                    f"weak_flip_margin_{margin_abs:.2f}",
+                    extra_fields={"margin_abs": margin_abs, "flip_margin_min": min_flip_margin},
+                )
+            nlock = max(0, int(getattr(self.cfg, "flip_lockout_candles", 0) or 0))
+            if nlock > 0 and isinstance(self._last_exit_bucket_utc, datetime):
+                curr_bucket = ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
+                bars_since = max(0, int((curr_bucket - self._last_exit_bucket_utc).total_seconds() // 60))
+                if bars_since < nlock:
+                    bo_e = float(m.get("breakout_energy", 0.0) or 0.0)
+                    bo_ok = bo_e >= float(getattr(self.cfg, "flip_override_energy_min", 0.60) or 0.60)
+                    margin_ok = margin_abs >= float(getattr(self.cfg, "flip_override_abs_margin_min", 0.20) or 0.20)
+                    htf_hold = int(m.get("htf_rev_hold", 0) or 0) > 0
+                    ema_breach = bool(m.get("ema915_breach", False))
+                    ema_age = int(m.get("ema915_age_ms", 0) or 0)
+                    ema_ok = ema_breach and ema_age >= int(getattr(self.cfg, "flip_override_ema915_age_ms", 350) or 350)
+                    if not (margin_ok and htf_hold and (bo_ok or ema_ok)):
+                        return _entry_veto_payload(
+                            f"flip_firewall_{bars_since}/{nlock}",
+                            extra_fields={
+                                "margin_abs": margin_abs,
+                                "breakout_energy": bo_e,
+                                "htf_rev_hold": int(m.get("htf_rev_hold", 0) or 0),
+                                "ema915_breach": bool(ema_breach),
+                                "ema915_age_ms": ema_age,
+                            },
+                        )
+
         atr = float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK)
         atr = max(self._TICK_SIZE, atr)
+        min_sl_distance = max(self._TICK_SIZE, float(self.cfg.min_init_sl_points), float(self.cfg.min_init_sl_atr) * atr)
 
         hard_min = float(self.cfg.hard_stop_points)
-        hard_mult = float(getattr(self.cfg, "hard_stop_atr_mult", 1.5))
-        hard_pts = max(hard_min, hard_mult * atr)
-        tp_pts = float(self.cfg.tp_atr_mult * atr)
+        hard_mult = float(self.cfg.hard_stop_atr_mult)
+        hard_pts = max(hard_min, hard_mult * atr, min_sl_distance)
+        try:
+            tp_mult = float(m.get("tp_mult")) if m.get("tp_mult") is not None else float(self._select_tp_mult(m, side, reason))
+        except Exception:
+            tp_mult = float(self.cfg.tp_atr_mult)
+        tp_mult = float(max(0.10, tp_mult))
+        tp_pts = float(tp_mult * atr)
+        m["tp_mult"] = tp_mult
+        be_trigger_points = float(self.cfg.move_to_be_atr * atr)
+        trail_arm_points = float(max(0.0, self.cfg.trail_start_atr) * atr)
+        regime = str(m.get("regime", "UNKNOWN") or "UNKNOWN")
+        setup_quality = str(m.get("setup_quality", "C") or "C")
+        try:
+            confidence = float(m.get("confidence", 0.0) or 0.0)
+        except Exception:
+            confidence = 0.0
 
         hard_sl_raw = (px - hard_pts) if side == "LONG" else (px + hard_pts)
         hard_sl = _snap_price(hard_sl_raw, self._TICK_SIZE, kind=("stop_long" if side == "LONG" else "stop_short"))
         sl = hard_sl
-        is_runner = bool(m.get("runner", getattr(self.cfg, "default_runner", False)))
+        forced_runner = m.get("runner", None)
+        if forced_runner is None:
+            is_runner = bool(self._select_runner(m)) or bool(getattr(self.cfg, "default_runner", False))
+            m["runner_selected"] = bool(is_runner)
+        else:
+            is_runner = bool(forced_runner)
+            m["runner_selected"] = bool(is_runner)
         if is_runner:
             tp = None
         else:
             tp_raw = (px + tp_pts) if side == "LONG" else (px - tp_pts)
             tp = _snap_price(tp_raw, self._TICK_SIZE, kind=("tp_long" if side == "LONG" else "tp_short"))
 
-        # Use structural stop hint (EMA915) when valid, but never loosen beyond hard stop.
+        # Structural stop hint may only tighten if it still respects minimum initial SL floor.
+        sl_hint_status = "none"
+        sl_hint_distance = None
         if sl_hint is not None:
             try:
                 slh = float(sl_hint)
                 if math.isfinite(slh):
                     if side == "LONG" and slh < (px - self._TICK_SIZE):
-                        slh = _snap_price(slh, self._TICK_SIZE, kind="stop_long")
-                        sl = max(hard_sl, slh)
+                        dist = float(px - slh)
+                        sl_hint_distance = dist
+                        if dist < min_sl_distance:
+                            sl_hint_status = "rejected_too_tight"
+                        else:
+                            sl_hint_status = "applied"
+                            slh = _snap_price(slh, self._TICK_SIZE, kind="stop_long")
+                            sl = max(hard_sl, slh)
                     elif side == "SHORT" and slh > (px + self._TICK_SIZE):
-                        slh = _snap_price(slh, self._TICK_SIZE, kind="stop_short")
-                        sl = min(hard_sl, slh)
+                        dist = float(slh - px)
+                        sl_hint_distance = dist
+                        if dist < min_sl_distance:
+                            sl_hint_status = "rejected_too_tight"
+                        else:
+                            sl_hint_status = "applied"
+                            slh = _snap_price(slh, self._TICK_SIZE, kind="stop_short")
+                            sl = min(hard_sl, slh)
+                    else:
+                        sl_hint_status = "ignored_invalid_side"
+                else:
+                    sl_hint_status = "ignored_non_finite"
+            except Exception:
+                sl_hint_status = "error"
+
+        sl_points = abs(float(px) - float(sl))
+        sl_atr = float(sl_points / max(_EPS, atr))
+        tp_points = abs(float(tp) - float(px)) if tp is not None else None
+        rr_est = float(tp_points / max(_EPS, sl_points)) if tp_points is not None else None
+        entry_bucket_utc = ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+        # SL sanity hard gate: reject entries with invalid/tiny hint or oversized initial risk.
+        veto_reason: Optional[str] = None
+        try:
+            if bool(getattr(self.cfg, "block_on_sl_hint_rejected", True)) and sl_hint_status == "rejected_too_tight":
+                veto_reason = "sl_hint_rejected"
+            max_sl_points = float(getattr(self.cfg, "max_sl_points", 0.0) or 0.0)
+            max_sl_atr = float(getattr(self.cfg, "max_sl_atr_mult", 0.0) or 0.0)
+            if max_sl_points > 0.0 and sl_points > max_sl_points:
+                veto_reason = f"sl_points_too_wide_{sl_points:.2f}>{max_sl_points:.2f}"
+            if max_sl_atr > 0.0 and sl_atr > max_sl_atr:
+                veto_reason = f"sl_atr_too_wide_{sl_atr:.2f}>{max_sl_atr:.2f}"
+        except Exception:
+            veto_reason = veto_reason or "sl_sanity_check_error"
+
+        if veto_reason:
+            try:
+                self.log.warning(
+                    "entry_veto_sl_sanity side=%s engine=%s reason=%s sl_points=%.2f sl_atr=%.2f",
+                    side,
+                    str(engine),
+                    str(veto_reason),
+                    float(sl_points),
+                    float(sl_atr),
+                )
             except Exception:
                 pass
+            return {
+                "suggestion": "ENTRY_VETO",
+                "state": "CANCEL",
+                "stream": "signal",
+                "channel": str(engine),
+                "engine": str(engine),
+                "reason": str(veto_reason),
+                "veto_reason": str(veto_reason),
+                "entry_side": str(side),
+                "px": float(px),
+                "entry_px": float(px),
+                "entry_atr": float(atr),
+                "sl": float(sl),
+                "tp": float(tp) if tp is not None else None,
+                "sl_points": float(sl_points),
+                "sl_atr": float(sl_atr),
+                "sl_hint_status": str(sl_hint_status),
+                "sl_hint_distance": sl_hint_distance,
+                "max_sl_points": float(getattr(self.cfg, "max_sl_points", 0.0) or 0.0),
+                "max_sl_atr_mult": float(getattr(self.cfg, "max_sl_atr_mult", 0.0) or 0.0),
+                "ts_utc": ts.astimezone(timezone.utc).isoformat(),
+                "ts_ist": _iso_ist(ts),
+            }
+
+        if sl_atr < 0.40:
+            self.log.warning(
+                "entry_sl_floor_low side=%s engine=%s sl_atr=%.3f sl_points=%.2f floor_pts=%.2f floor_atr=%.2f reason=%s",
+                side,
+                str(engine),
+                float(sl_atr),
+                float(sl_points),
+                float(min_sl_distance),
+                float(self.cfg.min_init_sl_atr),
+                str(sl_hint_status),
+            )
+
+        if sl_hint_status == "rejected_too_tight":
+            self.log.warning(
+                "sl_hint_rejected side=%s engine=%s hint_dist=%.2f min_sl_dist=%.2f",
+                side,
+                str(engine),
+                float(sl_hint_distance or 0.0),
+                float(min_sl_distance),
+            )
 
         new_pos = Position(
             side=side,
             entry_px=px,
             entry_ts=ts,
+            entry_bucket_utc=entry_bucket_utc,
             hard_sl=hard_sl,
             sl=sl,
             sl_init=sl,
             tp=tp,
             best_px=px,
+            entry_atr=atr,
+            be_trigger_points=be_trigger_points,
+            trail_arm_points=trail_arm_points,
+            rr_est=rr_est,
+            regime=regime,
+            setup_quality=setup_quality,
+            confidence=confidence,
             is_runner=is_runner,
             engine=engine,
             why=reason or "",
@@ -1987,6 +3120,7 @@ class TradeBrain:
         reserved = {"stream", "engine", "channel", "in_pos", "pos_side"}
         payload = {
             "suggestion": f"ENTRY_{side}",
+            "state": "TRIGGER",
             "channel": engine,
             "engine": engine,
             "in_pos": True,
@@ -1995,10 +3129,29 @@ class TradeBrain:
             "ts_ist": _iso_ist(ts),
             "reason": reason or "entry",
             "runner": new_pos.is_runner,
+            "runner_selected": bool(m.get("runner_selected", new_pos.is_runner)),
             "pos_side": side,
             "entry_px": px,
+            "entry_atr": atr,
+            "tp_mult": float(m.get("tp_mult", self.cfg.tp_atr_mult) or self.cfg.tp_atr_mult),
             "sl": sl,
             "tp": tp,
+            "hard_sl": hard_sl,
+            "sl_points": sl_points,
+            "sl_atr": sl_atr,
+            "be_trigger_points": be_trigger_points,
+            "trail_arm_points": trail_arm_points,
+            "rr_est": rr_est,
+            "regime": regime,
+            "setup_quality": setup_quality,
+            "confidence": confidence,
+            "setup_side_snapshot": self._setup_side,
+            "setup_margin_snapshot": float(self._setup_margin),
+            "candle_bucket_id": entry_bucket_utc.isoformat(),
+            "sl_hint_status": sl_hint_status,
+            "sl_hint_distance": sl_hint_distance,
+            "min_init_sl_points": float(self.cfg.min_init_sl_points),
+            "min_init_sl_atr": float(self.cfg.min_init_sl_atr),
             "stream": "signal",
             **{
                 k: v
@@ -2016,6 +3169,17 @@ class TradeBrain:
             except Exception:
                 pass
             self.pos = new_pos
+            try:
+                guard = self._impulse_reentry_guard_by_side.get(side)
+                if isinstance(guard, dict):
+                    wend = guard.get("window_end_utc")
+                    if isinstance(wend, datetime) and ts.astimezone(timezone.utc) <= wend:
+                        guard["count"] = int(guard.get("count", 0) or 0) + 1
+                    else:
+                        self._impulse_reentry_guard_by_side[side] = None
+            except Exception:
+                pass
+            self._maybe_notify_payload(payload)
             return payload
         except Exception:
             self.pos = None
@@ -2039,6 +3203,18 @@ class TradeBrain:
         if best_long and best_short:
             delta = abs(float(best_long.score) - float(best_short.score))
             if delta < float(self.cfg.intent_conflict_score_delta):
+                # PA dominance can resolve tie-conflicts when strong enough.
+                try:
+                    pa = self._last_pa if isinstance(self._last_pa, dict) else {}
+                    pa_mode = str(pa.get("pa_mode") or "")
+                    pa_side = str(pa.get("pa_side") or "")
+                    pa_strength = float(pa.get("pa_strength", 0.0) or 0.0)
+                    if pa_mode == "dominance" and pa_side in ("LONG", "SHORT") and pa_strength >= float(getattr(self.cfg, "pa_min_strength", 0.62)):
+                        if pa_side == "LONG":
+                            return best_long
+                        return best_short
+                except Exception:
+                    pass
                 self._intent_conflict_info = {
                     "delta": float(delta),
                     "best_long_engine": str(best_long.engine),
@@ -2133,6 +3309,197 @@ class TradeBrain:
         bias = (0.55 * _clamp(depth_imb)) + (0.55 * _clamp(qty_imb)) + (0.25 * cvd_sign)
         return _clamp(bias)
 
+    def _margin_from_metrics_safe(self, m: Dict[str, Any]) -> float:
+        try:
+            return float(self._dir_margin_from_metrics(m or {}, ema915_bias=0.0).get("margin", 0.0))
+        except Exception:
+            return 0.0
+
+    def _abs_dvwap_atr(self, m: Dict[str, Any], px_hint: Optional[float] = None) -> float:
+        try:
+            px = float(px_hint) if px_hint is not None else float(m.get("px", 0.0) or 0.0)
+            atr = max(self._TICK_SIZE, float(m.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK))
+            fut = m.get("fut_flow")
+            if isinstance(fut, dict):
+                vwap = fut.get("vwap")
+                if vwap is not None:
+                    return abs(px - float(vwap)) / max(_EPS, atr)
+            vwap0 = m.get("vwap")
+            if vwap0 is not None:
+                return abs(px - float(vwap0)) / max(_EPS, atr)
+        except Exception:
+            return 0.0
+        return 0.0
+
+    def _edge_score(self, m: Dict[str, Any]) -> float:
+        """Compact [0..1] edge score for tiered notifications."""
+        try:
+            margin_abs = abs(float(m.get("margin", 0.0) or 0.0))
+        except Exception:
+            margin_abs = 0.0
+        if margin_abs <= 0.0:
+            margin_abs = abs(self._margin_from_metrics_safe(m))
+        bo = max(0.0, min(1.0, float(m.get("breakout_energy", 0.0) or 0.0)))
+        pa = max(0.0, min(1.0, float(m.get("pa_strength", 0.0) or 0.0)))
+        pe = max(0.0, min(1.0, float(m.get("path_eff", 0.0) or 0.0)))
+        ext = self._abs_dvwap_atr(m)
+        ext_n = max(0.0, min(1.0, ext / 2.0))
+        sc = (0.32 * max(0.0, min(1.0, margin_abs))) + (0.28 * bo) + (0.18 * ext_n) + (0.12 * pa) + (0.10 * pe)
+        return max(0.0, min(1.0, float(sc)))
+
+    def _post_notify_webhook(self, evt: Dict[str, Any]) -> None:
+        url = str(getattr(self.cfg, "notify_webhook_url", "") or "")
+        if not url:
+            return
+        try:
+            body = json.dumps(_isoize(evt), default=str).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=1.5) as _:
+                pass
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            # Notification failures are non-fatal for trading.
+            return
+        except Exception:
+            return
+
+    def _notify_event(self, payload: Dict[str, Any], *, tier: str, side: str, debounce_s: int) -> None:
+        if not bool(getattr(self.cfg, "notify_enable", False)):
+            return
+        now_ms = int(time.time() * 1000)
+        key = f"{tier}|{side}|{str(payload.get('suggestion') or '')}"
+        last_ms = int(self._notify_last_sent_by_key.get(key, 0) or 0)
+        if debounce_s > 0 and (now_ms - last_ms) < (int(debounce_s) * 1000):
+            return
+        self._notify_last_sent_by_key[key] = now_ms
+
+        edge = self._edge_score(payload)
+        evt = {
+            "tier": tier,
+            "side": side,
+            "suggestion": payload.get("suggestion"),
+            "reason": payload.get("reason"),
+            "engine": payload.get("engine"),
+            "channel": payload.get("channel"),
+            "ts_utc": payload.get("ts_utc") or payload.get("ts"),
+            "ts_ist": payload.get("ts_ist"),
+            "px": payload.get("px"),
+            "regime": payload.get("regime"),
+            "breakout_energy": payload.get("breakout_energy"),
+            "margin": payload.get("margin"),
+            "edge_score": edge,
+            "latency_ms": payload.get("latency_ms"),
+        }
+        try:
+            self.log.info(
+                "notify tier=%s side=%s sug=%s reason=%s edge=%.2f",
+                str(tier),
+                str(side),
+                str(payload.get("suggestion", "")),
+                str(payload.get("reason", "")),
+                float(edge),
+            )
+        except Exception:
+            pass
+        self._post_notify_webhook(evt)
+
+    def _maybe_notify_payload(self, payload: Dict[str, Any]) -> None:
+        try:
+            sug = str(payload.get("suggestion", "") or "")
+            if not sug:
+                return
+            side = str(payload.get("pos_side") or payload.get("pos_side_before") or "")
+            if not side:
+                side = "LONG" if "LONG" in sug else ("SHORT" if "SHORT" in sug else "")
+            side = side or "NONE"
+            edge = self._edge_score(payload)
+            regime = str(payload.get("regime", "") or "")
+            lat = payload.get("latency_ms")
+            lat_i = int(lat) if lat is not None else 0
+
+            if sug.startswith("ARM_"):
+                if edge >= float(getattr(self.cfg, "notify_arm_edgescore", 0.0) or 0.0):
+                    self._notify_event(payload, tier="ARM", side=side, debounce_s=int(getattr(self.cfg, "notify_debounce_arm_s", 60)))
+                return
+
+            if sug.startswith("ENTRY_") and sug != "ENTRY_VETO":
+                tier = "GO"
+                if (lat_i > int(getattr(self.cfg, "notify_latency_downgrade_ms", 0) or 0)) or regime == "CHOP":
+                    tier = "ARM"
+                min_edge = float(getattr(self.cfg, "notify_go_edgescore", 0.0) or 0.0) if tier == "GO" else float(
+                    getattr(self.cfg, "notify_arm_edgescore", 0.0) or 0.0
+                )
+                if edge >= min_edge:
+                    db = int(getattr(self.cfg, "notify_debounce_go_s", 60) or 60) if tier == "GO" else int(
+                        getattr(self.cfg, "notify_debounce_arm_s", 60) or 60
+                    )
+                    self._notify_event(payload, tier=tier, side=side, debounce_s=db)
+                return
+
+            if sug.startswith("EXIT_"):
+                self._notify_event(payload, tier="MANAGE", side=side, debounce_s=int(getattr(self.cfg, "notify_debounce_manage_s", 20)))
+                return
+
+            if sug in ("ENTRY_VETO", "HOLD_WAIT_CONFIRM", "COOLDOWN_ACTIVE"):
+                if edge >= float(getattr(self.cfg, "notify_arm_edgescore", 0.0) or 0.0):
+                    self._notify_event(payload, tier="ARM", side=side, debounce_s=int(getattr(self.cfg, "notify_debounce_arm_s", 60)))
+        except Exception:
+            pass
+
+    def _same_side_stopout_block_reason_locked(self, side: str, intent_ts: datetime, m: Dict[str, Any]) -> Optional[str]:
+        """Post-stopout same-side cooldown: require bars elapsed and reclaim beyond stopout reference."""
+        if side not in ("LONG", "SHORT"):
+            return None
+        mem = self._stopout_cooldown_by_side.get(side)
+        if not isinstance(mem, dict):
+            return None
+
+        exit_bucket = mem.get("exit_bucket_utc")
+        if not isinstance(exit_bucket, datetime):
+            self._stopout_cooldown_by_side[side] = None
+            return None
+
+        curr_bucket = intent_ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        try:
+            min_bars = int(mem.get("min_bars", getattr(self.cfg, "cooldown_min_bars", 0)) or 0)
+            min_bars = max(0, min_bars)
+        except Exception:
+            min_bars = 0
+        bars_elapsed = max(0, int((curr_bucket - exit_bucket).total_seconds() // 60))
+
+        # Reclaim override: during cooldown, allow same-side re-entry when edge is strong.
+        try:
+            bo_e = float(m.get("breakout_energy", 0.0) or 0.0)
+            margin_abs = abs(self._margin_from_metrics_safe(m))
+            bo_ok = bo_e >= float(getattr(self.cfg, "cooldown_reclaim_override_energy_min", 0.55))
+            margin_ok = margin_abs >= float(getattr(self.cfg, "cooldown_reclaim_override_abs_margin_min", 0.25))
+            if bo_ok and margin_ok:
+                self._stopout_cooldown_by_side[side] = None
+                return None
+        except Exception:
+            pass
+
+        if bars_elapsed < min_bars:
+            return f"stopout_cooldown_bars_{bars_elapsed}/{min_bars}"
+
+        try:
+            reclaim_pts = float(mem.get("reclaim_points", 0.0) or 0.0)
+            ref_px = float(mem.get("stopout_px", 0.0) or 0.0)
+            px = float(m.get("px", 0.0) or 0.0)
+        except Exception:
+            return "stopout_cooldown_wait"
+
+        if reclaim_pts > 0.0 and ref_px > 0.0 and px > 0.0:
+            if side == "LONG":
+                if px < (ref_px + reclaim_pts):
+                    return "stopout_cooldown_reclaim_wait"
+            else:
+                if px > (ref_px - reclaim_pts):
+                    return "stopout_cooldown_reclaim_wait"
+
+        # Cooldown satisfied, clear memory for this side.
+        self._stopout_cooldown_by_side[side] = None
+        return None
+
     def _entry_context_veto_locked(self, intent: EntryIntent, m: Dict[str, Any]) -> Optional[str]:
         """Dynamic, multi-signal entry veto that avoids fixed one-size-fits-all gates.
 
@@ -2156,6 +3523,19 @@ class TradeBrain:
                 pass
             return f"veto_exception_{gate}"
 
+        margin_signed = self._margin_from_metrics_safe(m)
+        margin_abs = abs(float(margin_signed))
+        dir_sign = 1.0 if side == "LONG" else -1.0
+        margin_in_favor = margin_signed * dir_sign
+
+        # Global weak-edge guard.
+        try:
+            min_abs_margin = float(getattr(self.cfg, "min_abs_margin_entry", 0.0) or 0.0)
+            if min_abs_margin > 0.0 and margin_abs < min_abs_margin:
+                return f"weak_margin_{margin_abs:.2f}"
+        except Exception as e:
+            return _veto_exception("margin_floor", e)
+
         # Cooldown after absorption traps (side-specific; prevents immediate re-fire).
         now_ms = int(time.time() * 1000)
         try:
@@ -2169,6 +3549,69 @@ class TradeBrain:
         if not _is_finite_pos(atr):
             return None
         atr = max(self._TICK_SIZE, atr)
+
+        # Regime governor: in chop, stand down unless explicitly enabled.
+        try:
+            if (not bool(getattr(self.cfg, "allow_chop_trades", False))) and str(m.get("regime", "UNKNOWN") or "UNKNOWN") == "CHOP":
+                if not bool(getattr(self.cfg, "allow_chop_pa_exceptions", True)):
+                    return "regime_chop"
+                bo_e = float(m.get("breakout_energy", 0.0) or 0.0)
+                pa_s = float(m.get("pa_strength", 0.0) or 0.0)
+                if (bo_e < float(getattr(self.cfg, "breakout_energy_entry_min", 0.62))) and (pa_s < float(getattr(self.cfg, "chop_pa_min_strength", 0.72))):
+                    return "regime_chop"
+        except Exception as e:
+            return _veto_exception("regime_guard", e)
+
+        # Post stopout memory: avoid immediate same-side re-entry until reclaim.
+        try:
+            reason = self._same_side_stopout_block_reason_locked(side, intent.ts, m)
+            if reason:
+                return reason
+        except Exception as e:
+            return _veto_exception("stopout_memory", e)
+
+        # Anti-overtrade limiter after impulse exits (TRAIL/TP).
+        try:
+            guard = self._impulse_reentry_guard_by_side.get(side)
+            if isinstance(guard, dict):
+                win_end = guard.get("window_end_utc")
+                if isinstance(win_end, datetime) and intent.ts.astimezone(timezone.utc) <= win_end:
+                    bo_e = float(m.get("breakout_energy", 0.0) or 0.0)
+                    need_bo = float(getattr(self.cfg, "impulse_reentry_energy_min", 0.60) or 0.60)
+                    need_m = float(getattr(self.cfg, "impulse_reentry_abs_margin_min", 0.15) or 0.15)
+                    cnt = int(guard.get("count", 0) or 0)
+                    cap = max(0, int(getattr(self.cfg, "impulse_reentry_max", 1) or 1))
+                    if cnt >= cap:
+                        return f"impulse_reentry_limit_{cnt}/{cap}"
+                    if bo_e < need_bo or margin_abs < need_m:
+                        return "impulse_reentry_wait_edge"
+                else:
+                    self._impulse_reentry_guard_by_side[side] = None
+        except Exception as e:
+            return _veto_exception("impulse_reentry_guard", e)
+
+        # Flip firewall: block opposite-side entries for N candles unless reversal quality is high.
+        try:
+            if self._last_exit_side in ("LONG", "SHORT") and side != self._last_exit_side:
+                min_flip_margin = float(getattr(self.cfg, "min_abs_margin_entry_flip", 0.20) or 0.20)
+                if margin_abs < min_flip_margin:
+                    return f"weak_flip_margin_{margin_abs:.2f}"
+                nlock = max(0, int(getattr(self.cfg, "flip_lockout_candles", 0) or 0))
+                if nlock > 0 and isinstance(self._last_exit_bucket_utc, datetime):
+                    curr_bucket = intent.ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
+                    bars_since = max(0, int((curr_bucket - self._last_exit_bucket_utc).total_seconds() // 60))
+                    if bars_since < nlock:
+                        bo_e = float(m.get("breakout_energy", 0.0) or 0.0)
+                        bo_ok = bo_e >= float(getattr(self.cfg, "flip_override_energy_min", 0.60) or 0.60)
+                        margin_ok = margin_abs >= float(getattr(self.cfg, "flip_override_abs_margin_min", 0.20) or 0.20)
+                        htf_hold = int(m.get("htf_rev_hold", 0) or 0) > 0
+                        ema_breach = bool(m.get("ema915_breach", False))
+                        ema_age = int(m.get("ema915_age_ms", 0) or 0)
+                        ema_ok = ema_breach and ema_age >= int(getattr(self.cfg, "flip_override_ema915_age_ms", 350) or 350)
+                        if not (margin_ok and htf_hold and (bo_ok or ema_ok)):
+                            return f"flip_firewall_{bars_since}/{nlock}"
+        except Exception as e:
+            return _veto_exception("flip_firewall", e)
 
         px = float(intent.entry_px)
         hma = float(m.get("hma", px) or px)
@@ -2231,7 +3674,7 @@ class TradeBrain:
         try:
             loc_sup, loc_res, sess_sup, sess_res = self._get_sr_levels_locked(lb=int(getattr(self.cfg, "support_lookback", 45)))
             hard_min = float(self.cfg.hard_stop_points)
-            hard_mult = float(getattr(self.cfg, "hard_stop_atr_mult", 1.5))
+            hard_mult = float(self.cfg.hard_stop_atr_mult)
             risk_pts = max(hard_min, hard_mult * atr)
 
             buf = float(getattr(self.cfg, "sr_buffer_atr", 0.0) or 0.0)
@@ -2270,6 +3713,16 @@ class TradeBrain:
         dir_sign = 1.0 if side == "LONG" else -1.0
         dist_in_favor = float(anchor_dist_signed) * dir_sign
 
+        # Tick engines should not fight anchor unless tape is exceptionally strong.
+        try:
+            max_against = float(getattr(self.cfg, "anchor_align_max_against_atr", 0.60) or 0.60)
+            eng = str(getattr(intent, "engine", "") or "")
+            if max_against > 0.0 and eng in ("micro", "ema915"):
+                if dist_in_favor < (-abs(max_against)):
+                    return "against_anchor"
+        except Exception as e:
+            return _veto_exception("anchor_align_guard", e)
+
         # Avoid taking setups right on top of the anchor/HMA.
         try:
             min_anchor_atr = float(getattr(self.cfg, "entry_anchor_min_atr", 0.0))
@@ -2277,6 +3730,16 @@ class TradeBrain:
                 return "near_anchor"
         except Exception as e:
             return _veto_exception("near_anchor_guard", e)
+
+        # PA veto on strong opposite candle intent.
+        try:
+            pa_side = str(m.get("pa_side") or "")
+            pa_strength = float(m.get("pa_strength", 0.0) or 0.0)
+            veto_th = float(getattr(self.cfg, "pa_veto_strength", 0.78) or 0.78)
+            if pa_side in ("LONG", "SHORT") and pa_strength >= veto_th and pa_side != side:
+                return "pa_veto"
+        except Exception as e:
+            return _veto_exception("pa_veto_guard", e)
 
         # Lip-touch breakout detection against dynamic ATR band around anchor.
         upper = hma + float(self.cfg.stretch_limit) * atr
@@ -2399,17 +3862,42 @@ class TradeBrain:
                 want_side=str(intent.side),
             ):
                 return
+            rs = str(reason)
+            sug = "COOLDOWN_ACTIVE" if rs.startswith("stopout_cooldown") or rs.startswith("cooldown_wait") else "HOLD_WAIT_CONFIRM"
             hold = {
                 "channel": "tick",
                 "engine": intent.engine,
                 "ts": intent.ts.astimezone(timezone.utc).isoformat(),
-                "suggestion": "HOLD_WAIT_CONFIRM",
+                "suggestion": sug,
                 "reason": str(reason),
                 "want_side": intent.side,
                 "px": float(intent.entry_px),
             }
             hold.update(more)
             self._write_signal(hold, extra)
+
+        def _emit_entry_veto(reason: str, **more: Any) -> None:
+            if not self._should_emit_hold_wait_locked(
+                str(reason),
+                ckey,
+                engine=str(intent.engine),
+                want_side=str(intent.side),
+            ):
+                return
+            veto_evt = {
+                "channel": "tick",
+                "engine": intent.engine,
+                "ts": intent.ts.astimezone(timezone.utc).isoformat(),
+                "suggestion": "ENTRY_VETO",
+                "reason": str(reason),
+                "veto_reason": str(reason),
+                "want_side": intent.side,
+                "entry_reason": str(intent.reason or ""),
+                "entry_score": float(intent.score),
+                "px": float(intent.entry_px),
+            }
+            veto_evt.update(more)
+            self._write_signal(veto_evt, extra)
 
         if bool(getattr(self.cfg, "respect_bias", False)):
             bias = str(extra.get("bias") or "")
@@ -2434,10 +3922,12 @@ class TradeBrain:
             veto = self._entry_context_veto_locked(intent, extra)
             if veto:
                 _emit_hold(str(veto))
+                _emit_entry_veto(str(veto))
                 return
         except Exception as e:
             # Fail closed for scalper safety when gating logic errors out.
             _emit_hold("veto_check_error", error=str(e)[:120])
+            _emit_entry_veto("veto_check_error", error=str(e)[:120])
             return
 
         # Reversal-proof: if we just exited and the next entry is opposite, require evidence.
@@ -2470,7 +3960,7 @@ class TradeBrain:
                     blocked_entry_side=intent.side,
                 )
                 return
-        self._execute_entry(
+        out = self._execute_entry(
             intent.side,
             extra,
             reason=intent.reason,
@@ -2479,6 +3969,10 @@ class TradeBrain:
             engine=intent.engine,
             sl_hint=intent.sl_hint,
         )
+        if not _is_entry_suggestion(str((out or {}).get("suggestion") or "")):
+            if isinstance(out, dict):
+                self._write_signal(out, extra)
+            return
         try:
             self._last_entry_side = intent.side
             if isinstance(intent.extra, dict) and intent.extra.get("recv_ms") is not None:
@@ -2521,6 +4015,7 @@ class TradeBrain:
         out["_candle_ts"] = candle_bucket
         out["_candle_ts_utc"] = candle_bucket.astimezone(timezone.utc).isoformat()
         out["_candle_ts_ist"] = _iso_ist(candle_bucket)
+        out["candle_bucket_id"] = out["_candle_ts_utc"]
 
         fut, fut_age = self._get_fut_flow_snapshot(ts)
         if fut is not None:
@@ -2545,6 +4040,29 @@ class TradeBrain:
                     pass
         if recv_ns is not None:
             out["recv_ns"] = int(recv_ns)
+
+        if not out.get("regime"):
+            out["regime"] = str(getattr(self, "_last_diag", {}).get("regime", "UNKNOWN") or "UNKNOWN")
+        try:
+            if ("pa_mode" not in out) or (out.get("pa_strength") is None):
+                if isinstance(getattr(self, "_last_pa", None), dict):
+                    out.update(getattr(self, "_last_pa"))
+        except Exception:
+            pass
+        try:
+            if "breakout_energy" not in out:
+                bs = getattr(self, "_breakout_state", None)
+                if bs is not None:
+                    out["breakout_side"] = bs.side
+                    out["breakout_level"] = bs.level
+                    out["breakout_energy"] = bs.energy
+                    out["breakout_origin"] = bs.origin
+        except Exception:
+            pass
+        if not out.get("setup_quality") or out.get("confidence") is None:
+            q, c = self._quality_and_confidence(out)
+            out.setdefault("setup_quality", q)
+            out.setdefault("confidence", c)
         return out
 
     def _get_fut_flow_snapshot(self, ts: datetime) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
@@ -2601,6 +4119,9 @@ class TradeBrain:
             "bias": "NONE",
             "squeeze": False,
             "path_eff": 0.0,
+            "regime": "UNKNOWN",
+            "setup_quality": "C",
+            "confidence": 0.0,
         }
 
     def _micro_vel_acc_locked(self, ms: int, ltp: float) -> Optional[Tuple[float, float]]:
@@ -2978,8 +4499,13 @@ class TradeBrain:
         side = str(self._ema915_armed["side"])
         lvl = float(self._ema915_armed["lvl"])
         sl_hint = float(self._ema915_armed["sl"])
+        atr_for_break = max(self._TICK_SIZE, float(m0.get("atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK))
+        break_buffer_pts = max(
+            float(self._TICK_SIZE) * float(getattr(self.cfg, "ema915_break_buffer_ticks", 0) or 0),
+            float(getattr(self.cfg, "ema915_break_buffer_atr", 0.0) or 0.0) * atr_for_break,
+        )
 
-        if side == "LONG" and ltp >= (lvl + self._TICK_SIZE):
+        if side == "LONG" and ltp >= (lvl + break_buffer_pts):
             if self._rearm_required["ema915"]:
                 return None
             if self._shock_lock_side and recv_ms < self._shock_lock_until_ms and self._shock_lock_side != "LONG":
@@ -2989,6 +4515,7 @@ class TradeBrain:
                 "ema9": float(self._ema9 or 0.0),
                 "ema15": float(self._ema15 or 0.0),
                 "recv_ms": recv_ms,
+                "break_buffer_pts": break_buffer_pts,
             }
             return EntryIntent(
                 engine="ema915",
@@ -3001,7 +4528,7 @@ class TradeBrain:
                 extra=extra,
             )
 
-        if side == "SHORT" and ltp <= (lvl - self._TICK_SIZE):
+        if side == "SHORT" and ltp <= (lvl - break_buffer_pts):
             if self._rearm_required["ema915"]:
                 return None
             if self._shock_lock_side and recv_ms < self._shock_lock_until_ms and self._shock_lock_side != "SHORT":
@@ -3011,6 +4538,7 @@ class TradeBrain:
                 "ema9": float(self._ema9 or 0.0),
                 "ema15": float(self._ema15 or 0.0),
                 "recv_ms": recv_ms,
+                "break_buffer_pts": break_buffer_pts,
             }
             return EntryIntent(
                 engine="ema915",
@@ -3045,6 +4573,31 @@ class TradeBrain:
         def _do_exit(suggestion: str, px: float, reason: str = "") -> Dict[str, Any]:
             _ = recv_ms
             return self._execute_exit(suggestion, px=px, ts=ts, reason=reason or suggestion)
+
+        def _stall_exit_reason() -> Optional[str]:
+            try:
+                stall_bars = int(getattr(self.cfg, "stall_bars", 0) or 0)
+                if stall_bars <= 0:
+                    return None
+                min_mfe_atr = float(getattr(self.cfg, "stall_min_mfe_atr", 0.0) or 0.0)
+                entry_bucket = getattr(p, "entry_bucket_utc", None)
+                if not isinstance(entry_bucket, datetime):
+                    entry_bucket = p.entry_ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
+                curr_bucket = ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
+                elapsed_bars = int((curr_bucket - entry_bucket).total_seconds() // 60)
+                if elapsed_bars < stall_bars:
+                    return None
+
+                if p.side == "LONG":
+                    mfe_pts = float(p.best_px - p.entry_px)
+                else:
+                    mfe_pts = float(p.entry_px - p.best_px)
+                mfe_atr = float(mfe_pts / max(_EPS, atr))
+                if mfe_atr < min_mfe_atr:
+                    return f"stall_kill_{elapsed_bars}bars_mfeatr_{mfe_atr:.2f}"
+            except Exception:
+                return None
+            return None
 
         # Time-based decay exit (scalper TTL)
         max_hold_s = int(getattr(self.cfg, "max_hold_seconds", 15 * 60))
@@ -3082,6 +4635,38 @@ class TradeBrain:
             except Exception:
                 return False
 
+        def _trail_profile() -> Tuple[float, Optional[float]]:
+            """Return (arm_points, trail_atr_dist). None trail_atr_dist means trailing disabled."""
+            try:
+                if bool(getattr(p, "is_harvest", False)):
+                    trail_arm_pts = float(getattr(p, "trail_arm_points", 0.0) or 0.0)
+                    if trail_arm_pts <= 0.0:
+                        trail_arm_pts = max(0.0, float(getattr(self.cfg, "trail_start_atr", 0.0) or 0.0) * atr)
+                    return trail_arm_pts, float(getattr(self.cfg, "harvest_trail_atr", 0.5) or 0.5)
+                if bool(getattr(self.cfg, "regime_trailing_enable", False)):
+                    reg = str(getattr(p, "regime", "") or self._last_diag.get("regime", "UNKNOWN") or "UNKNOWN")
+                    if reg == "CHOP" and bool(getattr(self.cfg, "trail_disable_in_chop", True)):
+                        return 0.0, None
+                    if reg == "BREAKOUT_WINDOW":
+                        return (
+                            max(0.0, float(getattr(self.cfg, "trail_breakout_start_atr", 0.9) or 0.9) * atr),
+                            float(getattr(self.cfg, "trail_breakout_dist_atr", 0.9) or 0.9),
+                        )
+                    if reg == "TREND":
+                        return (
+                            max(0.0, float(getattr(self.cfg, "trail_trend_start_atr", 0.7) or 0.7) * atr),
+                            float(getattr(self.cfg, "trail_trend_dist_atr", 0.7) or 0.7),
+                        )
+                trail_arm_pts = float(getattr(p, "trail_arm_points", 0.0) or 0.0)
+                if trail_arm_pts <= 0.0:
+                    trail_arm_pts = max(0.0, float(getattr(self.cfg, "trail_start_atr", 0.0) or 0.0) * atr)
+                trail_dist = float(getattr(p, "trail_atr_current", 0.0) or 0.0)
+                if trail_dist <= 0.0:
+                    trail_dist = float(getattr(self.cfg, "trail_atr", 2.0) or 2.0)
+                return trail_arm_pts, trail_dist
+            except Exception:
+                return 0.0, float(getattr(self.cfg, "trail_atr", 2.0) or 2.0)
+
         # Update best price for trailing
         if p.side == "LONG":
             p.best_px = max(p.best_px, ltp)
@@ -3101,8 +4686,15 @@ class TradeBrain:
             if p.tp is not None and ltp >= p.tp:
                 return _do_exit("EXIT_TP", p.tp)
 
+            stall_reason = _stall_exit_reason()
+            if stall_reason is not None:
+                return _do_exit("EXIT_STALL", float(ltp), reason=stall_reason)
+
             # Move to BE
-            if (not p.is_be) and ((p.best_px - p.entry_px) >= (self.cfg.move_to_be_atr * atr)):
+            be_trigger_pts = float(getattr(p, "be_trigger_points", 0.0) or 0.0)
+            if be_trigger_pts <= 0.0:
+                be_trigger_pts = float(self.cfg.move_to_be_atr) * atr
+            if (not p.is_be) and ((p.best_px - p.entry_px) >= be_trigger_pts):
                 be_raw = p.entry_px + self.cfg.be_buffer_points
                 be_sl = _snap_price(be_raw, self._TICK_SIZE, kind="stop_long")
                 p.sl = max(p.sl, be_sl)
@@ -3111,17 +4703,20 @@ class TradeBrain:
             # Trailing (arm only after a proven move)
             try:
                 if not bool(getattr(p, "trail_armed", False)):
-                    start_atr = float(getattr(self.cfg, "trail_start_atr", 0.0) or 0.0)
-                    if start_atr > 0 and ((p.best_px - p.entry_px) >= (start_atr * atr)):
+                    trail_arm_pts, trail_dist_atr = _trail_profile()
+                    if trail_dist_atr is None:
+                        trail_arm_pts = 0.0
+                    if trail_arm_pts > 0 and ((p.best_px - p.entry_px) >= trail_arm_pts):
                         p.trail_armed = True
                         p.trail_arm_ts = ts
             except Exception:
                 pass
 
             if bool(getattr(p, "trail_armed", False)):
-                trail_atr = p.trail_atr_current if p.trail_atr_current > 0 else self.cfg.trail_atr
-                trail_sl = _snap_price(p.best_px - (trail_atr * atr), self._TICK_SIZE, kind="stop_long")
-                p.sl = max(p.sl, trail_sl)
+                _, trail_dist_atr = _trail_profile()
+                if trail_dist_atr is not None:
+                    trail_sl = _snap_price(p.best_px - (float(trail_dist_atr) * atr), self._TICK_SIZE, kind="stop_long")
+                    p.sl = max(p.sl, trail_sl)
 
         else:  # SHORT
             p.best_px = min(p.best_px, ltp)
@@ -3138,7 +4733,14 @@ class TradeBrain:
             if p.tp is not None and ltp <= p.tp:
                 return _do_exit("EXIT_TP", p.tp)
 
-            if (not p.is_be) and ((p.entry_px - p.best_px) >= (self.cfg.move_to_be_atr * atr)):
+            stall_reason = _stall_exit_reason()
+            if stall_reason is not None:
+                return _do_exit("EXIT_STALL", float(ltp), reason=stall_reason)
+
+            be_trigger_pts = float(getattr(p, "be_trigger_points", 0.0) or 0.0)
+            if be_trigger_pts <= 0.0:
+                be_trigger_pts = float(self.cfg.move_to_be_atr) * atr
+            if (not p.is_be) and ((p.entry_px - p.best_px) >= be_trigger_pts):
                 be_raw = p.entry_px - self.cfg.be_buffer_points
                 be_sl = _snap_price(be_raw, self._TICK_SIZE, kind="stop_short")
                 p.sl = min(p.sl, be_sl)
@@ -3147,17 +4749,20 @@ class TradeBrain:
             # Trailing (arm only after a proven move)
             try:
                 if not bool(getattr(p, "trail_armed", False)):
-                    start_atr = float(getattr(self.cfg, "trail_start_atr", 0.0) or 0.0)
-                    if start_atr > 0 and ((p.entry_px - p.best_px) >= (start_atr * atr)):
+                    trail_arm_pts, trail_dist_atr = _trail_profile()
+                    if trail_dist_atr is None:
+                        trail_arm_pts = 0.0
+                    if trail_arm_pts > 0 and ((p.entry_px - p.best_px) >= trail_arm_pts):
                         p.trail_armed = True
                         p.trail_arm_ts = ts
             except Exception:
                 pass
 
             if bool(getattr(p, "trail_armed", False)):
-                trail_atr = p.trail_atr_current if p.trail_atr_current > 0 else self.cfg.trail_atr
-                trail_sl = _snap_price(p.best_px + (trail_atr * atr), self._TICK_SIZE, kind="stop_short")
-                p.sl = min(p.sl, trail_sl)
+                _, trail_dist_atr = _trail_profile()
+                if trail_dist_atr is not None:
+                    trail_sl = _snap_price(p.best_px + (float(trail_dist_atr) * atr), self._TICK_SIZE, kind="stop_short")
+                    p.sl = min(p.sl, trail_sl)
 
         return None
 
@@ -3170,6 +4775,7 @@ class TradeBrain:
             exit_ms = int(time.time() * 1000)
         payload = {
             "suggestion": suggestion,
+            "state": "EXIT",
             "stream": "exit",
             "channel": "exit",
             "engine": (p.engine if p else "unknown"),
@@ -3179,6 +4785,7 @@ class TradeBrain:
             "ts": ts,
             "ts_utc": ts.astimezone(timezone.utc).isoformat(),
             "ts_ist": _iso_ist(ts),
+            "exit_candle_bucket_id": ts.astimezone(timezone.utc).replace(second=0, microsecond=0).isoformat(),
             "reason": reason or suggestion,
             "pos_side": None,
             "pos_side_before": exit_side,
@@ -3188,6 +4795,7 @@ class TradeBrain:
             payload.update(
                 {
                     "entry_px": p.entry_px,
+                    "entry_atr": p.entry_atr,
                     "entry_ts_ist": _iso_ist(p.entry_ts),
                     "sl_init": getattr(p, "sl_init", p.sl),
                     "sl_curr": p.sl,
@@ -3198,8 +4806,21 @@ class TradeBrain:
                     "is_be": p.is_be,
                     "is_runner": p.is_runner,
                     "why": p.why,
+                    "be_trigger_points": p.be_trigger_points,
+                    "trail_arm_points": p.trail_arm_points,
+                    "rr_est": p.rr_est,
+                    "regime": p.regime,
+                    "setup_quality": p.setup_quality,
+                    "confidence": p.confidence,
+                    "candle_bucket_id": p.entry_bucket_utc.isoformat() if isinstance(p.entry_bucket_utc, datetime) else None,
                 }
             )
+            try:
+                sl_points = abs(float(p.entry_px) - float(getattr(p, "sl_init", p.sl)))
+                payload["sl_points"] = sl_points
+                payload["sl_atr"] = float(sl_points / max(_EPS, float(p.entry_atr or 0.0)))
+            except Exception:
+                pass
 
         try:
             self.log.info(self._fmt_scalper_line(payload))
@@ -3219,7 +4840,52 @@ class TradeBrain:
         except Exception:
             pass
 
+        # Exit-type-aware cooldown memory.
+        if exit_side in ("LONG", "SHORT"):
+            try:
+                bars_map = {
+                    "EXIT_INIT_SL": int(getattr(self.cfg, "cooldown_exit_init_sl_bars", 1) or 1),
+                    "EXIT_BE": int(getattr(self.cfg, "cooldown_exit_be_bars", 1) or 1),
+                    "EXIT_HARD_STOP": int(getattr(self.cfg, "cooldown_exit_hard_stop_bars", 3) or 3),
+                    "EXIT_TRAIL": int(getattr(self.cfg, "cooldown_exit_trail_bars", 0) or 0),
+                }
+                min_bars = max(0, int(bars_map.get(suggestion, 0)))
+                if min_bars > 0:
+                    atr_ref = float(self._last_diag.get("atr", 0.0) or 0.0)
+                    if not _is_finite_pos(atr_ref):
+                        atr_ref = float(getattr(p, "entry_atr", self._MICRO_ATR_FALLBACK) or self._MICRO_ATR_FALLBACK)
+                    atr_ref = max(self._TICK_SIZE, atr_ref)
+                    reclaim_pts = max(self._TICK_SIZE, float(self.cfg.cooldown_reclaim_atr) * atr_ref)
+                    self._stopout_cooldown_by_side[exit_side] = {
+                        "exit_reason": suggestion,
+                        "exit_ts_utc": ts.astimezone(timezone.utc).isoformat(),
+                        "exit_bucket_utc": ts.astimezone(timezone.utc).replace(second=0, microsecond=0),
+                        "stopout_px": float(px),
+                        "atr_ref": float(atr_ref),
+                        "reclaim_points": float(reclaim_pts),
+                        "min_bars": int(min_bars),
+                    }
+                else:
+                    self._stopout_cooldown_by_side[exit_side] = None
+            except Exception:
+                self.log.exception("stopout_cooldown_set_failed")
+
+            # Impulse exit anti-overtrade window (same-side re-entries only).
+            try:
+                if suggestion in ("EXIT_TRAIL", "EXIT_TP"):
+                    win_min = max(0, int(getattr(self.cfg, "impulse_reentry_window_min", 0) or 0))
+                    if win_min > 0:
+                        self._impulse_reentry_guard_by_side[exit_side] = {
+                            "start_utc": ts.astimezone(timezone.utc),
+                            "window_end_utc": ts.astimezone(timezone.utc) + timedelta(minutes=win_min),
+                            "count": 0,
+                            "exit_reason": suggestion,
+                        }
+            except Exception:
+                self.log.exception("impulse_reentry_set_failed")
+
         self.pos = None
+        self._maybe_notify_payload(payload)
         return payload
 
     def _fmt_scalper_line(self, payload: Dict[str, Any]) -> str:
@@ -3315,19 +4981,37 @@ class TradeBrain:
             if k in payload:
                 continue
             payload[k] = v
+        if "state" not in payload:
+            payload["state"] = _signal_state(str(payload.get("suggestion", "") or ""))
+        if "regime" not in payload:
+            payload["regime"] = str((metrics or {}).get("regime", "UNKNOWN") or "UNKNOWN")
+        if "setup_quality" not in payload or payload.get("confidence") is None:
+            q, c = self._quality_and_confidence(payload)
+            payload.setdefault("setup_quality", q)
+            payload.setdefault("confidence", c)
+        payload.setdefault("candle_bucket_id", payload.get("_candle_ts_utc") or payload.get("_candle_ts"))
         return payload
 
     def _write_signal(self, decision: Dict[str, Any], metrics: Dict[str, Any]) -> None:
         """Write a single JSONL line for signals and (optionally) duplicate ARM to main."""
         try:
             sug0 = str(decision.get("suggestion", "") or "")
+            if sug0 == "HOLD_WAIT_CONFIRM":
+                rr = str(decision.get("reason", "") or "")
+                important_wait = (
+                    rr.startswith("stopout_cooldown")
+                    or rr.startswith("regime_chop")
+                    or rr.startswith("cooldown_wait")
+                )
+                if not important_wait:
+                    return
             # Allow important HOLD_* even when write_hold/write_all are off (scalper needs these)
-            important_holds = {"HOLD_CONFLICT", "HOLD_WAIT_CONFIRM", "HOLD_WEAK_EDGE"}
+            important_holds = {"HOLD_CONFLICT", "HOLD_WEAK_EDGE", "HOLD_WAIT_CONFIRM"}
             if (not self.cfg.write_all) and sug0.startswith("HOLD") and sug0 not in important_holds:
                 return
             if sug0 == "HOLD" and (not self.cfg.write_hold):
                 return
-            if sug0.startswith("ENTRY_"):
+            if sug0.startswith("ENTRY_") and sug0 != "ENTRY_VETO":
                 return
 
             payload = self._build_payload(decision, metrics)
@@ -3371,11 +5055,13 @@ class TradeBrain:
                     with self._write_lock:
                         self.jsonl_file.write(json.dumps(_isoize(payload2), default=str) + "\n")
                         self.jsonl_file.flush()
+                self._maybe_notify_payload(payload)
             else:
                 self._arm_log_key = None
                 with self._write_lock:
                     self.jsonl_file.write(json.dumps(_isoize(payload), default=str) + "\n")
                     self.jsonl_file.flush()
+                self._maybe_notify_payload(payload)
         except Exception:
             self.log.exception("_write_signal failed")
 
@@ -3474,7 +5160,24 @@ def _safe_float(v: Any) -> Optional[float]:
 
 
 def _is_entry_suggestion(s: Optional[str]) -> bool:
-    return isinstance(s, str) and s.startswith("ENTRY_")
+    return isinstance(s, str) and s.startswith("ENTRY_") and s != "ENTRY_VETO"
+
+
+def _signal_state(suggestion: str) -> str:
+    s = str(suggestion or "")
+    if s == "ENTRY_VETO":
+        return "CANCEL"
+    if s.startswith("ENTRY_"):
+        return "TRIGGER"
+    if s.startswith("EXIT_"):
+        return "EXIT"
+    if "ARM_" in s:
+        return "ARM"
+    if s.startswith("READY_"):
+        return "READY"
+    if s.startswith("HOLD") or s.startswith("NO_TRADE") or s.startswith("WATCH_") or s.startswith("FAIL_"):
+        return "CANCEL"
+    return "STATE"
 
 
 def _parse_ts(x: Any) -> Optional[datetime]:
