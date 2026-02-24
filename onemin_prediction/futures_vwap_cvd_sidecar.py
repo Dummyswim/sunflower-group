@@ -13,6 +13,7 @@ Sidecar VWAP + CVD calculator for NIFTY futures (Dhan WebSocket v2).
 - Writes outputs to (paths are configurable):
     * FUT_TICKS_PATH   (per-tick, default: trained_models/production/fut_ticks_vwap_cvd.csv)
     * FUT_SIDECAR_PATH (per-minute, default: trained_models/production/fut_candles_vwap_cvd.csv)
+    * FUT_SNAPSHOT_PATH (live snapshot JSON, default: runtime/fut_snapshot.json)
 - Does NOT modify or depend on the existing automation's event loop.
   It only uses the same logging conventions (logging_setup.py).
 
@@ -102,6 +103,7 @@ class SidecarConfig:
     max_tick_buffer: int = 10000
     out_path_ticks: str = "trained_models/production/fut_ticks_vwap_cvd.csv"
     out_path_candles: str = "trained_models/production/fut_candles_vwap_cvd.csv"
+    out_path_snapshot: str = "runtime/fut_snapshot.json"
 
     def validate(self) -> None:
         """
@@ -224,6 +226,7 @@ class FuturesVWAPCVDClient:
         # Output paths
         self._ticks_path = Path(cfg.out_path_ticks)
         self._candles_path = Path(cfg.out_path_candles)
+        self._snapshot_path = Path(cfg.out_path_snapshot)
         self._ensure_output_dirs()
         
         # Instrument/price diagnostics
@@ -235,6 +238,7 @@ class FuturesVWAPCVDClient:
         try:
             self._ticks_path.parent.mkdir(parents=True, exist_ok=True)
             self._candles_path.parent.mkdir(parents=True, exist_ok=True)
+            self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             self.log.warning(f"Could not create log directories: {e}")
 
@@ -543,6 +547,7 @@ class FuturesVWAPCVDClient:
                 self._safe_float(self._candle_last_vwap),
                 self._safe_float(self._candle_last_cvd),
             )
+            self._write_snapshot()
         except Exception as e:
             self.log.error(f"[VWAP-CVD] Failed to write candle row: {e}", exc_info=True)
 
@@ -553,6 +558,55 @@ class FuturesVWAPCVDClient:
         self._candle_ticks = 0
         self._candle_last_vwap = 0.0
         self._candle_last_cvd = 0.0
+
+    def _write_snapshot(self) -> None:
+        """
+        Write latest futures state atomically so the main loop can ingest it cross-process.
+        """
+        if self._bucket_start is None:
+            return
+        try:
+            cvd_raw = float(self._cum_cvd)
+            cum_vol = float(max(0.0, self._cum_vol))
+            candle_vol = float(max(0.0, self._candle_vol))
+            tick_count = int(max(0, self._candle_ticks))
+            session_vwap = float(self._safe_float(self._candle_last_vwap))
+            last_px = float(self._safe_float(self._close, default=0.0))
+            feature_ts = self._bucket_start
+            ingest_ts = datetime.now(IST)
+
+            # Derive deltas from cumulative state (same normalization as main loop).
+            prev_cvd = float(self._safe_float(getattr(self, "_snapshot_prev_cvd", 0.0), 0.0))
+            prev_cum_vol = float(self._safe_float(getattr(self, "_snapshot_prev_cum_vol", 0.0), 0.0))
+            cvd_delta_raw = float(cvd_raw - prev_cvd)
+            vol_delta_raw = float(cum_vol - prev_cum_vol)
+            cvd_delta = float(np.tanh(cvd_delta_raw / max(1.0, cum_vol)))
+            vol_delta = float(np.tanh(vol_delta_raw / 10000.0))
+            self._snapshot_prev_cvd = cvd_raw
+            self._snapshot_prev_cum_vol = cum_vol
+
+            payload = {
+                "source": "sidecar",
+                "stream": f"{self.cfg.exchange_segment}:{self.cfg.security_id}",
+                "feature_ts": feature_ts.isoformat(),
+                "ingest_ts": ingest_ts.isoformat(),
+                "fut_last_px": last_px,
+                "fut_session_vwap": session_vwap,
+                "fut_cvd_raw": cvd_raw,
+                "fut_cvd_delta_raw": cvd_delta_raw,
+                "fut_cvd_delta": cvd_delta,
+                "fut_vol_delta_raw": vol_delta_raw,
+                "fut_vol_delta": vol_delta,
+                "fut_candle_volume": candle_vol,
+                "fut_cum_volume": cum_vol,
+                "fut_tick_count": tick_count,
+            }
+            tmp_path = self._snapshot_path.with_suffix(self._snapshot_path.suffix + ".tmp")
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, separators=(",", ":"), ensure_ascii=True)
+            os.replace(tmp_path, self._snapshot_path)
+        except Exception as e:
+            self.log.debug("[VWAP-CVD] Failed to write snapshot: %s", e)
 
     def _append_tick_row(
         self,
@@ -777,12 +831,16 @@ async def _async_main():
     # Output paths (fix docs vs defaults): allow runtime override via env
     # - FUT_SIDECAR_PATH is what main_event_loop_regen reads for per-minute candles
     # - FUT_TICKS_PATH is optional, for tick-level inspection/debug
+    # - FUT_SNAPSHOT_PATH is the cross-process live snapshot consumed by main loop fallback
     out_ticks = os.getenv("FUT_TICKS_PATH", "").strip()
     out_candles = os.getenv("FUT_SIDECAR_PATH", "").strip()
+    out_snapshot = os.getenv("FUT_SNAPSHOT_PATH", "").strip()
     if out_ticks:
         cfg.out_path_ticks = out_ticks
     if out_candles:
         cfg.out_path_candles = out_candles
+    if out_snapshot:
+        cfg.out_path_snapshot = out_snapshot
 
     # Validate config (#5)
     try:

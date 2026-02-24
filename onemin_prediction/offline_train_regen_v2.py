@@ -125,8 +125,15 @@ def main() -> None:
         raise SchemaResolutionError("FEATURE_SCHEMA_COLS_PATH missing or invalid; base schema required")
 
     policy_schema = _load_policy_schema(production_link)
+    target_policy_schema = compose_policy_schema(list(base_schema))
     if not policy_schema:
-        policy_schema = compose_policy_schema(list(base_schema))
+        policy_schema = list(target_policy_schema)
+    else:
+        policy_set = set(policy_schema)
+        add_cols = [c for c in target_policy_schema if c not in policy_set]
+        if add_cols:
+            policy_schema = list(policy_schema) + add_cols
+            print(f"[OFFLINE] extended policy schema with {len(add_cols)} columns from base schema")
 
     if not args.log:
         raise SystemExit("TRAIN_LOG_PATH missing; --log is required")

@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 from collections import deque
 
-from signal_context import RECORD_VERSION, compute_schema_hash, validate_signal_context
+from signal_context import (
+    RECORD_VERSION,
+    align_features_to_schema,
+    compute_schema_hash,
+    validate_signal_context,
+)
 
 
 def append_jsonl(path: str, rec: Dict[str, Any]) -> None:
@@ -72,9 +77,17 @@ def load_signal_log(
                 continue
             if rec.get("record_version") != RECORD_VERSION:
                 continue
-            if target_hash and rec.get("feature_schema_hash") != target_hash:
-                continue
             if schema_cols:
+                feats = rec.get("features")
+                if not isinstance(feats, dict):
+                    continue
+                rec_hash = rec.get("feature_schema_hash")
+                if target_hash and rec_hash != target_hash:
+                    # Schema upgrade path: align legacy/new rows to active schema at read-time.
+                    aligned, _, _ = align_features_to_schema(feats, schema_cols)
+                    rec = dict(rec)
+                    rec["features"] = aligned
+                    rec["feature_schema_hash"] = target_hash
                 errs = validate_signal_context(rec, schema_cols=schema_cols)
                 if errs:
                     continue

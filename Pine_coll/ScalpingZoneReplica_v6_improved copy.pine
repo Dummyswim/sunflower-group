@@ -1,0 +1,715 @@
+// ============================================================================
+// Scalping Zone Replica (v6) — Improved & Fixed Edition
+// ----------------------------------------------------------------------------
+// CHANGELOG vs original:
+//  FIX-01 : Tuple "=" (not ":=") on destructured request.security calls.
+//  FIX-02 : f_touchZone — explicit bool result variable; no implicit na return.
+//  FIX-03 : Left-edge clamped via math.max(0,...) — never a negative bar index.
+//  FIX-04 : Box updates gated behind change-flag or barstate.islast only.
+//  FIX-05 : RSI label uses set_* instead of delete+new every tick (no flicker).
+//  FIX-06 : Supertrend direction vars now used for dynamic green/red colouring.
+//  FIX-07 : Removed all illegal "if cond => stmt" single-line syntax.
+//  FIX-08 : f_ma rewritten as proper if/else if chain (no elif / => syntax).
+//  FIX-09 : Colour helpers f_supBg/f_demBg converted to proper functions.
+//  IMP-01 : Zone invalidation — dims zone when price closes through it.
+//  IMP-02 : Confluent zone background highlight (2+ TF overlap).
+//  IMP-03 : ATR stop / R:R labels printed directly on TRP1 & LVT signals.
+//  IMP-04 : Signal logic consolidated via f_anyTF3() helper.
+//  IMP-05 : Per-side cooldown filter — suppresses repeat signals within N bars.
+//  IMP-06 : BB fill between upper/lower bands.
+//  IMP-07 : MA1/MA2 cross plotshape + alertcondition.
+//  IMP-08 : RSI OB/OS background colouring.
+//  IMP-09 : Full alertcondition coverage for all signals.
+// ============================================================================
+
+//@version=6
+indicator("Scalping Zone Replica (v6) - Improved", overlay=true,
+          max_boxes_count=100, max_labels_count=100)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 01  INPUTS — Zones
+// ─────────────────────────────────────────────────────────────────────────────
+grpZ = "01) Zones (Supply / Demand)"
+
+useTF1 = input.bool(true,  "Use TF1", group=grpZ)
+tf1    = input.timeframe("240", "TF1", group=grpZ)
+useTF2 = input.bool(true,  "Use TF2", group=grpZ)
+tf2    = input.timeframe("D",   "TF2", group=grpZ)
+useTF3 = input.bool(false, "Use TF3", group=grpZ)
+tf3    = input.timeframe("W",   "TF3", group=grpZ)
+
+pivotL = input.int(3, "Pivot Left",  minval=1, maxval=20, group=grpZ)
+pivotR = input.int(3, "Pivot Right", minval=1, maxval=20, group=grpZ)
+
+zoneAtrLen  = input.int(14,   "Zone ATR Length (HTF)",   minval=5,  maxval=200,  group=grpZ)
+zoneAtrMult = input.float(0.5,"Zone Thickness = ATR x",  step=0.1,  minval=0.1,  maxval=5.0, group=grpZ)
+
+showTargets     = input.bool(true, "Show Target Zones (prev zone)", group=grpZ)
+showZoneLabels  = input.bool(true, "Show Zone Labels",              group=grpZ)
+labelOffsetBars = input.int(30,    "Label X Offset (bars right)",   minval=0, maxval=300, group=grpZ)
+
+historyBars     = input.int(800,  "Zone History (bars left)",  minval=0,  maxval=10000, group=grpZ)
+extendRightBars = input.int(400,  "Zone Extend (bars right)", minval=20, maxval=10000, group=grpZ)
+padTicks        = input.int(10,   "Zone Pad (ticks)",          minval=0,  maxval=200,   group=grpZ)
+
+dimInvalidated  = input.bool(true, "Dim Invalidated Zones",                    group=grpZ)  // IMP-01
+showConfluentHL = input.bool(true, "Highlight Confluent Zones (multi-TF)",     group=grpZ)  // IMP-02
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 02  INPUTS — Operator Candles + Bubbles
+// ─────────────────────────────────────────────────────────────────────────────
+grpO = "02) Operator Candles + Bubbles"
+
+paintOperatorCandles = input.bool(true,  "Paint Operator Candles (Blue/Black)", group=grpO)
+opVolLen             = input.int(20,     "Volume SMA Length",  minval=5, maxval=200, group=grpO)
+opVolMult            = input.float(2.0,  "Operator Vol Mult",  step=0.1,             group=grpO)
+
+showBubbles      = input.bool(true,  "Show Bubbles",                   group=grpO)
+bubbleAtrLen     = input.int(14,     "Bubble ATR Length", minval=5,    maxval=200, group=grpO)
+bubbleAtrMult    = input.float(0.9,  "Bubble Body > ATR x", step=0.1,              group=grpO)
+bubbleVolMult    = input.float(2.2,  "Bubble Vol > SMA x",  step=0.1,              group=grpO)
+bubbleOnlyInZone = input.bool(true,  "Bubble only when price in zone", group=grpO)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 03  INPUTS — Overlays
+// ─────────────────────────────────────────────────────────────────────────────
+grpOv = "03) Overlays (VWAP / MVWAP / MAs / Bands / ST / RSI)"
+
+showVWAP  = input.bool(true,  "Show VWAP",  group=grpOv)
+showMVWAP = input.bool(true,  "Show MVWAP", group=grpOv)
+mvwapLen  = input.int(50,     "MVWAP Length", minval=5, maxval=500, group=grpOv)
+mvwapType = input.string("SMA","MVWAP Type", options=["SMA","EMA","RMA","WMA"], group=grpOv)
+
+showMA1 = input.bool(true,   "Show MA1", group=grpOv)
+ma1Len  = input.int(20,      "MA1 Length", minval=1, maxval=500, group=grpOv)
+ma1Type = input.string("EMA","MA1 Type", options=["SMA","EMA","RMA","WMA","VWMA"], group=grpOv)
+
+showMA2 = input.bool(true,   "Show MA2", group=grpOv)
+ma2Len  = input.int(50,      "MA2 Length", minval=1, maxval=500, group=grpOv)
+ma2Type = input.string("EMA","MA2 Type", options=["SMA","EMA","RMA","WMA","VWMA"], group=grpOv)
+
+showMA3 = input.bool(false,  "Show MA3", group=grpOv)
+ma3Len  = input.int(200,     "MA3 Length", minval=1, maxval=1000, group=grpOv)
+ma3Type = input.string("EMA","MA3 Type", options=["SMA","EMA","RMA","WMA","VWMA"], group=grpOv)
+
+showMACross = input.bool(true, "Show MA1/MA2 Cross Signal", group=grpOv)  // IMP-07
+
+showHTFMA        = input.bool(false, "Show HTF MA",   group=grpOv)
+htfMA_tf         = input.timeframe("240", "HTF MA Timeframe", group=grpOv)
+htfMA_len        = input.int(50,     "HTF MA Length",  minval=1, maxval=500, group=grpOv)
+htfMA_type       = input.string("EMA","HTF MA Type", options=["SMA","EMA","RMA","WMA","VWMA"], group=grpOv)
+htfConfirmedOnly = input.bool(true,  "HTF MA Confirmed Bars Only", group=grpOv)
+
+showBB     = input.bool(true,  "Show Bollinger Bands", group=grpOv)
+bbLen      = input.int(20,     "BB Length", minval=5, maxval=200, group=grpOv)
+bbMult     = input.float(2.0,  "BB StDev",  step=0.1, group=grpOv)
+showBBFill = input.bool(true,  "Show BB Fill", group=grpOv)  // IMP-06
+
+showST1 = input.bool(true,  "Show Supertrend 1", group=grpOv)
+st1Atr  = input.int(10,     "ST1 ATR Len", minval=1, maxval=200, group=grpOv)
+st1Mult = input.float(3.0,  "ST1 Mult", step=0.1, group=grpOv)
+
+showST2 = input.bool(false, "Show Supertrend 2", group=grpOv)
+st2Atr  = input.int(21,     "ST2 ATR Len", minval=1, maxval=200, group=grpOv)
+st2Mult = input.float(2.0,  "ST2 Mult", step=0.1, group=grpOv)
+
+showRSILast = input.bool(true, "Show RSI last value label", group=grpOv)
+rsiLen      = input.int(14,    "RSI Length", minval=2, maxval=200, group=grpOv)
+showRSIBg   = input.bool(true, "RSI OB/OS Background Colour", group=grpOv)  // IMP-08
+rsiOB       = input.int(70,    "RSI Overbought Level", minval=50, maxval=95, group=grpOv)
+rsiOS       = input.int(30,    "RSI Oversold Level",   minval=5,  maxval=50, group=grpOv)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 04  INPUTS — Scalping Signals
+// ─────────────────────────────────────────────────────────────────────────────
+grpS = "04) Scalping Signals (TRP1 / LVT)"
+
+showSignals   = input.bool(true,  "Show Scalping Signals",            group=grpS)
+trapVolMult   = input.float(1.8,  "TRP1 Vol Mult (vs SMA)",  step=0.1, group=grpS)
+lvtVolMaxMult = input.float(0.9,  "LVT Max Vol Mult (vs SMA)",step=0.1, group=grpS)
+lvtBodyMaxAtr = input.float(0.6,  "LVT Body Max ATR x",      step=0.1, group=grpS)
+
+showSigLabels  = input.bool(true,  "Show SL / TP Label on Signal",   group=grpS)  // IMP-03
+sigStopMult    = input.float(1.0,  "Stop Loss ATR Mult",   step=0.1,  group=grpS)
+sigTarget1Mult = input.float(1.5,  "Take Profit 1 ATR Mult",step=0.1, group=grpS)
+sigTarget2Mult = input.float(3.0,  "Take Profit 2 ATR Mult",step=0.1, group=grpS)
+
+sigCooldownBars = input.int(5, "Signal Cooldown (bars)", minval=1, maxval=50, group=grpS)  // IMP-05
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// FIX-08: proper if/else if chain — no elif, no => on if lines
+f_ma(src, len, typ) =>
+    float out = na
+    if typ == "SMA"
+        out := ta.sma(src, len)
+    else if typ == "EMA"
+        out := ta.ema(src, len)
+    else if typ == "RMA"
+        out := ta.rma(src, len)
+    else if typ == "WMA"
+        out := ta.wma(src, len)
+    else if typ == "VWMA"
+        out := ta.vwma(src, len)
+    else
+        out := ta.sma(src, len)
+    out
+
+pad = syminfo.mintick * padTicks
+
+// FIX-02: explicit bool variable — no implicit na on any branch
+f_touchZone(top, bot) =>
+    bool result = false
+    if not na(top) and not na(bot)
+        float t = math.max(top, bot)
+        float b = math.min(top, bot)
+        result := (high >= b - pad) and (low <= t + pad)
+    result
+
+f_trapSell(supTop, supBot, volSma) =>
+    float t = math.max(supTop, supBot)
+    (high > t + pad) and (close < t) and (volume > volSma * trapVolMult) and (close < open)
+
+f_trapBuy(demTop, demBot, volSma) =>
+    float b = math.min(demTop, demBot)
+    (low < b - pad) and (close > b) and (volume > volSma * trapVolMult) and (close > open)
+
+f_lvtBuy(demTop, demBot, volSma, atr) =>
+    float t  = math.max(demTop, demBot)
+    float b  = math.min(demTop, demBot)
+    float bd = math.abs(close - open)
+    (low <= t + pad) and (low >= b - 2 * pad) and (close > t) and
+     (volume < volSma * lvtVolMaxMult) and (bd < atr * lvtBodyMaxAtr)
+
+f_lvtSell(supTop, supBot, volSma, atr) =>
+    float t  = math.max(supTop, supBot)
+    float b  = math.min(supTop, supBot)
+    float bd = math.abs(close - open)
+    (high >= b - pad) and (high <= t + 2 * pad) and (close < b) and
+     (volume < volSma * lvtVolMaxMult) and (bd < atr * lvtBodyMaxAtr)
+
+// IMP-04: consolidated 3-TF signal helper
+f_anyTF3(use1, use2, use3, sig1, sig2, sig3) =>
+    (use1 and sig1) or (use2 and sig2) or (use3 and sig3)
+
+// FIX-03: safe left edge — never a negative bar index
+f_safeLeft(idx) =>
+    math.max(0, idx - historyBars)
+
+// FIX-04: typed parameters, gating handled at call site
+f_box_update(box bIn, bool enabled, int left, float top, float bot,
+              color bg, color brd) =>
+    box b = bIn
+    color hideCol = color.new(color.gray, 100)
+    if enabled and not na(top) and not na(bot)
+        float t  = math.max(top, bot)
+        float bt = math.min(top, bot)
+        if na(b)
+            b := box.new(left, t, bar_index + extendRightBars, bt,
+                         bgcolor=bg, border_color=brd)
+        else
+            box.set_left(b, left)
+            box.set_right(b, bar_index + extendRightBars)
+            box.set_top(b, t)
+            box.set_bottom(b, bt)
+            box.set_bgcolor(b, bg)
+            box.set_border_color(b, brd)
+    else
+        if not na(b)
+            box.set_bgcolor(b, hideCol)
+            box.set_border_color(b, hideCol)
+    b
+
+f_label_update(label lIn, bool enabled, float y, string txt, color col) =>
+    label l = lIn
+    int   x = bar_index + labelOffsetBars
+    if enabled and not na(y)
+        if na(l)
+            l := label.new(x, y, txt, style=label.style_label_left,
+                           color=col, textcolor=color.white)
+        else
+            label.set_xy(l, x, y)
+            label.set_text(l, txt)
+            label.set_color(l, col)
+            label.set_textcolor(l, color.white)
+    else
+        if not na(l)
+            label.delete(l)
+        l := na
+    l
+
+// FIX-09: colour helpers as proper functions (not bare => expressions)
+f_supBg(inv) =>
+    (dimInvalidated and inv) ? color.new(color.gray, 92) : color.new(color.red,  85)
+
+f_supBr(inv) =>
+    (dimInvalidated and inv) ? color.new(color.gray, 70) : color.new(color.red,  25)
+
+f_demBg(inv) =>
+    (dimInvalidated and inv) ? color.new(color.gray, 92) : color.new(color.teal, 85)
+
+f_demBr(inv) =>
+    (dimInvalidated and inv) ? color.new(color.gray, 70) : color.new(color.teal, 25)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZONE FUNCTION (HTF, ATR thickness, pivot-based)
+// ─────────────────────────────────────────────────────────────────────────────
+f_zones(pL, pR, aLen, aMult) =>
+    var float sup1T = na
+    var float sup1B = na
+    var float sup2T = na
+    var float sup2B = na
+    var float dem1T = na
+    var float dem1B = na
+    var float dem2T = na
+    var float dem2B = na
+
+    float atrZ = ta.atr(aLen)
+    float ph   = ta.pivothigh(high, pL, pR)
+    float pl   = ta.pivotlow(low,   pL, pR)
+
+    if barstate.isconfirmed
+        if not na(ph)
+            sup2T := sup1T
+            sup2B := sup1B
+            sup1T := high[pR]
+            sup1B := sup1T - atrZ[pR] * aMult
+        if not na(pl)
+            dem2T := dem1T
+            dem2B := dem1B
+            dem1B := low[pR]
+            dem1T := dem1B + atrZ[pR] * aMult
+
+    [sup1T, sup1B, sup2T, sup2B, dem1T, dem1B, dem2T, dem2B]
+
+// FIX-01: "=" not ":=" for tuple destructuring
+[s1T_1, s1B_1, s2T_1, s2B_1, d1T_1, d1B_1, d2T_1, d2B_1] =
+     request.security(syminfo.tickerid, tf1,
+          f_zones(pivotL, pivotR, zoneAtrLen, zoneAtrMult),
+          barmerge.gaps_off, barmerge.lookahead_off)
+
+[s1T_2, s1B_2, s2T_2, s2B_2, d1T_2, d1B_2, d2T_2, d2B_2] =
+     request.security(syminfo.tickerid, tf2,
+          f_zones(pivotL, pivotR, zoneAtrLen, zoneAtrMult),
+          barmerge.gaps_off, barmerge.lookahead_off)
+
+[s1T_3, s1B_3, s2T_3, s2B_3, d1T_3, d1B_3, d2T_3, d2B_3] =
+     request.security(syminfo.tickerid, tf3,
+          f_zones(pivotL, pivotR, zoneAtrLen, zoneAtrMult),
+          barmerge.gaps_off, barmerge.lookahead_off)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZONE CHANGE DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+f_zoneNew(cur, prev) =>
+    not na(cur) and (na(prev) or cur != prev)
+
+new_tf1_sup  = f_zoneNew(s1T_1, s1T_1[1])
+new_tf1_supT = f_zoneNew(s2T_1, s2T_1[1])
+new_tf1_dem  = f_zoneNew(d1T_1, d1T_1[1])
+new_tf1_demT = f_zoneNew(d2T_1, d2T_1[1])
+
+new_tf2_sup  = f_zoneNew(s1T_2, s1T_2[1])
+new_tf2_supT = f_zoneNew(s2T_2, s2T_2[1])
+new_tf2_dem  = f_zoneNew(d1T_2, d1T_2[1])
+new_tf2_demT = f_zoneNew(d2T_2, d2T_2[1])
+
+new_tf3_sup  = f_zoneNew(s1T_3, s1T_3[1])
+new_tf3_supT = f_zoneNew(s2T_3, s2T_3[1])
+new_tf3_dem  = f_zoneNew(d1T_3, d1T_3[1])
+new_tf3_demT = f_zoneNew(d2T_3, d2T_3[1])
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMP-01 — ZONE INVALIDATION
+// Supply invalidated: close above zone top. Demand: close below zone bottom.
+// Resets automatically when a new zone forms on that timeframe.
+// ─────────────────────────────────────────────────────────────────────────────
+var bool sup1_inv_1 = false
+var bool dem1_inv_1 = false
+var bool sup1_inv_2 = false
+var bool dem1_inv_2 = false
+var bool sup1_inv_3 = false
+var bool dem1_inv_3 = false
+
+// FIX-07: standard if blocks — no "if cond => stmt" inline syntax
+if new_tf1_sup
+    sup1_inv_1 := false
+if new_tf1_dem
+    dem1_inv_1 := false
+if new_tf2_sup
+    sup1_inv_2 := false
+if new_tf2_dem
+    dem1_inv_2 := false
+if new_tf3_sup
+    sup1_inv_3 := false
+if new_tf3_dem
+    dem1_inv_3 := false
+
+if barstate.isconfirmed
+    if not na(s1T_1) and close > math.max(s1T_1, s1B_1) + pad
+        sup1_inv_1 := true
+    if not na(d1B_1) and close < math.min(d1T_1, d1B_1) - pad
+        dem1_inv_1 := true
+    if not na(s1T_2) and close > math.max(s1T_2, s1B_2) + pad
+        sup1_inv_2 := true
+    if not na(d1B_2) and close < math.min(d1T_2, d1B_2) - pad
+        dem1_inv_2 := true
+    if not na(s1T_3) and close > math.max(s1T_3, s1B_3) + pad
+        sup1_inv_3 := true
+    if not na(d1B_3) and close < math.min(d1T_3, d1B_3) - pad
+        dem1_inv_3 := true
+
+// Target zone colours (always faint — no invalidation dimming needed)
+supBgT = color.new(color.red,  92)
+supBrT = color.new(color.red,  50)
+demBgT = color.new(color.teal, 92)
+demBrT = color.new(color.teal, 50)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPERATOR CANDLES + BUBBLES
+// ─────────────────────────────────────────────────────────────────────────────
+volSma   = ta.sma(volume, opVolLen)
+isBuyOp  = (close > open) and (volume > volSma * opVolMult)
+isSellOp = (close < open) and (volume > volSma * opVolMult)
+barcolor(paintOperatorCandles ? (isBuyOp  ? color.new(color.blue,  0) :
+                                  isSellOp ? color.new(color.black, 0) : na) : na)
+
+atrB  = ta.atr(bubbleAtrLen)
+bodyB = math.abs(close - open)
+bubbleBase = (volume > volSma * bubbleVolMult) and (bodyB > atrB * bubbleAtrMult)
+
+touchTF1 = useTF1 and (f_touchZone(s1T_1, s1B_1) or f_touchZone(d1T_1, d1B_1) or
+            (showTargets and (f_touchZone(s2T_1, s2B_1) or f_touchZone(d2T_1, d2B_1))))
+touchTF2 = useTF2 and (f_touchZone(s1T_2, s1B_2) or f_touchZone(d1T_2, d1B_2) or
+            (showTargets and (f_touchZone(s2T_2, s2B_2) or f_touchZone(d2T_2, d2B_2))))
+touchTF3 = useTF3 and (f_touchZone(s1T_3, s1B_3) or f_touchZone(d1T_3, d1B_3) or
+            (showTargets and (f_touchZone(s2T_3, s2B_3) or f_touchZone(d2T_3, d2B_3))))
+touchAny = touchTF1 or touchTF2 or touchTF3
+
+bubbleOk = showBubbles and bubbleBase and (not bubbleOnlyInZone or touchAny)
+plotshape(bubbleOk and close > open, title="Buy Bubble",
+          style=shape.circle, size=size.small,
+          location=location.belowbar, color=color.new(color.green, 55))
+plotshape(bubbleOk and close < open, title="Sell Bubble",
+          style=shape.circle, size=size.small,
+          location=location.abovebar, color=color.new(color.red,   55))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMP-02 — CONFLUENT ZONE BACKGROUND HIGHLIGHT
+// Fires when 2+ enabled TFs have an active zone touching the current bar.
+// ─────────────────────────────────────────────────────────────────────────────
+inSupTF1 = useTF1 and f_touchZone(s1T_1, s1B_1)
+inSupTF2 = useTF2 and f_touchZone(s1T_2, s1B_2)
+inSupTF3 = useTF3 and f_touchZone(s1T_3, s1B_3)
+inDemTF1 = useTF1 and f_touchZone(d1T_1, d1B_1)
+inDemTF2 = useTF2 and f_touchZone(d1T_2, d1B_2)
+inDemTF3 = useTF3 and f_touchZone(d1T_3, d1B_3)
+
+supConfluence = (int(inSupTF1 ? 1 : 0) + int(inSupTF2 ? 1 : 0) + int(inSupTF3 ? 1 : 0)) >= 2
+demConfluence = (int(inDemTF1 ? 1 : 0) + int(inDemTF2 ? 1 : 0) + int(inDemTF3 ? 1 : 0)) >= 2
+
+bgcolor(showConfluentHL and supConfluence ? color.new(color.red,  88) : na, title="Confluent Supply BG")
+bgcolor(showConfluentHL and demConfluence ? color.new(color.teal, 88) : na, title="Confluent Demand BG")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMP-08 — RSI OB / OS BACKGROUND
+// ─────────────────────────────────────────────────────────────────────────────
+rsi = ta.rsi(close, rsiLen)
+bgcolor(showRSIBg and rsi >= rsiOB ? color.new(color.red,   93) : na, title="RSI OB BG")
+bgcolor(showRSIBg and rsi <= rsiOS ? color.new(color.green, 93) : na, title="RSI OS BG")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DRAW ZONES — anchored left edges (FIX-03 + FIX-04)
+// ─────────────────────────────────────────────────────────────────────────────
+var box tf1_sup  = na
+var box tf1_supT = na
+var box tf1_dem  = na
+var box tf1_demT = na
+var box tf2_sup  = na
+var box tf2_supT = na
+var box tf2_dem  = na
+var box tf2_demT = na
+var box tf3_sup  = na
+var box tf3_supT = na
+var box tf3_dem  = na
+var box tf3_demT = na
+
+var int tf1_sup_left  = na
+var int tf1_supT_left = na
+var int tf1_dem_left  = na
+var int tf1_demT_left = na
+var int tf2_sup_left  = na
+var int tf2_supT_left = na
+var int tf2_dem_left  = na
+var int tf2_demT_left = na
+var int tf3_sup_left  = na
+var int tf3_supT_left = na
+var int tf3_dem_left  = na
+var int tf3_demT_left = na
+
+// FIX-07: standard if blocks for all left-anchor updates
+if useTF1
+    if na(tf1_sup_left) or new_tf1_sup
+        tf1_sup_left := f_safeLeft(bar_index)
+    if na(tf1_dem_left) or new_tf1_dem
+        tf1_dem_left := f_safeLeft(bar_index)
+    if showTargets
+        if na(tf1_supT_left) or new_tf1_supT
+            tf1_supT_left := f_safeLeft(bar_index)
+        if na(tf1_demT_left) or new_tf1_demT
+            tf1_demT_left := f_safeLeft(bar_index)
+
+if useTF2
+    if na(tf2_sup_left) or new_tf2_sup
+        tf2_sup_left := f_safeLeft(bar_index)
+    if na(tf2_dem_left) or new_tf2_dem
+        tf2_dem_left := f_safeLeft(bar_index)
+    if showTargets
+        if na(tf2_supT_left) or new_tf2_supT
+            tf2_supT_left := f_safeLeft(bar_index)
+        if na(tf2_demT_left) or new_tf2_demT
+            tf2_demT_left := f_safeLeft(bar_index)
+
+if useTF3
+    if na(tf3_sup_left) or new_tf3_sup
+        tf3_sup_left := f_safeLeft(bar_index)
+    if na(tf3_dem_left) or new_tf3_dem
+        tf3_dem_left := f_safeLeft(bar_index)
+    if showTargets
+        if na(tf3_supT_left) or new_tf3_supT
+            tf3_supT_left := f_safeLeft(bar_index)
+        if na(tf3_demT_left) or new_tf3_demT
+            tf3_demT_left := f_safeLeft(bar_index)
+
+// FIX-04: box draw calls only on actual zone change or last bar
+bool anyChange = new_tf1_sup or new_tf1_dem or new_tf1_supT or new_tf1_demT or
+                 new_tf2_sup or new_tf2_dem or new_tf2_supT or new_tf2_demT or
+                 new_tf3_sup or new_tf3_dem or new_tf3_supT or new_tf3_demT
+
+if barstate.islast or anyChange
+    int l1s  = na(tf1_sup_left)  ? f_safeLeft(bar_index) : tf1_sup_left
+    int l1d  = na(tf1_dem_left)  ? f_safeLeft(bar_index) : tf1_dem_left
+    int l1sT = na(tf1_supT_left) ? f_safeLeft(bar_index) : tf1_supT_left
+    int l1dT = na(tf1_demT_left) ? f_safeLeft(bar_index) : tf1_demT_left
+    int l2s  = na(tf2_sup_left)  ? f_safeLeft(bar_index) : tf2_sup_left
+    int l2d  = na(tf2_dem_left)  ? f_safeLeft(bar_index) : tf2_dem_left
+    int l2sT = na(tf2_supT_left) ? f_safeLeft(bar_index) : tf2_supT_left
+    int l2dT = na(tf2_demT_left) ? f_safeLeft(bar_index) : tf2_demT_left
+    int l3s  = na(tf3_sup_left)  ? f_safeLeft(bar_index) : tf3_sup_left
+    int l3d  = na(tf3_dem_left)  ? f_safeLeft(bar_index) : tf3_dem_left
+    int l3sT = na(tf3_supT_left) ? f_safeLeft(bar_index) : tf3_supT_left
+    int l3dT = na(tf3_demT_left) ? f_safeLeft(bar_index) : tf3_demT_left
+
+    tf1_sup  := f_box_update(tf1_sup,  useTF1,                 l1s,  s1T_1, s1B_1, f_supBg(sup1_inv_1), f_supBr(sup1_inv_1))
+    tf1_dem  := f_box_update(tf1_dem,  useTF1,                 l1d,  d1T_1, d1B_1, f_demBg(dem1_inv_1), f_demBr(dem1_inv_1))
+    tf1_supT := f_box_update(tf1_supT, useTF1 and showTargets, l1sT, s2T_1, s2B_1, supBgT, supBrT)
+    tf1_demT := f_box_update(tf1_demT, useTF1 and showTargets, l1dT, d2T_1, d2B_1, demBgT, demBrT)
+
+    tf2_sup  := f_box_update(tf2_sup,  useTF2,                 l2s,  s1T_2, s1B_2, f_supBg(sup1_inv_2), f_supBr(sup1_inv_2))
+    tf2_dem  := f_box_update(tf2_dem,  useTF2,                 l2d,  d1T_2, d1B_2, f_demBg(dem1_inv_2), f_demBr(dem1_inv_2))
+    tf2_supT := f_box_update(tf2_supT, useTF2 and showTargets, l2sT, s2T_2, s2B_2, supBgT, supBrT)
+    tf2_demT := f_box_update(tf2_demT, useTF2 and showTargets, l2dT, d2T_2, d2B_2, demBgT, demBrT)
+
+    tf3_sup  := f_box_update(tf3_sup,  useTF3,                 l3s,  s1T_3, s1B_3, f_supBg(sup1_inv_3), f_supBr(sup1_inv_3))
+    tf3_dem  := f_box_update(tf3_dem,  useTF3,                 l3d,  d1T_3, d1B_3, f_demBg(dem1_inv_3), f_demBr(dem1_inv_3))
+    tf3_supT := f_box_update(tf3_supT, useTF3 and showTargets, l3sT, s2T_3, s2B_3, supBgT, supBrT)
+    tf3_demT := f_box_update(tf3_demT, useTF3 and showTargets, l3dT, d2T_3, d2B_3, demBgT, demBrT)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZONE LABELS
+// ─────────────────────────────────────────────────────────────────────────────
+var label l1s_lbl = na
+var label l1d_lbl = na
+var label l2s_lbl = na
+var label l2d_lbl = na
+var label l3s_lbl = na
+var label l3d_lbl = na
+
+if barstate.islast
+    l1s_lbl := f_label_update(l1s_lbl, useTF1 and showZoneLabels, s1T_1, tf1 + " Supply", color.new(color.red,  0))
+    l1d_lbl := f_label_update(l1d_lbl, useTF1 and showZoneLabels, d1B_1, tf1 + " Demand", color.new(color.teal, 0))
+    l2s_lbl := f_label_update(l2s_lbl, useTF2 and showZoneLabels, s1T_2, tf2 + " Supply", color.new(color.red,  0))
+    l2d_lbl := f_label_update(l2d_lbl, useTF2 and showZoneLabels, d1B_2, tf2 + " Demand", color.new(color.teal, 0))
+    l3s_lbl := f_label_update(l3s_lbl, useTF3 and showZoneLabels, s1T_3, tf3 + " Supply", color.new(color.red,  0))
+    l3d_lbl := f_label_update(l3d_lbl, useTF3 and showZoneLabels, d1B_3, tf3 + " Demand", color.new(color.teal, 0))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OVERLAYS — VWAP / MVWAP
+// ─────────────────────────────────────────────────────────────────────────────
+vwap  = ta.vwap(hlc3)
+mvwap = f_ma(vwap, mvwapLen, mvwapType)
+plot(showVWAP  ? vwap  : na, title="VWAP",  color=color.new(color.orange, 0), linewidth=2)
+plot(showMVWAP ? mvwap : na, title="MVWAP", color=color.new(color.yellow, 0), linewidth=2)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OVERLAYS — MAs + IMP-07 MA Cross Signal
+// ─────────────────────────────────────────────────────────────────────────────
+ma1 = f_ma(close, ma1Len, ma1Type)
+ma2 = f_ma(close, ma2Len, ma2Type)
+ma3 = f_ma(close, ma3Len, ma3Type)
+
+plot(showMA1 ? ma1 : na, title="MA1", color=color.new(color.aqua,  0), linewidth=2)
+plot(showMA2 ? ma2 : na, title="MA2", color=color.new(color.white, 0), linewidth=2)
+plot(showMA3 ? ma3 : na, title="MA3", color=color.new(color.gray,  0), linewidth=2)
+
+maCrossBull = showMACross and showMA1 and showMA2 and ta.crossover(ma1,  ma2)
+maCrossBear = showMACross and showMA1 and showMA2 and ta.crossunder(ma1, ma2)
+plotshape(maCrossBull, title="MA Cross Bull", style=shape.triangleup,
+          location=location.belowbar, size=size.tiny,
+          color=color.new(color.aqua, 0))
+plotshape(maCrossBear, title="MA Cross Bear", style=shape.triangledown,
+          location=location.abovebar, size=size.tiny,
+          color=color.new(color.white, 0))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OVERLAYS — HTF MA
+// ─────────────────────────────────────────────────────────────────────────────
+f_htf_ma() =>
+    float m = f_ma(close, htfMA_len, htfMA_type)
+    htfConfirmedOnly ? m[1] : m
+
+htfMA = request.security(syminfo.tickerid, htfMA_tf, f_htf_ma(),
+                          barmerge.gaps_off, barmerge.lookahead_off)
+plot(showHTFMA ? htfMA : na, title="HTF MA", color=color.new(color.purple, 0), linewidth=2)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OVERLAYS — Bollinger Bands + IMP-06 fill
+// ─────────────────────────────────────────────────────────────────────────────
+[bbBasis, bbUpper, bbLower] = ta.bb(close, bbLen, bbMult)
+pBBU = plot(showBB ? bbUpper : na, title="BB Upper", color=color.new(color.blue, 50))
+pBBM = plot(showBB ? bbBasis : na, title="BB Basis", color=color.new(color.blue, 30))
+pBBL = plot(showBB ? bbLower : na, title="BB Lower", color=color.new(color.blue, 50))
+fill(pBBU, pBBL, color=(showBB and showBBFill) ? color.new(color.blue, 93) : na, title="BB Fill")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OVERLAYS — Supertrend (FIX-06 — direction drives green/red colouring)
+// ─────────────────────────────────────────────────────────────────────────────
+[st1, st1Dir] = ta.supertrend(st1Mult, st1Atr)
+[st2, st2Dir] = ta.supertrend(st2Mult, st2Atr)
+
+st1Col = st1Dir == -1 ? color.new(color.green, 0) : color.new(color.red, 0)
+st2Col = st2Dir == -1 ? color.new(color.green, 0) : color.new(color.red, 0)
+plot(showST1 ? st1 : na, title="Supertrend 1", color=st1Col, linewidth=2)
+plot(showST2 ? st2 : na, title="Supertrend 2", color=st2Col, linewidth=2)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OVERLAYS — RSI label (FIX-05 — set_* only, no delete+new flicker)
+// ─────────────────────────────────────────────────────────────────────────────
+var label rsiLbl = na
+if showRSILast and barstate.islast
+    int    rx   = bar_index + labelOffsetBars
+    color  rCol = rsi >= rsiOB ? color.new(color.red,   0) :
+                  rsi <= rsiOS ? color.new(color.green, 0) :
+                                 color.new(color.gray,  0)
+    string rtxt = "RSI " + str.tostring(int(rsi))
+    if na(rsiLbl)
+        rsiLbl := label.new(rx, close, rtxt,
+                            style=label.style_label_center, size=size.large,
+                            textcolor=color.white, color=rCol)
+    else
+        label.set_xy(rsiLbl, rx, close)
+        label.set_text(rsiLbl, rtxt)
+        label.set_color(rsiLbl, rCol)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCALPING SIGNALS (IMP-04 + IMP-05 + IMP-03)
+// ─────────────────────────────────────────────────────────────────────────────
+atrSig = ta.atr(bubbleAtrLen)
+
+// IMP-04: consolidated via f_anyTF3()
+trapSell = showSignals and f_anyTF3(useTF1, useTF2, useTF3,
+               f_trapSell(s1T_1, s1B_1, volSma),
+               f_trapSell(s1T_2, s1B_2, volSma),
+               f_trapSell(s1T_3, s1B_3, volSma))
+
+trapBuy  = showSignals and f_anyTF3(useTF1, useTF2, useTF3,
+               f_trapBuy(d1T_1, d1B_1, volSma),
+               f_trapBuy(d1T_2, d1B_2, volSma),
+               f_trapBuy(d1T_3, d1B_3, volSma))
+
+lvtBuy   = showSignals and f_anyTF3(useTF1, useTF2, useTF3,
+               f_lvtBuy(d1T_1, d1B_1, volSma, atrSig),
+               f_lvtBuy(d1T_2, d1B_2, volSma, atrSig),
+               f_lvtBuy(d1T_3, d1B_3, volSma, atrSig))
+
+lvtSell  = showSignals and f_anyTF3(useTF1, useTF2, useTF3,
+               f_lvtSell(s1T_1, s1B_1, volSma, atrSig),
+               f_lvtSell(s1T_2, s1B_2, volSma, atrSig),
+               f_lvtSell(s1T_3, s1B_3, volSma, atrSig))
+
+// IMP-05: per-side cooldown counters
+var int lastBuyBar  = -9999
+var int lastSellBar = -9999
+
+bool buySignal  = (trapBuy  or lvtBuy)  and (bar_index - lastBuyBar  >= sigCooldownBars)
+bool sellSignal = (trapSell or lvtSell) and (bar_index - lastSellBar >= sigCooldownBars)
+
+// FIX-07: standard if blocks for cooldown updates
+if buySignal
+    lastBuyBar := bar_index
+if sellSignal
+    lastSellBar := bar_index
+
+bool isTrapBuy  = trapBuy  and buySignal
+bool isLvtBuy   = lvtBuy   and buySignal  and not trapBuy
+bool isTrapSell = trapSell and sellSignal
+bool isLvtSell  = lvtSell  and sellSignal and not trapSell
+
+plotshape(isTrapSell, title="TRP1 Sell", style=shape.labeldown,
+          location=location.abovebar, text="TRP1", size=size.tiny,
+          color=color.new(color.red, 0), textcolor=color.white)
+plotshape(isTrapBuy,  title="TRP1 Buy",  style=shape.labelup,
+          location=location.belowbar, text="TRP1", size=size.tiny,
+          color=color.new(color.green, 0), textcolor=color.white)
+plotshape(isLvtBuy,   title="LVT Buy",   style=shape.triangleup,
+          location=location.belowbar, text="LVT", size=size.tiny,
+          color=color.new(color.green, 0), textcolor=color.white)
+plotshape(isLvtSell,  title="LVT Sell",  style=shape.triangledown,
+          location=location.abovebar, text="LVT", size=size.tiny,
+          color=color.new(color.red, 0), textcolor=color.white)
+
+// IMP-03: ATR-based SL / TP label on every confirmed signal
+if showSigLabels
+    int decPlaces = syminfo.mintick >= 1 ? 0 : 2
+
+    if isTrapBuy or isLvtBuy
+        float sl  = low   - atrSig * sigStopMult
+        float tp1 = close + atrSig * sigTarget1Mult
+        float tp2 = close + atrSig * sigTarget2Mult
+        float rr1 = math.round((tp1 - close) / math.max(close - sl, syminfo.mintick), 2)
+        label.new(bar_index, low - atrSig * 0.4,
+                  "SL "   + str.tostring(math.round(sl,  decPlaces)) +
+                  "\nTP1 " + str.tostring(math.round(tp1, decPlaces)) +
+                  "\nTP2 " + str.tostring(math.round(tp2, decPlaces)) +
+                  "\nRR "  + str.tostring(rr1) + "R",
+                  style=label.style_label_up,
+                  color=color.new(color.green, 20),
+                  textcolor=color.white, size=size.small)
+
+    if isTrapSell or isLvtSell
+        float sl  = high  + atrSig * sigStopMult
+        float tp1 = close - atrSig * sigTarget1Mult
+        float tp2 = close - atrSig * sigTarget2Mult
+        float rr1 = math.round((close - tp1) / math.max(sl - close, syminfo.mintick), 2)
+        label.new(bar_index, high + atrSig * 0.4,
+                  "SL "   + str.tostring(math.round(sl,  decPlaces)) +
+                  "\nTP1 " + str.tostring(math.round(tp1, decPlaces)) +
+                  "\nTP2 " + str.tostring(math.round(tp2, decPlaces)) +
+                  "\nRR "  + str.tostring(rr1) + "R",
+                  style=label.style_label_down,
+                  color=color.new(color.red, 20),
+                  textcolor=color.white, size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMP-09 — ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(isTrapBuy,     title="TRP1 Buy",          message="TRP1 Buy Signal — {{ticker}} {{interval}}")
+alertcondition(isTrapSell,    title="TRP1 Sell",         message="TRP1 Sell Signal — {{ticker}} {{interval}}")
+alertcondition(isLvtBuy,      title="LVT Buy",           message="LVT Buy Signal — {{ticker}} {{interval}}")
+alertcondition(isLvtSell,     title="LVT Sell",          message="LVT Sell Signal — {{ticker}} {{interval}}")
+alertcondition(maCrossBull,   title="MA Cross Bull",     message="MA Bullish Cross — {{ticker}} {{interval}}")
+alertcondition(maCrossBear,   title="MA Cross Bear",     message="MA Bearish Cross — {{ticker}} {{interval}}")
+alertcondition(supConfluence, title="Supply Confluence", message="Multi-TF Supply Confluence — {{ticker}}")
+alertcondition(demConfluence, title="Demand Confluence", message="Multi-TF Demand Confluence — {{ticker}}")

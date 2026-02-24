@@ -22,6 +22,7 @@ import asyncio
 from collections import deque
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -120,6 +121,46 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
 
+def _is_finite(x: Optional[float]) -> bool:
+    return x is not None and isinstance(x, (int, float)) and math.isfinite(float(x))
+
+
+def _safe_float(x: Optional[float], default: float = 0.0) -> float:
+    return float(x) if _is_finite(x) else float(default)
+
+
+def _safe_div(num: float, den: float, default: float = 0.0) -> float:
+    d = float(den)
+    if not math.isfinite(d) or abs(d) <= 1e-12:
+        return float(default)
+    n = float(num)
+    if not math.isfinite(n):
+        return float(default)
+    return n / d
+
+
+def _sigmoid(x: float) -> float:
+    z = _safe_float(x, 0.0)
+    if z >= 35.0:
+        return 1.0
+    if z <= -35.0:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+def _softmax(values: Sequence[float]) -> List[float]:
+    if not values:
+        return []
+    finite_vals = [_safe_float(v, 0.0) for v in values]
+    vmax = max(finite_vals)
+    exps = [math.exp(v - vmax) for v in finite_vals]
+    total = sum(exps)
+    if total <= 0.0 or not math.isfinite(total):
+        n = float(len(exps))
+        return [1.0 / n for _ in exps]
+    return [v / total for v in exps]
+
+
 # ----------------------------
 # Data types
 # ----------------------------
@@ -166,6 +207,12 @@ class MarketContext:
     slope: Optional[float] = None
     confidence: float = 0.0
     macd_bias: str = "neutral"
+    regime_probs: Dict[str, float] = field(default_factory=dict)
+    trend_strength: float = 0.0
+    transition_risk: float = 1.0
+    trend_age: int = 0
+    exhaustion_bull: float = 0.0
+    exhaustion_bear: float = 0.0
 
 
 @dataclass
@@ -505,32 +552,50 @@ class ADX:
 
 class MarketContextDetector:
     def __init__(self):
-        # Faster ADX default for 1m scalping.
         self.adx_len = _env_int("REGIME_ADX_LENGTH", 9)
-        self.slope_len = _env_int("REGIME_SLOPE_EMA", 20)
-        self.regime_confirm_bars = max(1, _env_int("REGIME_CONFIRM_BARS", 2))
-        self.trend_adx_threshold = _env_float("REGIME_TREND_ADX", 25.0)
-        self.range_adx_threshold = _env_float("REGIME_RANGE_ADX", 20.0)
-        self.volatile_atr_ratio = _env_float("REGIME_VOLATILE_ATR_RATIO", 1.5)
-        self.slope_atr_threshold = _env_float("REGIME_SLOPE_ATR_FRAC", 0.15)
+        self.regime_unclear_threshold = _clamp(_env_float("REGIME_UNCLEAR_THRESHOLD", 0.45), 0.30, 0.70)
+        self.state_stay_prob = _clamp(_env_float("REGIME_STATE_STAY_PROB", 0.84), 0.55, 0.97)
+        self.state_flip_prob = _clamp(_env_float("REGIME_STATE_FLIP_PROB", 0.03), 0.01, 0.20)
+        self.regime_ema_fast_len = max(2, _env_int("REGIME_EMA_FAST", 8))
+        self.regime_ema_mid_len = max(3, _env_int("REGIME_EMA_MID", 20))
+        self.regime_ema_slow_len = max(5, _env_int("REGIME_EMA_SLOW", 50))
+        self.exhaust_mom_len = max(2, _env_int("EXH_MOM_LENGTH", 6))
 
         self.adx = ADX(self.adx_len)
         self.atr14 = ATR(14)
         self.atr_sma20 = SMA(20)
-        self.ema = EMA(self.slope_len)
-        self.prev_ema: Optional[float] = None
+        self.ema_fast = EMA(self.regime_ema_fast_len)
+        self.ema_mid = EMA(self.regime_ema_mid_len)
+        self.ema_slow = EMA(self.regime_ema_slow_len)
+        self.ema20 = EMA(20)
+        self.prev_ema_fast: Optional[float] = None
+        self.prev_ema_mid: Optional[float] = None
+        self.prev_ema_slow: Optional[float] = None
 
         self.macd_fast = EMA(_env_int("MACD_FAST", 12))
         self.macd_slow = EMA(_env_int("MACD_SLOW", 26))
         self.macd_signal = EMA(_env_int("MACD_SIGNAL", 9))
 
-        self.regime: str = "UNCLEAR"
-        self.pending_regime: Optional[str] = None
-        self.pending_count: int = 0
         self._last_ctx: Optional[MarketContext] = None
+        self._states: Sequence[str] = ("TREND_UP", "TREND_DOWN", "RANGE", "VOLATILE_CHOP")
+        self.posterior: Dict[str, float] = {
+            "TREND_UP": 0.25,
+            "TREND_DOWN": 0.25,
+            "RANGE": 0.25,
+            "VOLATILE_CHOP": 0.25,
+        }
+        self.prev_di_norm: float = 0.0
+        self.prev_close_for_run: Optional[float] = None
+        self.prev_mom0: Optional[float] = None
+        self.run_up = 0
+        self.run_down = 0
+        self.trend_age = 0
+        self.last_trend_label = "UNCLEAR"
 
         self.recent_highs: Deque[float] = deque(maxlen=20)
         self.recent_lows: Deque[float] = deque(maxlen=20)
+        self.recent_bars: Deque[Candle1m] = deque(maxlen=24)
+        self.close_hist: Deque[float] = deque(maxlen=128)
 
     def _session_phase(self, candle: Candle1m) -> str:
         dt_ist = _parse_iso(candle.start_ist).astimezone(IST_TZ)
@@ -541,59 +606,187 @@ class MarketContextDetector:
             return "MIDDAY"
         return "LATE"
 
-    def _raw_regime(
+    def _structure_scores(self) -> tuple[float, float]:
+        if len(self.recent_bars) < 4:
+            return 0.0, 0.0
+        hhhl = 0
+        lhll = 0
+        pairs = 0
+        bars = list(self.recent_bars)
+        for i in range(1, len(bars)):
+            prev = bars[i - 1]
+            cur = bars[i]
+            pairs += 1
+            if float(cur.high) > float(prev.high) and float(cur.low) > float(prev.low):
+                hhhl += 1
+            if float(cur.high) < float(prev.high) and float(cur.low) < float(prev.low):
+                lhll += 1
+        if pairs <= 0:
+            return 0.0, 0.0
+        return float(hhhl) / float(pairs), float(lhll) / float(pairs)
+
+    def _transition_matrix(self) -> Dict[str, Dict[str, float]]:
+        stay = self.state_stay_prob
+        flip = self.state_flip_prob
+        residual = max(0.0, 1.0 - stay - flip)
+        to_range = residual * 0.55
+        to_chop = residual * 0.45
+        trend_residual = max(0.0, 1.0 - stay)
+        return {
+            "TREND_UP": {
+                "TREND_UP": stay,
+                "TREND_DOWN": flip,
+                "RANGE": to_range,
+                "VOLATILE_CHOP": to_chop,
+            },
+            "TREND_DOWN": {
+                "TREND_UP": flip,
+                "TREND_DOWN": stay,
+                "RANGE": to_range,
+                "VOLATILE_CHOP": to_chop,
+            },
+            "RANGE": {
+                "TREND_UP": trend_residual * 0.35,
+                "TREND_DOWN": trend_residual * 0.35,
+                "RANGE": stay,
+                "VOLATILE_CHOP": trend_residual * 0.30,
+            },
+            "VOLATILE_CHOP": {
+                "TREND_UP": trend_residual * 0.30,
+                "TREND_DOWN": trend_residual * 0.30,
+                "RANGE": trend_residual * 0.40,
+                "VOLATILE_CHOP": stay,
+            },
+        }
+
+    def _emission_probs(
         self,
         adx_v: Optional[float],
         plus_di: Optional[float],
         minus_di: Optional[float],
         atr_ratio: Optional[float],
-        slope_norm: Optional[float],
-    ) -> str:
-        slope_mag = abs(slope_norm) if slope_norm is not None else 0.0
-        if (
-            adx_v is not None
-            and adx_v >= self.trend_adx_threshold
-            and slope_mag >= self.slope_atr_threshold
-            and plus_di is not None
-            and minus_di is not None
-        ):
-            return "TREND_UP" if plus_di >= minus_di else "TREND_DOWN"
+        s_fast: float,
+        s_mid: float,
+        s_slow: float,
+    ) -> Dict[str, float]:
+        adx_n = _clamp(_safe_div(_safe_float(adx_v, 0.0) - 15.0, 25.0, 0.0), 0.0, 1.0)
+        plus = _safe_float(plus_di, 0.0)
+        minus = _safe_float(minus_di, 0.0)
+        di_norm = _safe_div(plus - minus, plus + minus + 1e-6, 0.0)
+        di_mag = abs(di_norm)
+        vexp = _clamp(_safe_div(_safe_float(atr_ratio, 1.0) - 1.0, 0.8, 0.0), 0.0, 1.0)
+        vctr = _clamp(_safe_div(1.0 - _safe_float(atr_ratio, 1.0), 0.4, 0.0), 0.0, 1.0)
 
-        is_volatile_chop = (
-            atr_ratio is not None
-            and atr_ratio >= self.volatile_atr_ratio
-            and (adx_v is None or adx_v < self.trend_adx_threshold)
-        )
-        if is_volatile_chop:
-            return "VOLATILE_CHOP"
+        salign = 1.0 if ((s_fast >= 0 and s_mid >= 0 and s_slow >= 0) or (s_fast <= 0 and s_mid <= 0 and s_slow <= 0)) else 0.0
+        hhhl, lhll = self._structure_scores()
+        trend_power = (0.85 * adx_n) + (0.35 * salign) + (0.30 * di_mag)
 
-        is_range = (
-            adx_v is not None
-            and adx_v <= self.range_adx_threshold
-            and slope_mag < self.slope_atr_threshold
-        )
-        if is_range:
-            return "RANGE"
+        up_logit = -0.20 + trend_power + (0.85 * max(di_norm, 0.0)) + (0.35 * max(s_fast, 0.0)) + (0.25 * hhhl) - (0.20 * lhll)
+        dn_logit = -0.20 + trend_power + (0.85 * max(-di_norm, 0.0)) + (0.35 * max(-s_fast, 0.0)) + (0.25 * lhll) - (0.20 * hhhl)
+        range_logit = -0.10 + (0.95 * (1.0 - adx_n)) + (0.45 * vctr) + (0.30 * (1.0 - min(1.0, abs(s_mid)))) + (0.25 * (1.0 - di_mag))
+        chop_logit = -0.25 + (0.90 * vexp) + (0.40 * (1.0 - adx_n)) + (0.20 * (1.0 - salign))
 
-        return "UNCLEAR"
+        probs = _softmax([up_logit, dn_logit, range_logit, chop_logit])
+        return {
+            "TREND_UP": probs[0],
+            "TREND_DOWN": probs[1],
+            "RANGE": probs[2],
+            "VOLATILE_CHOP": probs[3],
+        }
 
-    def _apply_hysteresis(self, raw_regime: str) -> str:
-        if raw_regime == self.regime:
-            self.pending_regime = None
-            self.pending_count = 0
-            return self.regime
+    def _posterior_probs(self, emission: Dict[str, float]) -> Dict[str, float]:
+        trans = self._transition_matrix()
+        states = self._states
+        pred: Dict[str, float] = {}
+        for s_to in states:
+            pred_val = 0.0
+            for s_from in states:
+                pred_val += _safe_float(self.posterior.get(s_from), 0.25) * _safe_float(trans.get(s_from, {}).get(s_to), 0.0)
+            pred[s_to] = pred_val
 
-        if self.pending_regime != raw_regime:
-            self.pending_regime = raw_regime
-            self.pending_count = 1
-            return self.regime
+        raw: Dict[str, float] = {}
+        total = 0.0
+        for s in states:
+            val = max(0.0, pred.get(s, 0.0) * emission.get(s, 0.0))
+            raw[s] = val
+            total += val
+        if total <= 0.0 or not math.isfinite(total):
+            return {s: 1.0 / float(len(states)) for s in states}
+        return {s: raw[s] / total for s in states}
 
-        self.pending_count += 1
-        if self.pending_count >= self.regime_confirm_bars:
-            self.regime = raw_regime
-            self.pending_regime = None
-            self.pending_count = 0
-        return self.regime
+    def _decide_regime(self, posterior: Dict[str, float], di_norm: float) -> str:
+        top_state = max(self._states, key=lambda s: posterior.get(s, 0.0))
+        top_prob = _safe_float(posterior.get(top_state), 0.0)
+        if top_prob < self.regime_unclear_threshold:
+            return "UNCLEAR"
+        if top_state == "TREND_UP" and di_norm <= 0.0:
+            return "UNCLEAR"
+        if top_state == "TREND_DOWN" and di_norm >= 0.0:
+            return "UNCLEAR"
+        return top_state
+
+    def _update_exhaustion(
+        self,
+        candle: Candle1m,
+        atr_v: float,
+        di_norm: float,
+        close_ema20: float,
+    ) -> tuple[float, float]:
+        close = float(candle.close)
+        open_ = float(candle.open)
+        high = float(candle.high)
+        low = float(candle.low)
+        bar_range = max(high - low, 1e-6)
+        atr = max(atr_v, 1e-6)
+
+        if self.prev_close_for_run is None:
+            self.prev_close_for_run = close
+        if close > self.prev_close_for_run:
+            self.run_up += 1
+            self.run_down = 0
+        elif close < self.prev_close_for_run:
+            self.run_down += 1
+            self.run_up = 0
+        self.prev_close_for_run = close
+
+        self.close_hist.append(close)
+        mom0 = 0.0
+        if len(self.close_hist) > self.exhaust_mom_len:
+            mom0 = close - self.close_hist[-1 - self.exhaust_mom_len]
+        mom1 = 0.0
+        if self.prev_mom0 is not None:
+            mom1 = mom0 - self.prev_mom0
+        self.prev_mom0 = mom0
+
+        ext = _safe_div(close - close_ema20, atr, 0.0)
+        decel_up = _clamp(_safe_div(-mom1, atr, 0.0), 0.0, 3.0)
+        decel_down = _clamp(_safe_div(mom1, atr, 0.0), 0.0, 3.0)
+        di_comp = _clamp(abs(self.prev_di_norm) - abs(di_norm), 0.0, 1.0)
+        self.prev_di_norm = di_norm
+
+        upper_wick = _clamp(_safe_div(high - max(open_, close), bar_range, 0.0), 0.0, 1.0)
+        lower_wick = _clamp(_safe_div(min(open_, close) - low, bar_range, 0.0), 0.0, 1.0)
+        run_up_n = _clamp(_safe_div(float(self.run_up), 5.0, 0.0), 0.0, 1.0)
+        run_dn_n = _clamp(_safe_div(float(self.run_down), 5.0, 0.0), 0.0, 1.0)
+
+        fail_up = 0
+        fail_dn = 0
+        bars = list(self.recent_bars)
+        for i in range(1, len(bars)):
+            prev = bars[i - 1]
+            cur = bars[i]
+            rng = max(float(cur.high) - float(cur.low), 1e-6)
+            cpos = _safe_div(float(cur.close) - float(cur.low), rng, 0.5)
+            if float(cur.high) > float(prev.high) and cpos < 0.75:
+                fail_up += 1
+            if float(cur.low) < float(prev.low) and cpos > 0.25:
+                fail_dn += 1
+        fail_up_n = _clamp(_safe_div(float(fail_up), 5.0, 0.0), 0.0, 1.0)
+        fail_dn_n = _clamp(_safe_div(float(fail_dn), 5.0, 0.0), 0.0, 1.0)
+
+        z_bear = -2.2 + (0.90 * max(ext, 0.0)) + (0.80 * run_up_n) + (0.70 * decel_up) + (0.50 * di_comp) + (0.60 * upper_wick) + (0.60 * fail_up_n)
+        z_bull = -2.2 + (0.90 * max(-ext, 0.0)) + (0.80 * run_dn_n) + (0.70 * decel_down) + (0.50 * di_comp) + (0.60 * lower_wick) + (0.60 * fail_dn_n)
+        return _sigmoid(z_bull), _sigmoid(z_bear)
 
     def on_candle(self, candle: Candle1m) -> MarketContext:
         # Synthetic candles should not update regime indicators.
@@ -614,26 +807,41 @@ class MarketContextDetector:
                 slope=last.slope,
                 confidence=max(0.0, float(last.confidence) * 0.85),
                 macd_bias=last.macd_bias,
+                regime_probs=dict(last.regime_probs),
+                trend_strength=last.trend_strength,
+                transition_risk=min(1.0, last.transition_risk + 0.08),
+                trend_age=last.trend_age,
+                exhaustion_bull=last.exhaustion_bull,
+                exhaustion_bear=last.exhaustion_bear,
             )
             self._last_ctx = ctx
             return ctx
 
+        self.recent_bars.append(candle)
         adx_v, plus_di, minus_di = self.adx.update(candle.high, candle.low, candle.close)
         atr_v = self.atr14.update(candle.high, candle.low, candle.close)
-        atr_mean = self.atr_sma20.update(atr_v if atr_v is not None else 0.0)
-        atr_ratio = (atr_v / atr_mean) if (atr_v is not None and atr_mean not in (None, 0.0)) else None
+        atr_mean = self.atr_sma20.update(_safe_float(atr_v, 0.0))
+        atr_ratio = _safe_div(_safe_float(atr_v, 0.0), _safe_float(atr_mean, 0.0), 1.0) if _is_finite(atr_v) and _is_finite(atr_mean) else None
 
-        ema_v = self.ema.update(candle.close)
-        slope = None if self.prev_ema is None else (ema_v - self.prev_ema)
-        self.prev_ema = ema_v
+        ema_fast = self.ema_fast.update(candle.close)
+        ema_mid = self.ema_mid.update(candle.close)
+        ema_slow = self.ema_slow.update(candle.close)
+        ema20 = self.ema20.update(candle.close)
 
-        slope_norm = None
-        if slope is not None:
-            base = atr_v if (atr_v is not None and atr_v > 0.0) else max(abs(candle.close), 1.0)
-            slope_norm = slope / base
+        s_fast = _safe_div(ema_fast - _safe_float(self.prev_ema_fast, ema_fast), max(_safe_float(atr_v, 0.0), 1e-6), 0.0)
+        s_mid = _safe_div(ema_mid - _safe_float(self.prev_ema_mid, ema_mid), max(_safe_float(atr_v, 0.0), 1e-6), 0.0)
+        s_slow = _safe_div(ema_slow - _safe_float(self.prev_ema_slow, ema_slow), max(_safe_float(atr_v, 0.0), 1e-6), 0.0)
+        self.prev_ema_fast = ema_fast
+        self.prev_ema_mid = ema_mid
+        self.prev_ema_slow = ema_slow
 
-        raw_regime = self._raw_regime(adx_v, plus_di, minus_di, atr_ratio, slope_norm)
-        regime = self._apply_hysteresis(raw_regime)
+        plus = _safe_float(plus_di, 0.0)
+        minus = _safe_float(minus_di, 0.0)
+        di_norm = _safe_div(plus - minus, plus + minus + 1e-6, 0.0)
+        emission = self._emission_probs(adx_v, plus_di, minus_di, atr_ratio, s_fast, s_mid, s_slow)
+        posterior = self._posterior_probs(emission)
+        self.posterior = posterior
+        regime = self._decide_regime(posterior, di_norm)
 
         vol_state = "normal"
         if atr_ratio is not None and atr_ratio >= 1.25:
@@ -645,25 +853,47 @@ class MarketContextDetector:
         signal_line = self.macd_signal.update(macd_line)
         delta = macd_line - signal_line
         macd_bias = "neutral"
-        macd_eps = (atr_v or (abs(candle.close) * 0.001)) * 0.02
+        macd_eps = max(_safe_float(atr_v, abs(float(candle.close)) * 0.001), 1e-6) * 0.02
         if delta > macd_eps:
             macd_bias = "long"
         elif delta < -macd_eps:
             macd_bias = "short"
 
+        p_up = _safe_float(posterior.get("TREND_UP"), 0.0)
+        p_dn = _safe_float(posterior.get("TREND_DOWN"), 0.0)
+        trend_strength = max(p_up, p_dn)
+        transition_risk = 1.0 - max(_safe_float(posterior.get(s), 0.0) for s in self._states)
+
         bias = "neutral"
-        if regime == "TREND_UP":
+        if p_up - p_dn > 0.12:
             bias = "long"
-        elif regime == "TREND_DOWN":
+        elif p_dn - p_up > 0.12:
             bias = "short"
 
-        confidence = 0.0
-        if adx_v is not None:
-            confidence += 0.5 * _clamp((adx_v - 15.0) / 20.0, 0.0, 1.0)
-        if atr_ratio is not None:
-            confidence += 0.2 * _clamp(abs(atr_ratio - 1.0), 0.0, 1.0)
-        if slope_norm is not None:
-            confidence += 0.3 * _clamp(abs(slope_norm) / max(self.slope_atr_threshold, 1e-6), 0.0, 1.0)
+        if regime in ("TREND_UP", "TREND_DOWN"):
+            if self.last_trend_label == regime:
+                self.trend_age += 1
+            else:
+                self.trend_age = 1
+            self.last_trend_label = regime
+        else:
+            self.trend_age = 0
+            self.last_trend_label = "UNCLEAR"
+
+        confidence = _clamp(
+            (0.55 * trend_strength)
+            + (0.25 * (1.0 - transition_risk))
+            + (0.20 * min(1.0, abs(di_norm))),
+            0.0,
+            1.0,
+        )
+
+        exhaustion_bull, exhaustion_bear = self._update_exhaustion(
+            candle=candle,
+            atr_v=max(_safe_float(atr_v, 0.0), 1e-6),
+            di_norm=di_norm,
+            close_ema20=ema20,
+        )
 
         self.recent_highs.append(float(candle.high))
         self.recent_lows.append(float(candle.low))
@@ -685,9 +915,15 @@ class MarketContextDetector:
             minus_di=minus_di,
             atr=atr_v,
             atr_ratio=atr_ratio,
-            slope=slope,
+            slope=s_mid,
             confidence=_clamp(confidence, 0.0, 1.0),
             macd_bias=macd_bias,
+            regime_probs=dict(posterior),
+            trend_strength=_clamp(trend_strength, 0.0, 1.0),
+            transition_risk=_clamp(transition_risk, 0.0, 1.0),
+            trend_age=max(0, self.trend_age),
+            exhaustion_bull=_clamp(exhaustion_bull, 0.0, 1.0),
+            exhaustion_bear=_clamp(exhaustion_bear, 0.0, 1.0),
         )
         self._last_ctx = ctx
         return ctx
@@ -705,8 +941,9 @@ class MomentumEngine(StrategyEngine):
         self.tick_size = float(tick_size)
         self._closes: List[float] = []
         self._mom0_prev: Optional[float] = None
-        self.min_strength_atr_frac = _env_float("MOM_MIN_STRENGTH_ATR_FRAC", 0.15)
-        self.close_acceptance = _clamp(_env_float("MOM_CLOSE_ACCEPTANCE", 0.60), 0.5, 0.95)
+        self.min_strength_atr_frac = _env_float("MOM_MIN_STRENGTH_ATR_FRAC", 0.12)
+        self.close_acceptance = _clamp(_env_float("MOM_CLOSE_ACCEPTANCE", 0.57), 0.5, 0.95)
+        self.decel_tolerance_frac = _clamp(_env_float("MOM_DECEL_TOL_FRAC", 0.25), 0.0, 1.0)
 
     def on_candle(self, candle: Candle1m, context: Optional[MarketContext] = None) -> EngineDecision:
         c = float(candle.close)
@@ -737,8 +974,9 @@ class MomentumEngine(StrategyEngine):
 
         strength = max(abs(mom0), abs(mom1))
         conf = _clamp(strength / max(atr * 2.0, self.tick_size), 0.0, 1.0)
+        decel_tol = self.decel_tolerance_frac * min_strength
 
-        if mom0 > min_strength and mom1 > 0.0 and long_close_ok:
+        if mom0 > min_strength and mom1 > (-decel_tol) and long_close_ok:
             if context is not None and context.macd_bias == "short":
                 return EngineDecision(engine=self.name, signal="HOLD", reason="blocked_macd_countertrend")
             return EngineDecision(
@@ -751,7 +989,7 @@ class MomentumEngine(StrategyEngine):
                 rationale_tags=["trend_aligned", "strong_momentum", "close_near_high"],
             )
 
-        if mom0 < -min_strength and mom1 < 0.0 and short_close_ok:
+        if mom0 < -min_strength and mom1 < decel_tol and short_close_ok:
             if context is not None and context.macd_bias == "long":
                 return EngineDecision(engine=self.name, signal="HOLD", reason="blocked_macd_countertrend")
             return EngineDecision(
@@ -1078,6 +1316,9 @@ class PriceActionEngine(StrategyEngine):
         self.doji_body_frac = _env_float("PA_DOJI_BODY_FRAC", 0.40)
         self.level_prox_atr = _env_float("PA_LEVEL_PROX_ATR", 0.35)
         self.close_accept = _clamp(_env_float("PA_CLOSE_ACCEPT", 0.65), 0.5, 0.95)
+        self.u_turn_min_exhaust = _clamp(_env_float("PA_U_TURN_MIN_EXHAUST", 0.65), 0.30, 0.95)
+        self.u_turn_max_trend_strength = _clamp(_env_float("PA_U_TURN_MAX_TREND_STRENGTH", 0.75), 0.30, 0.98)
+        self.u_turn_min_transition_risk = _clamp(_env_float("PA_U_TURN_MIN_TRANSITION_RISK", 0.30), 0.05, 0.95)
 
     @staticmethod
     def _body_wicks(c: Candle1m) -> tuple[float, float, float]:
@@ -1179,23 +1420,28 @@ class PriceActionEngine(StrategyEngine):
         c1_body = max(b1, self.tick_size)
         is_doji2 = b2 <= self.doji_body_frac * c1_body
         c1_mid = (float(c1.open) + float(c1.close)) / 2.0
+        ex_bull = _safe_float(context.exhaustion_bull if context else None, 0.0)
+        ex_bear = _safe_float(context.exhaustion_bear if context else None, 0.0)
+        trisk = _safe_float(context.transition_risk if context else None, 1.0)
+        tstr = _safe_float(context.trend_strength if context else None, 0.0)
+        u_turn_context_ok = trisk >= self.u_turn_min_transition_risk and tstr <= self.u_turn_max_trend_strength
 
-        if bear(c1) and is_doji2 and bull(c3) and float(c3.close) >= c1_mid:
+        if bear(c1) and is_doji2 and bull(c3) and float(c3.close) >= c1_mid and ex_bull >= self.u_turn_min_exhaust and u_turn_context_ok and near_low:
             return EngineDecision(
                 engine=self.name,
                 signal="READY_LONG",
                 stop_price=float(c3.high) + self.tick_size,
-                confidence=0.90,
+                confidence=_clamp(0.62 + (0.20 * ex_bull) + (0.10 * trisk), 0.0, 1.0),
                 entry_type="stop",
                 rationale_tags=["u_turn_bullish"],
             )
 
-        if bull(c1) and is_doji2 and bear(c3) and float(c3.close) <= c1_mid:
+        if bull(c1) and is_doji2 and bear(c3) and float(c3.close) <= c1_mid and ex_bear >= self.u_turn_min_exhaust and u_turn_context_ok and near_high:
             return EngineDecision(
                 engine=self.name,
                 signal="READY_SHORT",
                 stop_price=float(c3.low) - self.tick_size,
-                confidence=0.90,
+                confidence=_clamp(0.62 + (0.20 * ex_bear) + (0.10 * trisk), 0.0, 1.0),
                 entry_type="stop",
                 rationale_tags=["u_turn_bearish"],
             )
@@ -1210,144 +1456,190 @@ class PriceActionEngine(StrategyEngine):
 class SignalArbiter:
     def __init__(self):
         self.min_score = _env_float("ARBITER_MIN_SCORE", 70.0)
+        self.min_score_midday = max(0.0, _env_float("ARBITER_MIN_SCORE_MIDDAY", 74.0))
+        self.min_score_unclear = max(0.0, _env_float("ARBITER_MIN_SCORE_UNCLEAR", 72.0))
         self.conflict_band = _env_float("ARBITER_CONFLICT_BAND", 5.0)
+        self.min_pwin = _clamp(_env_float("ARBITER_MIN_P_WIN", 0.55), 0.30, 0.90)
+        self.min_ev = _env_float("ARBITER_MIN_EV", 0.10)
+        self.hard_countertrend_block_strength = _clamp(_env_float("ARBITER_CT_BLOCK_TREND_STRENGTH", 0.70), 0.45, 0.95)
+        self.hard_countertrend_exhaust = _clamp(_env_float("ARBITER_CT_MIN_EXHAUST", 0.75), 0.50, 0.98)
+        self.u_turn_swing_atr_max = _clamp(_env_float("ARBITER_U_TURN_SWING_ATR_MAX", 0.35), 0.10, 1.50)
+        self.reliability_lookup: Optional[Any] = None
 
-        # Weights sum to 100.
-        self.w_trend = 25.0
-        self.w_regime = 20.0
-        self.w_time = 15.0
-        self.w_momentum = 15.0
-        self.w_rr = 15.0
-        self.w_levels = 10.0
+    def set_reliability_lookup(self, fn: Optional[Any]) -> None:
+        self.reliability_lookup = fn
 
-        # Session-time quality knobs.
-        self.time_q_open_go = _clamp(_env_float("ARBITER_TIME_Q_OPEN_GO", 1.0), 0.0, 1.0)
-        self.time_q_late = _clamp(_env_float("ARBITER_TIME_Q_LATE", 0.70), 0.0, 1.0)
-        self.time_q_midday = _clamp(_env_float("ARBITER_TIME_Q_MIDDAY", 0.35), 0.0, 1.0)
-        self.time_q_other = _clamp(_env_float("ARBITER_TIME_Q_OTHER", 0.50), 0.0, 1.0)
-
-        # Risk-reward normalization knobs.
-        self.rr_target_default = max(0.10, _env_float("ARBITER_RR_TARGET_DEFAULT", 2.0))
-        self.rr_target_trend = max(0.10, _env_float("ARBITER_RR_TARGET_TREND", 2.5))
-        self.rr_target_range = max(0.10, _env_float("ARBITER_RR_TARGET_RANGE", 1.30))
-        self.rr_target_range_fade = max(0.10, _env_float("ARBITER_RR_TARGET_RANGE_FADE", 1.12))
-        self.rr_target_range_specialist = max(0.10, _env_float("ARBITER_RR_TARGET_RANGE_SPECIALIST", 1.25))
-        self.rr_target_chop = max(0.10, _env_float("ARBITER_RR_TARGET_CHOP", 1.20))
-        self.use_tp2_for_trend_rr = _env_bool("ARBITER_USE_TP2_FOR_TREND_RR", True)
-
-        # Optional floor for counter-trend reversal patterns.
-        self.countertrend_pattern_floor = _clamp(_env_float("ARBITER_COUNTERTREND_PATTERN_FLOOR", 0.0), 0.0, 0.75)
-
-    def _time_quality(self, session_phase: str) -> float:
-        if session_phase == "OPEN_GO":
-            return self.time_q_open_go
-        if session_phase == "LATE":
-            return self.time_q_late
-        if session_phase == "MIDDAY":
-            return self.time_q_midday
-        return self.time_q_other
+    def _effective_min_score(self, ctx: MarketContext) -> float:
+        floor = float(self.min_score)
+        if ctx.session_phase == "MIDDAY":
+            floor = max(floor, float(self.min_score_midday))
+        if ctx.regime == "UNCLEAR":
+            floor = max(floor, float(self.min_score_unclear))
+        return floor
 
     @staticmethod
     def _is_countertrend_pattern(setup: TradeSetup) -> bool:
         tags = setup.rationale_tags or []
         return any(("u_turn" in t) or ("rejection" in t) or ("dominance" in t) for t in tags)
 
-    def _trend_alignment(self, setup: TradeSetup, ctx: MarketContext) -> float:
+    @staticmethod
+    def _dir_align(setup: TradeSetup, ctx: MarketContext) -> int:
         if ctx.bias == "neutral":
-            return 0.5
+            return 0
         if (ctx.bias == "long" and setup.direction == "LONG") or (ctx.bias == "short" and setup.direction == "SHORT"):
-            return 1.0
-        if self.countertrend_pattern_floor > 0.0 and self._is_countertrend_pattern(setup):
-            return self.countertrend_pattern_floor
-        return 0.0
+            return 1
+        return -1
 
-    def _regime_compat(self, setup: TradeSetup, ctx: MarketContext) -> float:
-        return 1.0 if ctx.regime in setup.compatible_regimes else 0.0
+    @staticmethod
+    def _directional_regime_prob(setup: TradeSetup, ctx: MarketContext) -> float:
+        probs = ctx.regime_probs or {}
+        if setup.direction == "LONG":
+            return _safe_float(probs.get("TREND_UP"), 0.0)
+        return _safe_float(probs.get("TREND_DOWN"), 0.0)
 
-    def _effective_rr(self, setup: TradeSetup, ctx: MarketContext) -> float:
-        rr = float(setup.risk_reward)
-        if (
-            self.use_tp2_for_trend_rr
-            and ctx.regime in ("TREND_UP", "TREND_DOWN")
-            and setup.take_profit_2 is not None
-        ):
-            risk = max(abs(float(setup.entry_price) - float(setup.stop_loss)), 1e-6)
-            rr = abs(float(setup.take_profit_2) - float(setup.entry_price)) / risk
-        return max(0.0, rr)
+    @staticmethod
+    def _dist_swing_atr(setup: TradeSetup, ctx: MarketContext) -> float:
+        atr = max(_safe_float(ctx.atr, 0.0), 1e-6)
+        if setup.direction == "LONG":
+            anchor = _safe_float(ctx.key_levels.get("swing_low"), setup.entry_price)
+        else:
+            anchor = _safe_float(ctx.key_levels.get("swing_high"), setup.entry_price)
+        return abs(float(setup.entry_price) - anchor) / atr
 
-    def _rr_target(self, setup: TradeSetup, ctx: MarketContext) -> float:
-        if ctx.regime in ("TREND_UP", "TREND_DOWN"):
-            return self.rr_target_trend
-        if ctx.regime == "RANGE":
-            tags = setup.rationale_tags or []
-            if any("range_fade" in t for t in tags):
-                return self.rr_target_range_fade
-            if any(("range_specialist" in t) or ("counter_move" in t) for t in tags):
-                return self.rr_target_range_specialist
-            return self.rr_target_range
-        if ctx.regime == "VOLATILE_CHOP":
-            return self.rr_target_chop
-        return self.rr_target_default
+    def _reliability_prior(self, setup: TradeSetup, ctx: MarketContext) -> float:
+        if self.reliability_lookup is None:
+            return 0.50
+        try:
+            val = float(self.reliability_lookup(setup, ctx))
+            if not math.isfinite(val):
+                return 0.50
+            return _clamp(val, 0.05, 0.95)
+        except Exception:
+            return 0.50
 
-    def _levels_quality(self, setup: TradeSetup) -> float:
-        if any(v.startswith("near_") for v in setup.veto_flags):
-            return 0.25
-        return 1.0
-
-    def score(self, setup: TradeSetup, ctx: MarketContext) -> float:
-        trend = self._trend_alignment(setup, ctx)
-        regime = self._regime_compat(setup, ctx)
-        tqual = self._time_quality(ctx.session_phase)
-        mqual = _clamp(setup.confidence, 0.0, 1.0)
-        rr_target = self._rr_target(setup, ctx)
-        rrqual = _clamp(self._effective_rr(setup, ctx) / max(rr_target, 1e-6), 0.0, 1.0)
-        lqual = self._levels_quality(setup)
-
-        score = (
-            self.w_trend * trend
-            + self.w_regime * regime
-            + self.w_time * tqual
-            + self.w_momentum * mqual
-            + self.w_rr * rrqual
-            + self.w_levels * lqual
-        )
-
+    def _p_win(self, setup: TradeSetup, ctx: MarketContext) -> float:
+        dir_align = self._dir_align(setup, ctx)
+        dir_prob = self._directional_regime_prob(setup, ctx)
+        transition_risk = _safe_float(ctx.transition_risk, 1.0)
+        trend_strength = _safe_float(ctx.trend_strength, 0.0)
+        dist_swing_atr = self._dist_swing_atr(setup, ctx)
+        near_swing = 1.0 if dist_swing_atr <= self.u_turn_swing_atr_max else 0.0
+        ex = _safe_float(ctx.exhaustion_bull if setup.direction == "LONG" else ctx.exhaustion_bear, 0.0)
+        rel = self._reliability_prior(setup, ctx)
         tags = setup.rationale_tags or []
-        bonus = 0.0
-        if any("u_turn" in t for t in tags):
-            bonus += 10.0
-        elif any("rejection" in t for t in tags):
-            bonus += 6.0
-        elif any("dominance" in t for t in tags):
-            bonus += 4.0
+        is_u_turn = 1.0 if any("u_turn" in t for t in tags) else 0.0
+        is_rej = 1.0 if any("rejection" in t for t in tags) else 0.0
+        is_dom = 1.0 if any("dominance" in t for t in tags) else 0.0
 
-        # Soft penalty for each veto.
-        score -= 5.0 * float(len(setup.veto_flags))
-        score += bonus
-        return _clamp(score, 0.0, 100.0)
+        z = -0.40
+        z += 1.10 * _safe_float(setup.confidence, 0.0)
+        z += 0.65 * float(dir_align)
+        z += 0.85 * dir_prob
+        z += 0.60 * (rel - 0.50)
+        z += 0.45 * ex
+        z += 0.30 * (1.0 - transition_risk)
+        z += 0.25 * is_dom * max(0.0, float(dir_align))
+        z += 0.15 * is_rej * near_swing
+        z += 0.30 * is_u_turn * near_swing
+        z += 0.20 * is_u_turn * transition_risk
+        z -= 0.35 * is_u_turn * (1.0 - near_swing)
+        z -= 0.30 * max(0.0, trend_strength - 0.80) * (1.0 if dir_align < 0 else 0.0)
+        return _sigmoid(z)
+
+    def _ev(self, setup: TradeSetup, p_win: float) -> float:
+        rr = max(float(setup.risk_reward), 0.0)
+        return (p_win * rr) - (1.0 - p_win)
+
+    def _hard_block_reason(self, setup: TradeSetup, ctx: MarketContext) -> Optional[str]:
+        tags = setup.rationale_tags or []
+        dir_align = self._dir_align(setup, ctx)
+        ex = _safe_float(ctx.exhaustion_bull if setup.direction == "LONG" else ctx.exhaustion_bear, 0.0)
+        trend_strength = _safe_float(ctx.trend_strength, 0.0)
+        transition_risk = _safe_float(ctx.transition_risk, 1.0)
+        dist_swing_atr = self._dist_swing_atr(setup, ctx)
+
+        if (
+            dir_align < 0
+            and self._is_countertrend_pattern(setup)
+            and trend_strength >= self.hard_countertrend_block_strength
+            and (ex < self.hard_countertrend_exhaust or transition_risk < 0.25)
+        ):
+            return "blocked_countertrend_strong_trend"
+
+        if any("u_turn" in t for t in tags) and dist_swing_atr > self.u_turn_swing_atr_max:
+            return "blocked_u_turn_far_from_swing"
+        return None
+
+    def score(self, setup: TradeSetup, ctx: MarketContext) -> tuple[float, float, float, Optional[str]]:
+        hard_block = self._hard_block_reason(setup, ctx)
+        if hard_block is not None:
+            return 0.0, 0.0, -1.0, hard_block
+
+        p_win = self._p_win(setup, ctx)
+        ev = self._ev(setup, p_win)
+        ev_norm = _clamp(_safe_div(ev + 1.0, 2.0, 0.0), 0.0, 1.0)
+        score = 100.0 * ((0.60 * p_win) + (0.40 * ev_norm))
+        return _clamp(score, 0.0, 100.0), p_win, ev, None
 
     def choose(self, setups: List[TradeSetup], ctx: MarketContext) -> ArbiterDecision:
         if not setups:
             return ArbiterDecision(winner=None, reason="no_candidates")
 
-        scored: List[tuple[float, TradeSetup]] = []
+        scored: List[tuple[float, float, float, TradeSetup]] = []
+        suppressed: List[Dict[str, Any]] = []
         for s in setups:
-            score = self.score(s, ctx)
+            score, p_win, ev, hard_block = self.score(s, ctx)
             s.quality_score = int(round(score))
-            scored.append((score, s))
+            if hard_block is not None:
+                suppressed.append(
+                    {
+                        "signal_id": s.signal_id,
+                        "engine": s.engine,
+                        "direction": s.direction,
+                        "score": score,
+                        "p_win": p_win,
+                        "ev": ev,
+                        "reason": hard_block,
+                    }
+                )
+                continue
+            if p_win < self.min_pwin or ev < self.min_ev:
+                suppressed.append(
+                    {
+                        "signal_id": s.signal_id,
+                        "engine": s.engine,
+                        "direction": s.direction,
+                        "score": score,
+                        "p_win": p_win,
+                        "ev": ev,
+                        "reason": "low_pwin_or_ev",
+                    }
+                )
+                continue
+            scored.append((score, p_win, ev, s))
+
+        if not scored:
+            return ArbiterDecision(winner=None, reason="no_viable_candidates", suppressed=suppressed)
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        top_score, top_setup = scored[0]
+        top_score, top_pwin, top_ev, top_setup = scored[0]
+        min_required = self._effective_min_score(ctx)
 
-        if top_score < self.min_score:
+        if top_score < min_required:
             return ArbiterDecision(
                 winner=None,
-                reason=f"low_quality score={top_score:.1f}<min={self.min_score:.1f}",
-                suppressed=[{"signal_id": s.signal_id, "engine": s.engine, "direction": s.direction, "score": sc} for sc, s in scored],
+                reason=f"low_quality score={top_score:.1f}<min={min_required:.1f}",
+                suppressed=(
+                    suppressed
+                    + [
+                        {"signal_id": s.signal_id, "engine": s.engine, "direction": s.direction, "score": sc, "p_win": pw, "ev": ev}
+                        for sc, pw, ev, s in scored
+                    ]
+                ),
             )
 
         if len(scored) >= 2:
-            second_score, second_setup = scored[1]
+            second_score, _, _, second_setup = scored[1]
             opposite = top_setup.direction != second_setup.direction
             close_scores = abs(top_score - second_score) <= self.conflict_band
             strong_bias = ctx.bias in ("long", "short") and (
@@ -1358,15 +1650,21 @@ class SignalArbiter:
                 return ArbiterDecision(
                     winner=None,
                     reason=f"conflict top={top_score:.1f} second={second_score:.1f}",
-                    suppressed=[{"signal_id": s.signal_id, "engine": s.engine, "direction": s.direction, "score": sc} for sc, s in scored],
+                    suppressed=(
+                        suppressed
+                        + [
+                            {"signal_id": s.signal_id, "engine": s.engine, "direction": s.direction, "score": sc, "p_win": pw, "ev": ev}
+                            for sc, pw, ev, s in scored
+                        ]
+                    ),
                 )
 
-        suppressed = [
-            {"signal_id": s.signal_id, "engine": s.engine, "direction": s.direction, "score": sc}
-            for sc, s in scored
+        kept = [
+            {"signal_id": s.signal_id, "engine": s.engine, "direction": s.direction, "score": sc, "p_win": pw, "ev": ev}
+            for sc, pw, ev, s in scored
             if s.signal_id != top_setup.signal_id
         ]
-        return ArbiterDecision(winner=top_setup, reason="selected", suppressed=suppressed)
+        return ArbiterDecision(winner=top_setup, reason=f"selected p_win={top_pwin:.2f} ev={top_ev:.2f}", suppressed=(suppressed + kept))
 
 
 @dataclass
@@ -1448,6 +1746,30 @@ class JsonlAppender:
             f.write(line + "\n")
 
 
+class TickRecorder:
+    def __init__(self, path: str, log: logging.Logger, strict: bool = False):
+        self.path = path
+        self.log = log
+        self.strict = bool(strict)
+        self.seq = 0
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    def append(self, tick: Dict[str, Any]) -> None:
+        self.seq += 1
+        row = {
+            "seq": self.seq,
+            "recv_ts_ist": datetime.now(IST_TZ).isoformat(),
+            "tick": tick,
+        }
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, separators=(",", ":")) + "\n")
+        except Exception as e:
+            self.log.error("[TICK_RECORDER] write failed seq=%s path=%s err=%s", self.seq, self.path, e)
+            if self.strict:
+                raise
+
+
 class WinStatsStore:
     def __init__(self):
         self.path = _env("NOTIFY_STATS_PATH", "logs/win_stats.json")
@@ -1469,18 +1791,32 @@ class WinStatsStore:
     def key(engine: str, regime: str, session_phase: str) -> str:
         return f"{engine}:{regime}:{session_phase}"
 
+    @staticmethod
+    def tag_key(engine: str, tag: str, regime: str, session_phase: str) -> str:
+        return f"{engine}|{tag}:{regime}:{session_phase}"
+
+    @staticmethod
+    def global_key(engine: str, tag: str) -> str:
+        return f"{engine}|{tag}:ALL:ALL"
+
     def _flush(self) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, separators=(",", ":"))
 
-    def record(self, setup: TradeSetup, session_phase: str, win: bool) -> None:
-        k = self.key(setup.engine, setup.regime, session_phase)
+    def _record_key(self, k: str, win: bool) -> None:
         rec = self.data.get(k, {"wins": 0, "total": 0})
         rec["total"] += 1
         if win:
             rec["wins"] += 1
         self.data[k] = rec
+
+    def record(self, setup: TradeSetup, session_phase: str, win: bool) -> None:
+        k = self.key(setup.engine, setup.regime, session_phase)
+        self._record_key(k, win)
+        for tag in (setup.rationale_tags or []):
+            self._record_key(self.tag_key(setup.engine, str(tag), setup.regime, session_phase), win)
+            self._record_key(self.global_key(setup.engine, str(tag)), win)
         try:
             self._flush()
         except Exception:
@@ -1496,6 +1832,32 @@ class WinStatsStore:
         if total < 10:
             return 0.0
         return float(wins) / float(max(1, total))
+
+    def bayesian_reliability(self, setup: TradeSetup, ctx: MarketContext, alpha: float = 3.0, beta: float = 3.0) -> float:
+        tags = setup.rationale_tags or []
+        if not tags:
+            return 0.50
+
+        priors: List[float] = []
+        for tag in tags:
+            local_key = self.tag_key(setup.engine, str(tag), ctx.regime, ctx.session_phase)
+            global_key = self.global_key(setup.engine, str(tag))
+            local = self.data.get(local_key, {"wins": 0, "total": 0})
+            glob = self.data.get(global_key, {"wins": 0, "total": 0})
+
+            lw = float(local.get("wins", 0))
+            lt = float(local.get("total", 0))
+            gw = float(glob.get("wins", 0))
+            gt = float(glob.get("total", 0))
+
+            local_rel = _safe_div(lw + alpha, lt + alpha + beta, 0.50)
+            global_rel = _safe_div(gw + alpha, gt + alpha + beta, 0.50)
+            lam = _clamp(_safe_div(lt, 30.0, 0.0), 0.0, 1.0)
+            priors.append((lam * local_rel) + ((1.0 - lam) * global_rel))
+
+        if not priors:
+            return 0.50
+        return _clamp(sum(priors) / float(len(priors)), 0.05, 0.95)
 
 
 class Notifier:
@@ -1570,7 +1932,9 @@ class EngineManager:
         self.market_open_h, self.market_open_m = _parse_hhmm(self.market_open_hhmm, default_h=9, default_m=15)
 
         self.context_detector = MarketContextDetector()
+        self.win_stats = WinStatsStore()
         self.arbiter = SignalArbiter()
+        self.arbiter.set_reliability_lookup(self.win_stats.bayesian_reliability)
         self.risk = RiskManager()
 
         self.tick_size = _env_float("TICK_SIZE", 0.05)
@@ -1611,9 +1975,30 @@ class EngineManager:
         if self.sim_intrabar_model not in ("ohlc_path", "conservative", "optimistic"):
             self.sim_intrabar_model = "ohlc_path"
 
-        # Optional suggestion notifier + online win stats.
+        # Optional suggestion notifier.
         self.notifier = Notifier()
-        self.win_stats = WinStatsStore()
+
+        # Human-friendly scalper action logging.
+        self.scalper_friendly_log = _env_bool("SCALPER_FRIENDLY_LOG", True)
+
+        # Selective relaxation for consecutive signals in UNCLEAR regimes.
+        self.consec_allow_unclear = _env_bool("SETUP_CONSEC_ALLOW_UNCLEAR", True)
+        self.consec_unclear_max_adx = _env_float("SETUP_CONSEC_UNCLEAR_MAX_ADX", 24.0)
+        self.consec_unclear_block_midday = _env_bool("SETUP_CONSEC_UNCLEAR_BLOCK_MIDDAY", True)
+
+        # Optional one-bar-early lead alert (notify-only guidance, not an auto-trade).
+        self.lead_alert_enabled = _env_bool("LEAD_ALERT_ENABLED", True)
+        self.lead_alert_cooldown_bars = max(0, _env_int("LEAD_ALERT_COOLDOWN_BARS", 1))
+        self.lead_min_adx = _env_float("LEAD_MIN_ADX", 24.0)
+        self.lead_min_di_spread = _env_float("LEAD_MIN_DI_SPREAD", 10.0)
+        self.lead_min_conf = _env_float("LEAD_MIN_CONF", 0.45)
+        self.lead_block_midday = _env_bool("LEAD_BLOCK_MIDDAY", True)
+        self._last_lead_candle_idx = -10_000_000
+        self.refire_cooldown_bars = max(0, _env_int("SETUP_REFIRE_COOLDOWN_BARS", 2))
+        self.refire_pullback_atr = _env_float("SETUP_REFIRE_PULLBACK_ATR", 0.60)
+        self.last_winner_direction: Optional[str] = None
+        self.last_winner_entry: Optional[float] = None
+        self.last_winner_candle_idx: int = -10_000_000
 
     @staticmethod
     def _normalize_decisions(result: EngineOutput) -> List[EngineDecision]:
@@ -1657,6 +2042,104 @@ class EngineManager:
             row.update(payload)
         self.jsonl.append(row)
 
+    @staticmethod
+    def _scalper_action(entry_type: str, direction: str) -> str:
+        side = "BUY" if direction == "LONG" else "SELL"
+        if entry_type == "market":
+            return f"{side} NOW at market"
+        if entry_type == "limit":
+            return f"PLACE {side} LIMIT at entry"
+        return f"PLACE {side} STOP at entry"
+
+    def _log_scalper_suggestion(self, setup: TradeSetup, ctx: MarketContext, decision: str) -> None:
+        if not self.scalper_friendly_log:
+            return
+        tp2_txt = "-" if setup.take_profit_2 is None else f"{float(setup.take_profit_2):.2f}"
+        action = self._scalper_action(setup.entry_type, setup.direction)
+        self.log.info(
+            "[SCALPER] %s | %s NIFTY50 | entry=%.2f | sl=%.2f | tp1=%.2f | tp2=%s | q=%s | regime=%s | hold<=%sb",
+            decision,
+            action,
+            setup.entry_price,
+            setup.stop_loss,
+            setup.take_profit_1,
+            tp2_txt,
+            setup.quality_score,
+            ctx.regime,
+            setup.max_hold_bars,
+        )
+
+    def _log_scalper_wait(self, reason: str, ctx: MarketContext) -> None:
+        if not self.scalper_friendly_log:
+            return
+        self.log.info(
+            "[SCALPER] WAIT | no trade setup | reason=%s | regime=%s | bias=%s | conf=%.2f",
+            reason,
+            ctx.regime,
+            ctx.bias,
+            ctx.confidence,
+        )
+
+    def _lead_alert_signal(self, ctx: MarketContext) -> Optional[tuple[str, float, str]]:
+        if not self.lead_alert_enabled:
+            return None
+        if ctx.regime != "UNCLEAR":
+            return None
+        if self.lead_block_midday and ctx.session_phase == "MIDDAY":
+            return None
+        if self.candle_idx <= (self._last_lead_candle_idx + self.lead_alert_cooldown_bars):
+            return None
+        if (
+            ctx.adx is None
+            or ctx.plus_di is None
+            or ctx.minus_di is None
+            or ctx.confidence is None
+            or ctx.macd_bias not in ("long", "short")
+        ):
+            return None
+        if float(ctx.adx) < float(self.lead_min_adx):
+            return None
+        if float(ctx.confidence) < float(self.lead_min_conf):
+            return None
+
+        if ctx.macd_bias == "long":
+            spread = float(ctx.plus_di) - float(ctx.minus_di)
+            if spread >= float(self.lead_min_di_spread):
+                return "LONG", spread, "pretrend_long"
+        else:
+            spread = float(ctx.minus_di) - float(ctx.plus_di)
+            if spread >= float(self.lead_min_di_spread):
+                return "SHORT", spread, "pretrend_short"
+        return None
+
+    def _emit_lead_alert(self, candle: Candle1m, ctx: MarketContext) -> None:
+        lead = self._lead_alert_signal(ctx)
+        if lead is None:
+            return
+        direction, di_spread, reason = lead
+        self._last_lead_candle_idx = self.candle_idx
+        self._log_event(
+            "LEAD_ALERT",
+            candle,
+            direction=direction,
+            reason=reason,
+            di_spread=di_spread,
+            confidence=ctx.confidence,
+            adx=ctx.adx,
+            regime=ctx.regime,
+            session_phase=ctx.session_phase,
+            entry_hint=float(candle.close),
+        )
+        if self.scalper_friendly_log:
+            self.log.info(
+                "[SCALPER] LEAD_ALERT | %s BIAS building | watch breakout next 1m | last=%.2f | di_spread=%.2f | adx=%.2f | conf=%.2f",
+                direction,
+                float(candle.close),
+                di_spread,
+                float(ctx.adx or 0.0),
+                float(ctx.confidence),
+            )
+
     def _compatible_regimes(self, engine: str) -> List[str]:
         mapping = {
             "momentum": ["TREND_UP", "TREND_DOWN"],
@@ -1686,6 +2169,15 @@ class EngineManager:
         compat = self._compatible_regimes(dec.engine)
         tags = list(dec.rationale_tags) if dec.rationale_tags else ["engine_signal", "regime_compatible"]
 
+        if dec.engine == "consecutive" and ctx.regime == "UNCLEAR" and self.consec_allow_unclear:
+            adx_ok = (ctx.adx is None) or (float(ctx.adx) <= float(self.consec_unclear_max_adx))
+            session_ok = (not self.consec_unclear_block_midday) or (ctx.session_phase != "MIDDAY")
+            if adx_ok and session_ok:
+                if "UNCLEAR" not in compat:
+                    compat = list(compat) + ["UNCLEAR"]
+                if "unclear_range_like" not in tags:
+                    tags.append("unclear_range_like")
+
         if ctx.regime not in compat:
             conf_override = float(dec.confidence or 0.0)
             is_trend_engine = dec.engine in ("momentum", "keltner", "channel_breakout")
@@ -1698,19 +2190,59 @@ class EngineManager:
             ):
                 return None
 
+        bar_range = max(float(candle.high) - float(candle.low), self.tick_size)
+        atr = ctx.atr if (ctx.atr is not None and ctx.atr > 0.0) else bar_range
+        atr_base = float(atr) if atr else bar_range
+        trend_strength = _safe_float(ctx.trend_strength, 0.0)
+        transition_risk = _safe_float(ctx.transition_risk, 1.0)
+        phase_factor = 1.0 if ctx.session_phase == "OPEN_GO" else (-1.0 if ctx.session_phase == "MIDDAY" else 0.0)
+
+        if (
+            self.last_winner_direction is not None
+            and self.last_winner_entry is not None
+            and direction == self.last_winner_direction
+            and (self.candle_idx - self.last_winner_candle_idx) <= self.refire_cooldown_bars
+        ):
+            pullback_depth = (
+                _safe_div(self.last_winner_entry - float(candle.low), atr_base, 0.0)
+                if direction == "LONG"
+                else _safe_div(float(candle.high) - self.last_winner_entry, atr_base, 0.0)
+            )
+            if pullback_depth < float(self.refire_pullback_atr):
+                return None
+
         self.signal_seq += 1
         signal_id = f"{dec.engine}_{self.candle_idx}_{self.signal_seq}"
 
         entry_type = dec.entry_type if dec.entry_type in ("stop", "limit", "market") else "stop"
+        if entry_type != "market":
+            continuation_score = (0.55 * trend_strength) + (0.30 * (1.0 - transition_risk))
+            continuation_score += 0.20 * (_safe_float(dec.confidence, 0.0))
+            continuation_score += 0.10 if any(("breakout" in t) or ("momentum" in t) for t in tags) else 0.0
+
+            pullback_score = (0.45 * transition_risk) + (0.25 * _safe_float(ctx.exhaustion_bull if direction == "LONG" else ctx.exhaustion_bear, 0.0))
+            pullback_score += 0.15 * (1.0 if any(("rejection" in t) or ("u_turn" in t) for t in tags) else 0.0)
+            pullback_score += 0.10 * max(0.0, _safe_float(ctx.atr_ratio, 1.0) - 1.0)
+            if (pullback_score - continuation_score) >= 0.15:
+                entry_type = "limit"
+            elif (continuation_score - pullback_score) >= 0.15:
+                entry_type = "stop"
+
         if entry_type == "market":
             entry_price = float(candle.close)
+        elif entry_type == "limit":
+            retrace = max(self.tick_size, 0.25 * atr_base)
+            entry_price = float(candle.close) - retrace if direction == "LONG" else float(candle.close) + retrace
         else:
             entry_price = float(dec.stop_price) if isinstance(dec.stop_price, (int, float)) else float(candle.close)
 
-        tp1_r, tp2_r, max_hold_bars, ttl_bars = self._rr_profile(ctx)
-        bar_range = max(float(candle.high) - float(candle.low), self.tick_size)
-        atr = ctx.atr if (ctx.atr is not None and ctx.atr > 0.0) else bar_range
-        atr_base = float(atr) if atr else bar_range
+        tp1_r, tp2_r, max_hold_bars_profile, ttl_bars_profile = self._rr_profile(ctx)
+        ttl_dyn = int(round(2.0 + (2.5 * trend_strength) - (2.0 * transition_risk) + phase_factor - max(0.0, _safe_float(ctx.atr_ratio, 1.0) - 1.4)))
+        hold_dyn = int(round(4.0 + (4.0 * trend_strength) + (2.0 * max(0.0, abs(_safe_float(ctx.slope, 0.0)))) - max(0.0, _safe_float(ctx.atr_ratio, 1.0) - 1.5)))
+        ttl_bars = int(_clamp(float(ttl_dyn), 2.0, 8.0))
+        max_hold_bars = int(_clamp(float(hold_dyn), 3.0, 12.0))
+        ttl_bars = max(int(ttl_bars_profile), ttl_bars)
+        max_hold_bars = max(int(max_hold_bars_profile), max_hold_bars)
 
         is_price_action = (dec.engine == "price_action") or any(("u_turn" in t) or ("rejection" in t) or ("dominance" in t) for t in tags)
         buf_frac = self.pa_sl_buffer_atr_frac if is_price_action else self.sl_buffer_atr_frac
@@ -1948,6 +2480,7 @@ class EngineManager:
             decision = "NO_SUGGEST" if self.suggest_only else "NO_TRADE"
             self._log_event("DECISION", candle, decision=decision, mode=self.mode, reason="synthetic_candle", candidate_count=0)
             self.log.info("[DECISION] %s reason=synthetic_candle regime=%s", decision, ctx.regime)
+            self._log_scalper_wait("synthetic_candle", ctx)
             return
 
         raw_candidates: List[TradeSetup] = []
@@ -1994,12 +2527,13 @@ class EngineManager:
 
         # Open warmup: engines can build state, but no suggestions.
         if self._in_open_warmup(candle):
+            warmup_reason = f"open_warmup_{self.open_warmup_minutes}m"
             self._log_event(
                 "DECISION",
                 candle,
                 decision="NO_SUGGEST",
                 mode=self.mode,
-                reason=f"open_warmup_{self.open_warmup_minutes}m",
+                reason=warmup_reason,
                 candidate_count=len(raw_candidates),
             )
             self.log.info(
@@ -2007,12 +2541,14 @@ class EngineManager:
                 self.open_warmup_minutes,
                 ctx.regime,
             )
+            self._log_scalper_wait(warmup_reason, ctx)
             return
 
         # Manual mode: always produce best-effort suggestions.
         if self.suggest_only:
             arb = self.arbiter.choose(raw_candidates, ctx)
             if arb.winner is None:
+                self._emit_lead_alert(candle, ctx)
                 self._log_event(
                     "DECISION",
                     candle,
@@ -2023,6 +2559,7 @@ class EngineManager:
                     suppressed=arb.suppressed,
                 )
                 self.log.info("[DECISION] NO_SUGGEST reason=%s regime=%s", arb.reason, ctx.regime)
+                self._log_scalper_wait(arb.reason, ctx)
                 return
 
             winner = arb.winner
@@ -2049,6 +2586,10 @@ class EngineManager:
                 winner.quality_score,
                 ctx.regime,
             )
+            self._log_scalper_suggestion(winner, ctx, decision="SUGGEST")
+            self.last_winner_direction = winner.direction
+            self.last_winner_entry = float(winner.entry_price)
+            self.last_winner_candle_idx = int(self.candle_idx)
             return
 
         # Simulator mode: retain risk gate + order lifecycle behavior.
@@ -2063,6 +2604,7 @@ class EngineManager:
                 candidate_count=len(raw_candidates),
             )
             self.log.info("[DECISION] NO_TRADE reason=%s regime=%s", gate.reason, ctx.regime)
+            self._log_scalper_wait(gate.reason, ctx)
             return
 
         arb = self.arbiter.choose(raw_candidates, ctx)
@@ -2077,6 +2619,7 @@ class EngineManager:
                 suppressed=arb.suppressed,
             )
             self.log.info("[DECISION] NO_TRADE reason=%s regime=%s", arb.reason, ctx.regime)
+            self._log_scalper_wait(arb.reason, ctx)
             return
 
         winner = arb.winner
@@ -2133,6 +2676,10 @@ class EngineManager:
             winner.quality_score,
             ctx.regime,
         )
+        self._log_scalper_suggestion(winner, ctx, decision="TRADE")
+        self.last_winner_direction = winner.direction
+        self.last_winner_entry = float(winner.entry_price)
+        self.last_winner_candle_idx = int(self.candle_idx)
 
 
 # ----------------------------
@@ -2140,10 +2687,11 @@ class EngineManager:
 # ----------------------------
 
 class MultiEngineRelay:
-    def __init__(self, mgr: EngineManager, candle_builder: OneMinuteCandleBuilder, log: logging.Logger):
+    def __init__(self, mgr: EngineManager, candle_builder: OneMinuteCandleBuilder, log: logging.Logger, tick_recorder: Optional[TickRecorder] = None):
         self.mgr = mgr
         self.cb = candle_builder
         self.log = log
+        self.tick_recorder = tick_recorder
         self._tick_seen = 0
 
     def on_tick(self, tick: Dict[str, Any]) -> None:
@@ -2153,12 +2701,22 @@ class MultiEngineRelay:
             if tick.get("kind") != "dhan_quote_packet":
                 return
 
+            if self.tick_recorder is not None:
+                self.tick_recorder.append(tick)
+
             ts = str(tick.get("timestamp") or "")
             dt_ist = _feed_ts_to_ist(ts)
 
             price = float(tick.get("ltp") or 0.0)
+            if not math.isfinite(price) or price <= 0.0:
+                self.log.warning("[RELAY] dropped tick with invalid ltp=%r ts=%s", tick.get("ltp"), ts)
+                return
             vol_raw = tick.get("volume")
-            volume = int(vol_raw) if vol_raw is not None else None
+            try:
+                volume = int(vol_raw) if vol_raw is not None else None
+            except Exception:
+                self.log.warning("[RELAY] volume parse failed volume=%r ts=%s", vol_raw, ts)
+                volume = None
 
             self._tick_seen += 1
             closed = self.cb.on_tick(dt_ist, price, volume)
@@ -2174,16 +2732,63 @@ class MultiEngineRelay:
 # Orchestrator
 # ----------------------------
 
+def _validate_runtime_config(log: logging.Logger) -> None:
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    tick_size = _env_float("TICK_SIZE", 0.05)
+    if tick_size <= 0.0:
+        errors.append("TICK_SIZE must be > 0")
+
+    if _env_int("SETUP_MAX_HOLD_BARS", 3) < 1:
+        errors.append("SETUP_MAX_HOLD_BARS must be >= 1")
+    if _env_int("SETUP_TTL_BARS", 2) < 1:
+        errors.append("SETUP_TTL_BARS must be >= 1")
+
+    min_score = _env_float("ARBITER_MIN_SCORE", 70.0)
+    min_score_midday = _env_float("ARBITER_MIN_SCORE_MIDDAY", 74.0)
+    min_score_unclear = _env_float("ARBITER_MIN_SCORE_UNCLEAR", 72.0)
+    for k, v in (("ARBITER_MIN_SCORE", min_score), ("ARBITER_MIN_SCORE_MIDDAY", min_score_midday), ("ARBITER_MIN_SCORE_UNCLEAR", min_score_unclear)):
+        if not (0.0 <= v <= 100.0):
+            errors.append(f"{k} must be in [0,100]")
+
+    min_p_win = _env_float("ARBITER_MIN_P_WIN", 0.55)
+    if not (0.0 <= min_p_win <= 1.0):
+        errors.append("ARBITER_MIN_P_WIN must be in [0,1]")
+
+    state_stay = _env_float("REGIME_STATE_STAY_PROB", 0.84)
+    state_flip = _env_float("REGIME_STATE_FLIP_PROB", 0.03)
+    if state_stay + state_flip >= 1.0:
+        errors.append("REGIME_STATE_STAY_PROB + REGIME_STATE_FLIP_PROB must be < 1")
+
+    u_turn_swing = _env_float("ARBITER_U_TURN_SWING_ATR_MAX", 0.35)
+    if u_turn_swing <= 0.0:
+        errors.append("ARBITER_U_TURN_SWING_ATR_MAX must be > 0")
+
+    warmup = _env_int("STRAT_OPEN_WARMUP_MINUTES", 15)
+    if warmup < 0:
+        errors.append("STRAT_OPEN_WARMUP_MINUTES must be >= 0")
+    if warmup > 120:
+        warnings.append("STRAT_OPEN_WARMUP_MINUTES is very high; no signals may appear for long.")
+
+    if errors:
+        for msg in errors:
+            log.error("[CONFIG] %s", msg)
+        raise SystemExit("Invalid configuration. Fix [CONFIG] errors and rerun.")
+    for msg in warnings:
+        log.warning("[CONFIG] %s", msg)
+
+
 def _build_engines(log: Optional[logging.Logger] = None) -> List[StrategyEngine]:
     tick_size = _env_float("TICK_SIZE", 0.05)
     builders: Dict[str, Any] = {
-        "momentum": lambda: MomentumEngine(length=_env_int("MOM_LENGTH", 12), tick_size=tick_size),
+        "momentum": lambda: MomentumEngine(length=_env_int("MOM_LENGTH", 10), tick_size=tick_size),
         "keltner": lambda: KeltnerChannelsEngine(
             length=_env_int("KELTNER_LENGTH", 20),
-            mult=_env_float("KELTNER_MULT", 2.0),
+            mult=_env_float("KELTNER_MULT", 1.6),
             use_exp=_env_bool("KELTNER_USE_EXP", True),
             bands_style=_env("KELTNER_BANDS_STYLE", "Average True Range"),
-            atr_length=_env_int("KELTNER_ATR_LENGTH", 10),
+            atr_length=_env_int("KELTNER_ATR_LENGTH", 8),
             tick_size=tick_size,
         ),
         "macd": lambda: MACDEngine(
@@ -2242,14 +2847,15 @@ async def run_system() -> None:
     log_level = getattr(dhan, "_parse_log_level", lambda d=logging.INFO: logging.INFO)(logging.INFO)
     log_to_console = getattr(dhan, "_env_bool", lambda k, d, aliases=None: _env_bool(k, d))("LOG_TO_CONSOLE", False, aliases=["FULL_LOG_TO_CONSOLE"])
     log = dhan.setup_logging(log_file=log_file, level=log_level, also_console=log_to_console)
+    _validate_runtime_config(log)
 
     engines = _build_engines(log=log)
     if not engines:
         raise SystemExit("No engines enabled. Set ENABLE_ENGINES=... or LIST_ENGINES=1")
 
     jsonl_path = _env("STRAT_JSONL", "logs/strategy_signals.jsonl")
-    write_hold = _env_bool("STRAT_WRITE_HOLD", False)
-    write_candles = _env_bool("STRAT_WRITE_CANDLES", False)
+    write_hold = _env_bool("STRAT_WRITE_HOLD", True)
+    write_candles = _env_bool("STRAT_WRITE_CANDLES", True)
     gap_fill = _env_bool("STRAT_GAP_FILL", False)
     max_gap_fill = _env_int("STRAT_GAP_FILL_MAX_MINUTES", 3)
 
@@ -2257,6 +2863,18 @@ async def run_system() -> None:
     log.info("[SYS] jsonl=%s write_hold=%s write_candles=%s gap_fill=%s", jsonl_path, write_hold, write_candles, gap_fill)
     if not write_candles:
         log.warning("[SYS] STRAT_WRITE_CANDLES is disabled; TP/SL outcome validation from JSONL will be limited.")
+
+    tick_recorder: Optional[TickRecorder] = None
+    if _env_bool("STRAT_TICK_LOG_ENABLED", False):
+        tick_path_tmpl = _env("STRAT_TICK_LOG_PATH", "logs/ticks_{date}.ndjson")
+        date_token = datetime.now(IST_TZ).strftime("%Y-%m-%d")
+        tick_path = tick_path_tmpl.replace("{date}", date_token)
+        tick_recorder = TickRecorder(
+            path=tick_path,
+            log=log,
+            strict=_env_bool("STRAT_TICK_LOG_STRICT", False),
+        )
+        log.info("[SYS] tick_recorder enabled path=%s", tick_path)
 
     mgr = EngineManager(
         engines=engines,
@@ -2269,6 +2887,7 @@ async def run_system() -> None:
         mgr=mgr,
         candle_builder=OneMinuteCandleBuilder(gap_fill=gap_fill, max_gap_fill_minutes=max_gap_fill),
         log=log,
+        tick_recorder=tick_recorder,
     )
 
     await dhan.run_quote_feed(cfg, relay, log)

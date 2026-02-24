@@ -211,7 +211,13 @@ class PolicyPipeline:
         if self._calib_sell_path:
             self._calib_sell = _load_calibrator(self._calib_sell_path)
 
-    def replace_models(self, *, buy_model: Any = None, sell_model: Any = None) -> None:
+    def replace_models(
+        self,
+        *,
+        buy_model: Any = None,
+        sell_model: Any = None,
+        schema_cols: Optional[List[str]] = None,
+    ) -> None:
         def _wrap(model: Any, name: str) -> Optional[PolicyModel]:
             if model is None:
                 return None
@@ -235,6 +241,16 @@ class PolicyPipeline:
                 feature_names = list(getattr(booster, "feature_names", None) or []) or None
             except Exception:
                 feature_names = None
+            if not feature_names and hasattr(booster, "attr"):
+                try:
+                    meta_raw = booster.attr("feature_schema")
+                    if meta_raw:
+                        meta = json.loads(meta_raw)
+                        names = meta.get("feature_names")
+                        if isinstance(names, list) and names and all(isinstance(x, str) for x in names):
+                            feature_names = list(names)
+                except Exception:
+                    feature_names = None
             try:
                 num_features = int(booster.num_features())
             except Exception:
@@ -251,6 +267,8 @@ class PolicyPipeline:
             self.sell_model = sm
             updated = True
         if updated:
+            if schema_cols and isinstance(schema_cols, list):
+                self.feature_schema_names = [str(c) for c in schema_cols]
             self.reload_calibration()
 
     def predict_success(

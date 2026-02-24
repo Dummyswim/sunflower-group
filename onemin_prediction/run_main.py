@@ -21,6 +21,37 @@ DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+
+def _safe_getenv_bool(key: str, default: bool = False) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return bool(default)
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _apply_phase1_profile_defaults() -> None:
+    """
+    Optional stabilization profile for Phase 1 bring-up.
+    Applies only when ENABLE_PHASE1_PROFILE=1 and only for unset vars.
+    """
+    if not _safe_getenv_bool("ENABLE_PHASE1_PROFILE", default=False):
+        return
+    defaults = {
+        "FLOW_STRONG_MIN": "0.32",
+        "RULE_MIN_SIG": "0.15",
+        "LANE_SCORE_MIN": "0.45",
+        "EMA_CHOP_HARD_MIN": "0.55",
+        "FLOW_CVD_MIN": "0.012",
+        "FLOW_LOCK_CVD_MIN": "0.03",
+        "FLOW_LOCK_IMB_MIN": "0.07",
+        "POLICY_MIN_SUCCESS": "0.52",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+
+
+_apply_phase1_profile_defaults()
+
 config = SimpleNamespace(
     # Instrument / subscription
     symbol=os.getenv("TRAIN_SYMBOL", "IDX_I:NIFTY 50"),
@@ -40,8 +71,9 @@ config = SimpleNamespace(
     user_trade_control=True,
     emit_prob_only=True,                 # NEW: probabilities-only mode
     suggest_tradeable_from_Q=True,       # optional UI hint
-    signals_path="trained_models/production/signals.jsonl",
+    signals_path=os.getenv("SIGNALS_PATH", "trained_models/production/signals.jsonl"),
     train_log_path=os.getenv("TRAIN_LOG_PATH", "data/train_log_v3_canonical.jsonl"),
+    idx_ticks_path=os.getenv("IDX_TICKS_PATH", ""),
 
     # Timekeeping
     use_arrival_time=True,
@@ -152,12 +184,6 @@ async def main():
 
 if __name__ == "__main__":
     from logging_setup import setup_logging2 as setup_logging, start_dynamic_level_watcher, stop_dynamic_level_watcher
-
-    def _safe_getenv_bool(key: str, default: bool = False) -> bool:
-        val = os.getenv(key)
-        if val is None:
-            return bool(default)
-        return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
     _high_verbose = _safe_getenv_bool("LOG_HIGH_VERBOSITY", default=True)
     _console_level = logging.DEBUG if _high_verbose else logging.INFO

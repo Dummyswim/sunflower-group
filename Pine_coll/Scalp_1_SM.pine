@@ -1,0 +1,416 @@
+//@version=5
+VERSION = 'v6_1_23_fixed_2026_02_21'
+
+strategy(
+     'XXX',
+     shorttitle              = 'XXX ' + VERSION,
+     overlay                 = true,
+     explicit_plot_zorder    = true,
+     pyramiding              = 0,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     calc_on_every_tick      = false,
+     calc_on_order_fills     = true,
+     process_orders_on_close = true)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+G_SCRIPT01   = '■ ' + 'SAIYAN OCC'
+
+// NON REPAINT / EXECUTION
+res                       = input.timeframe('15',  'HTF TIMEFRAME (for signals)', group ="NON REPAINT")
+htfConfirmedSignals       = input.bool(true,       'Use CONFIRMED HTF bars only (strict non-repaint)', group="NON REPAINT",
+     tooltip="ON = uses previous closed HTF bar. Signals will not repaint but will be later.\nOFF = uses developing HTF bar (no future leak), may change until HTF closes.")
+useRes                    = input(true,            'Use HTF signals', group="NON REPAINT")
+
+basisType                 = input.string('ALMA',   'MA Type: ', options=['TEMA', 'HullMA', 'ALMA'], group=G_SCRIPT01)
+basisLen                  = input.int(2,           'MA Period', minval=1, group=G_SCRIPT01)
+offsetSigma               = input.int(5,           'Offset for LSMA / Sigma for ALMA', minval=0, group=G_SCRIPT01)
+offsetALMA                = input.float(0.85,      'Offset for ALMA', minval=0, step=0.01, group=G_SCRIPT01)
+scolor                    = input(false,           'Show coloured Bars to indicate Trend?', group=G_SCRIPT01)
+delayOffset               = input.int(0,           'Delay Open/Close MA', minval=0, step=1, group=G_SCRIPT01,
+     tooltip='Shifts the MA inputs by N bars. Does not fix repaint if HTF lookahead is wrong.')
+tradeType                 = input.string('BOTH',   'What trades should be taken : ',
+     options = ['LONG', 'SHORT', 'BOTH', 'NONE'], group=G_SCRIPT01)
+
+h                         = input(false,           'Signals for Heikin Ashi Candles', group=G_SCRIPT01)
+
+// Supply/Demand Settings
+swing_length              = input.int(10,          'Swing High/Low Length', group = 'Settings', minval = 1, maxval = 50)
+history_of_demand_to_keep = input.int(20,          'History To Keep', minval = 5, maxval = 50, group='Settings')
+box_width                 = input.float(2.5,       'Supply/Demand Box Width', group = 'Settings', minval = 1, maxval = 10, step = 0.5)
+
+// Visual Settings
+show_zigzag               = input.bool(false,      'Show Zig Zag', group = 'Visual Settings', inline = '1')
+show_price_action_labels  = input.bool(false,      'Show Price Action Labels', group = 'Visual Settings', inline = '2')
+supply_color              = input.color(#00000000, 'Supply', group = 'Visual Settings', inline = '3')
+supply_outline_color      = input.color(#00000000, 'Outline', group = 'Visual Settings', inline = '3')
+demand_color              = input.color(#00000000, 'Demand', group = 'Visual Settings', inline = '4')
+demand_outline_color      = input.color(#00000000, 'Outline', group = 'Visual Settings', inline = '4')
+bos_label_color           = input.color(#00000000, 'BOS Label', group = 'Visual Settings', inline = '5')
+poi_label_color           = input.color(#00000000, 'POI Label', group = 'Visual Settings', inline = '7')
+poi_border_color          = input.color(#00000000, 'POI border', group = 'Visual Settings', inline = '7')
+swing_type_color          = input.color(#00000000, 'Price Action Label', group = 'Visual Settings', inline = '8')
+zigzag_color              = input.color(#00000000, 'Zig Zag', group = 'Visual Settings', inline = '9')
+
+// ============================================================================
+// SAFE MTF WRAPPERS (NO FUTURE LEAK)
+// ============================================================================
+sec_htf_mode(sym, tf, expr) =>
+    // lookahead_off prevents future leak. expr[1] makes it confirmed-only.
+    request.security(sym, tf, htfConfirmedSignals ? expr[1] : expr, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Backward-compatible alias (script used these names)
+securityNoRep(sym, tf, src) =>
+    sec_htf_mode(sym, tf, src)
+
+// "Non repaint" helper used earlier in your script. Now consistent in both history and realtime.
+rp_security(sym, tf, src) =>
+    sec_htf_mode(sym, tf, src)
+
+// ============================================================================
+// FUNCTIONS (Supply/Demand)
+// ============================================================================
+f_array_add_pop(array, new_value_to_add) =>
+    array.unshift(array, new_value_to_add)
+    array.pop(array)
+
+f_sh_sl_labels(array, swing_type) =>
+    var string label_text = na
+    if swing_type == 1
+        label_text := array.get(array, 0) >= array.get(array, 1) ? 'HH' : 'LH'
+        label.new(bar_index - swing_length, array.get(array,0), text = label_text,
+          style = label.style_label_down, textcolor = swing_type_color, color = swing_type_color, size = size.tiny)
+    else if swing_type == -1
+        label_text := array.get(array, 0) >= array.get(array, 1) ? 'HL' : 'LL'
+        label.new(bar_index - swing_length, array.get(array,0), text = label_text,
+          style = label.style_label_up, textcolor = swing_type_color, color = swing_type_color, size = size.tiny)
+
+f_check_overlapping(new_poi, box_array, atrValue) =>
+    atr_threshold = atrValue * 2
+    okay_to_draw = true
+    for i = 0 to array.size(box_array) - 1
+        b = array.get(box_array, i)
+        top = box.get_top(b)
+        bottom = box.get_bottom(b)
+        poi = (top + bottom) / 2
+        upper_boundary = poi + atr_threshold
+        lower_boundary = poi - atr_threshold
+        if new_poi >= lower_boundary and new_poi <= upper_boundary
+            okay_to_draw := false
+            break
+        else
+            okay_to_draw := true
+    okay_to_draw
+
+f_supply_demand(value_array, bn_array, box_array, label_array, box_type, atrValue) =>
+    atr_buffer = atrValue * (box_width / 10)
+    box_left   = array.get(bn_array, 0)
+    box_right  = bar_index
+    var float box_top = 0.00
+    var float box_bottom = 0.00
+    var float poi = 0.00
+    if box_type == 1
+        box_top := array.get(value_array, 0)
+        box_bottom := box_top - atr_buffer
+        poi := (box_top + box_bottom) / 2
+    else if box_type == -1
+        box_bottom := array.get(value_array, 0)
+        box_top := box_bottom + atr_buffer
+        poi := (box_top + box_bottom) / 2
+    okay_to_draw = f_check_overlapping(poi, box_array, atrValue)
+
+    if box_type == 1 and okay_to_draw
+        box.delete(array.get(box_array, array.size(box_array) - 1))
+        f_array_add_pop(box_array, box.new(left = box_left, top = box_top, right = box_right, bottom = box_bottom,
+             border_color = supply_outline_color, bgcolor = supply_color, extend = extend.right,
+             text = 'SUPPLY', text_halign = text.align_center, text_valign = text.align_center,
+             text_color = poi_label_color, text_size = size.small, xloc = xloc.bar_index))
+
+        box.delete(array.get(label_array, array.size(label_array) - 1))
+        f_array_add_pop(label_array, box.new(left = box_left, top = poi, right = box_right, bottom = poi,
+             border_color = poi_border_color, bgcolor = poi_border_color, extend = extend.right,
+             text = 'POI', text_halign = text.align_left, text_valign = text.align_center,
+             text_color = poi_label_color, text_size = size.small, xloc = xloc.bar_index))
+
+    else if box_type == -1 and okay_to_draw
+        box.delete(array.get(box_array, array.size(box_array) - 1))
+        f_array_add_pop(box_array, box.new(left = box_left, top = box_top, right = box_right, bottom = box_bottom,
+             border_color = demand_outline_color, bgcolor = demand_color, extend = extend.right,
+             text = 'DEMAND', text_halign = text.align_center, text_valign = text.align_center,
+             text_color = poi_label_color, text_size = size.small, xloc = xloc.bar_index))
+
+        box.delete(array.get(label_array, array.size(label_array) - 1))
+        f_array_add_pop(label_array, box.new(left = box_left, top = poi, right = box_right, bottom = poi,
+             border_color = poi_border_color, bgcolor = poi_border_color, extend = extend.right,
+             text = 'POI', text_halign = text.align_left, text_valign = text.align_center,
+             text_color = poi_label_color, text_size = size.small, xloc = xloc.bar_index))
+
+f_sd_to_bos(box_array, bos_array, label_array, zone_type) =>
+    if zone_type == 1
+        for i = 0 to array.size(box_array) - 1
+            level_to_break = box.get_top(array.get(box_array,i))
+            if close >= level_to_break
+                copied_box = box.copy(array.get(box_array,i))
+                f_array_add_pop(bos_array, copied_box)
+                mid = (box.get_top(array.get(box_array,i)) + box.get_bottom(array.get(box_array,i))) / 2
+                box.set_top(array.get(bos_array,0), mid)
+                box.set_bottom(array.get(bos_array,0), mid)
+                box.set_extend(array.get(bos_array,0), extend.none)
+                box.set_right(array.get(bos_array,0), bar_index)
+                box.set_text(array.get(bos_array,0), 'BOS')
+                box.set_text_color(array.get(bos_array,0), bos_label_color)
+                box.set_text_size(array.get(bos_array,0), size.small)
+                box.set_text_halign(array.get(bos_array,0), text.align_center)
+                box.set_text_valign(array.get(bos_array,0), text.align_center)
+                box.delete(array.get(box_array, i))
+                box.delete(array.get(label_array, i))
+    if zone_type == -1
+        for i = 0 to array.size(box_array) - 1
+            level_to_break = box.get_bottom(array.get(box_array,i))
+            if close <= level_to_break
+                copied_box = box.copy(array.get(box_array,i))
+                f_array_add_pop(bos_array, copied_box)
+                mid = (box.get_top(array.get(box_array,i)) + box.get_bottom(array.get(box_array,i))) / 2
+                box.set_top(array.get(bos_array,0), mid)
+                box.set_bottom(array.get(bos_array,0), mid)
+                box.set_extend(array.get(bos_array,0), extend.none)
+                box.set_right(array.get(bos_array,0), bar_index)
+                box.set_text(array.get(bos_array,0), 'BOS')
+                box.set_text_color(array.get(bos_array,0), bos_label_color)
+                box.set_text_size(array.get(bos_array,0), size.small)
+                box.set_text_halign(array.get(bos_array,0), text.align_center)
+                box.set_text_valign(array.get(bos_array,0), text.align_center)
+                box.delete(array.get(box_array, i))
+                box.delete(array.get(label_array, i))
+
+f_extend_box_endpoint(box_array) =>
+    for i = 0 to array.size(box_array) - 1
+        box.set_right(array.get(box_array, i), bar_index + 100)
+
+// ============================================================================
+// CALCULATIONS (Supply/Demand zones etc.)
+// ============================================================================
+src = h ? request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close, lookahead = barmerge.lookahead_off) : close
+atrValue = ta.atr(50)
+
+swing_high = ta.pivothigh(high, swing_length, swing_length)
+swing_low  = ta.pivotlow(low,   swing_length, swing_length)
+
+var swing_high_values  = array.new_float(5,0.00)
+var swing_low_values   = array.new_float(5,0.00)
+var swing_high_bns     = array.new_int(5,0)
+var swing_low_bns      = array.new_int(5,0)
+
+var current_supply_box = array.new_box(history_of_demand_to_keep, na)
+var current_demand_box = array.new_box(history_of_demand_to_keep, na)
+var current_supply_poi = array.new_box(history_of_demand_to_keep, na)
+var current_demand_poi = array.new_box(history_of_demand_to_keep, na)
+
+var supply_bos         = array.new_box(5, na)
+var demand_bos         = array.new_box(5, na)
+
+if not na(swing_high)
+    f_array_add_pop(swing_high_values, swing_high)
+    f_array_add_pop(swing_high_bns, bar_index[swing_length])
+    if show_price_action_labels
+        f_sh_sl_labels(swing_high_values, 1)
+    f_supply_demand(swing_high_values, swing_high_bns, current_supply_box, current_supply_poi, 1, atrValue)
+else if not na(swing_low)
+    f_array_add_pop(swing_low_values, swing_low)
+    f_array_add_pop(swing_low_bns, bar_index[swing_length])
+    if show_price_action_labels
+        f_sh_sl_labels(swing_low_values, -1)
+    f_supply_demand(swing_low_values, swing_low_bns, current_demand_box, current_demand_poi, -1, atrValue)
+
+f_sd_to_bos(current_supply_box, supply_bos, current_supply_poi, 1)
+f_sd_to_bos(current_demand_box, demand_bos, current_demand_poi, -1)
+
+f_extend_box_endpoint(current_supply_box)
+f_extend_box_endpoint(current_demand_box)
+
+// ============================================================================
+// MA VARIANT + SAFE RESOLUTION WRAPPER (FIXED: NO LOOKAHEAD_ON)
+// ============================================================================
+variant(type, src_, len, offSig, offALMA) =>
+    v1  = ta.sma(src_, len)
+    v2  = ta.ema(src_, len)
+    v4  = 3 * (v2 - ta.ema(v2, len)) + ta.ema(ta.ema(v2, len), len)  // TEMA-ish
+    v8  = ta.wma(2 * ta.wma(src_, len / 2) - ta.wma(src_, len), math.round(math.sqrt(len)))  // Hull
+    v10 = ta.alma(src_, len, offALMA, offSig)
+    type == 'TEMA' ? v4 : type == 'HullMA' ? v8 : type == 'ALMA' ? v10 : v1
+
+reso(exp, use, tf) =>
+    use ? sec_htf_mode(syminfo.tickerid, tf, exp) : exp
+
+closeSeries = variant(basisType, close[delayOffset], basisLen, offsetSigma, offsetALMA)
+openSeries  = variant(basisType, open[delayOffset],  basisLen, offsetSigma, offsetALMA)
+
+// IMPORTANT: use user-selected HTF `res`
+closeSeriesAlt = reso(closeSeries, useRes, res)
+openSeriesAlt  = reso(openSeries,  useRes, res)
+
+// ============================================================================
+// TRIGGERS
+// ============================================================================
+leTrigger = ta.crossover(closeSeriesAlt, openSeriesAlt)
+seTrigger = ta.crossunder(closeSeriesAlt, openSeriesAlt)
+
+// ============================================================================
+// RISK MANAGEMENT (ENTRY-PRICE BASED BRACKETS)
+// ============================================================================
+G_RISK  = '■ ' + 'Risk Management'
+T_LVL = '(%) Exit Level'
+T_QTY = '(%) Adjust trade exit volume'
+T_MSG = 'Paste JSON message for your bot'
+
+O_LEMSG    = 'Long Entry'
+O_LXMSGSL  = 'Long SL'
+O_LXMSGTP1 = 'Long TP1'
+O_LXMSGTP2 = 'Long TP2'
+O_LXMSGTP3 = 'Long TP3'
+O_LXMSG    = 'Long Exit'
+O_SEMSG    = 'Short Entry'
+O_SXMSGSL  = 'Short SL'
+O_SXMSGA   = 'Short TP1'
+O_SXMSGB   = 'Short TP2'
+O_SXMSGC   = 'Short TP3'
+O_SXMSGX   = 'Short Exit'
+
+i_lxLvlTP1 = input.float(1,   'Level TP1', group = G_RISK, tooltip=T_LVL)
+i_lxQtyTP1 = input.float(50,  'Qty   TP1', group = G_RISK, tooltip=T_QTY)
+i_lxLvlTP2 = input.float(1.5, 'Level TP2', group = G_RISK, tooltip=T_LVL)
+i_lxQtyTP2 = input.float(30,  'Qty   TP2', group = G_RISK, tooltip=T_QTY)
+i_lxLvlTP3 = input.float(2,   'Level TP3', group = G_RISK, tooltip=T_LVL)
+i_lxQtyTP3 = input.float(20,  'Qty   TP3', group = G_RISK, tooltip=T_QTY)
+i_lxLvlSL  = input.float(0.5, 'Stop Loss', group = G_RISK, tooltip=T_LVL)
+
+i_sxLvlTP1 = i_lxLvlTP1
+i_sxQtyTP1 = i_lxQtyTP1
+i_sxLvlTP2 = i_lxLvlTP2
+i_sxQtyTP2 = i_lxQtyTP2
+i_sxLvlTP3 = i_lxLvlTP3
+i_sxQtyTP3 = i_lxQtyTP3
+i_sxLvlSL  = i_lxLvlSL
+
+G_MSG   = '■ ' + 'Webhook Message'
+i_leMsg    = input.string(O_LEMSG   ,'Long Entry',  group = G_MSG, tooltip = T_MSG)
+i_lxMsgSL  = input.string(O_LXMSGSL ,'Long SL',     group = G_MSG, tooltip = T_MSG)
+i_lxMsgTP1 = input.string(O_LXMSGTP1,'Long TP1',    group = G_MSG, tooltip = T_MSG)
+i_lxMsgTP2 = input.string(O_LXMSGTP2,'Long TP2',    group = G_MSG, tooltip = T_MSG)
+i_lxMsgTP3 = input.string(O_LXMSGTP3,'Long TP3',    group = G_MSG, tooltip = T_MSG)
+i_lxMsg    = input.string(O_LXMSG   ,'Long Exit',   group = G_MSG, tooltip = T_MSG)
+
+i_seMsg    = input.string(O_SEMSG   ,'Short Entry', group = G_MSG, tooltip = T_MSG)
+i_sxMsgSL  = input.string(O_SXMSGSL ,'Short SL',    group = G_MSG, tooltip = T_MSG)
+i_sxMsgTP1 = input.string(O_SXMSGA  ,'Short TP1',   group = G_MSG, tooltip = T_MSG)
+i_sxMsgTP2 = input.string(O_SXMSGB  ,'Short TP2',   group = G_MSG, tooltip = T_MSG)
+i_sxMsgTP3 = input.string(O_SXMSGC  ,'Short TP3',   group = G_MSG, tooltip = T_MSG)
+i_sxMsg    = input.string(O_SXMSGX  ,'Short Exit',  group = G_MSG, tooltip = T_MSG)
+
+i_alertOn  = input.bool(true,  'Alert Labels On/Off', group = 'Display')
+i_barColOn = input.bool(true,  'Bar Color On/Off',    group = 'Display')
+
+G_EXEC     = 'Execution'
+flatOnly   = input.bool(false, 'Flat-only entries (no reversals)', group=G_EXEC)
+exitOnOpp  = input.bool(true,  'Exit on opposite signal',          group=G_EXEC)
+
+allowLong  = tradeType == 'LONG'  or tradeType == 'BOTH'
+allowShort = tradeType == 'SHORT' or tradeType == 'BOTH'
+
+// Entries/Exits
+if barstate.isconfirmed
+    if exitOnOpp and strategy.position_size > 0 and seTrigger
+        strategy.close('Long',  alert_message=i_lxMsg, comment='LX')
+    if exitOnOpp and strategy.position_size < 0 and leTrigger
+        strategy.close('Short', alert_message=i_sxMsg, comment='SX')
+
+    if allowLong and leTrigger and tradeType != 'NONE' and (not flatOnly or strategy.position_size == 0)
+        if strategy.position_size < 0
+            strategy.close('Short', alert_message=i_sxMsg, comment='SX')
+        strategy.entry('Long', strategy.long, alert_message=i_leMsg, comment='LE')
+
+    if allowShort and seTrigger and tradeType != 'NONE' and (not flatOnly or strategy.position_size == 0)
+        if strategy.position_size > 0
+            strategy.close('Long', alert_message=i_lxMsg, comment='LX')
+        strategy.entry('Short', strategy.short, alert_message=i_seMsg, comment='SE') // FIXED: i_seMsg
+
+// Brackets
+var float entryLine = na
+var float slLine    = na
+var float tp1Line   = na
+var float tp2Line   = na
+var float tp3Line   = na
+
+enteredLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+enteredShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+toFlat       = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if enteredLong
+    entryLine := strategy.position_avg_price
+    slLine    := entryLine * (1 - i_lxLvlSL/100)
+    tp1Line   := entryLine * (1 + i_lxLvlTP1/100)
+    tp2Line   := entryLine * (1 + i_lxLvlTP2/100)
+    tp3Line   := entryLine * (1 + i_lxLvlTP3/100)
+
+    strategy.exit('LXTP1','Long', qty_percent=i_lxQtyTP1, limit=tp1Line, stop=slLine, alert_profit=i_lxMsgTP1, alert_loss=i_lxMsgSL)
+    strategy.exit('LXTP2','Long', qty_percent=i_lxQtyTP2, limit=tp2Line, stop=slLine, alert_profit=i_lxMsgTP2, alert_loss=i_lxMsgSL)
+    strategy.exit('LXTP3','Long', qty_percent=i_lxQtyTP3, limit=tp3Line, stop=slLine, alert_profit=i_lxMsgTP3, alert_loss=i_lxMsgSL)
+
+if enteredShort
+    entryLine := strategy.position_avg_price
+    slLine    := entryLine * (1 + i_sxLvlSL/100)
+    tp1Line   := entryLine * (1 - i_sxLvlTP1/100)
+    tp2Line   := entryLine * (1 - i_sxLvlTP2/100)
+    tp3Line   := entryLine * (1 - i_sxLvlTP3/100)
+
+    strategy.exit('SXTP1','Short', qty_percent=i_sxQtyTP1, limit=tp1Line, stop=slLine, alert_profit=i_sxMsgTP1, alert_loss=i_sxMsgSL)
+    strategy.exit('SXTP2','Short', qty_percent=i_sxQtyTP2, limit=tp2Line, stop=slLine, alert_profit=i_sxMsgTP2, alert_loss=i_sxMsgSL)
+    strategy.exit('SXTP3','Short', qty_percent=i_sxQtyTP3, limit=tp3Line, stop=slLine, alert_profit=i_sxMsgTP3, alert_loss=i_sxMsgSL)
+
+if toFlat
+    entryLine := na
+    slLine    := na
+    tp1Line   := na
+    tp2Line   := na
+    tp3Line   := na
+
+// Visuals
+inPos   = strategy.position_size != 0
+c_tp    = inPos ? color.green : na
+c_entry = inPos ? color.blue  : na
+c_sl    = inPos ? color.red   : na
+
+p_tp1Line   = plot(inPos ? tp1Line : na, title="TP Line 1", color=c_tp, linewidth=1, style=plot.style_linebr)
+p_tp2Line   = plot(inPos ? tp2Line : na, title="TP Line 2", color=c_tp, linewidth=1, style=plot.style_linebr)
+p_tp3Line   = plot(inPos ? tp3Line : na, title="TP Line 3", color=c_tp, linewidth=1, style=plot.style_linebr)
+p_entryLine = plot(inPos ? entryLine : na, title="Entry Line", color=c_entry, linewidth=1, style=plot.style_linebr)
+p_slLine    = plot(inPos ? slLine : na, title="SL Line", color=c_sl, linewidth=1, style=plot.style_linebr)
+
+fill(p_tp3Line, p_entryLine, color = inPos ? color.new(color.green, 90) : na)
+fill(p_entryLine, p_slLine,  color = inPos ? color.new(color.red,   90) : na)
+
+enteredLongNow  = enteredLong
+enteredShortNow = enteredShort
+exitedLongNow   = strategy.position_size <= 0 and strategy.position_size[1] > 0
+exitedShortNow  = strategy.position_size >= 0 and strategy.position_size[1] < 0
+
+plotshape(i_alertOn and enteredLongNow,  title='Long',  text='Long',  textcolor=color.white, color=color.green, style=shape.labelup,   size=size.tiny, location=location.belowbar)
+plotshape(i_alertOn and enteredShortNow, title='Short', text='Short', textcolor=color.white, color=color.red,   style=shape.labeldown, size=size.tiny, location=location.abovebar)
+plotshape(i_alertOn and (exitedLongNow or exitedShortNow), title='Close', text='Close', textcolor=color.white, color=color.gray, style=shape.labelup, size=size.tiny, location=location.belowbar)
+
+c_barCol = close > open ? color.rgb(120, 9, 139) : color.rgb(69, 155, 225)
+barcolor(i_barColOn ? c_barCol : na)
+
+// Alerts (bar-close)
+if enteredLongNow or enteredShortNow or exitedLongNow or exitedShortNow
+    alert(message = 'Any Alert', freq = alert.freq_once_per_bar_close)
+if enteredLongNow
+    alert(message = 'Long Entry', freq = alert.freq_once_per_bar_close)
+if enteredShortNow
+    alert(message = 'Short Entry', freq = alert.freq_once_per_bar_close)
+if exitedLongNow
+    alert(message = 'Long Exit', freq = alert.freq_once_per_bar_close)
+if exitedShortNow
+    alert(message = 'Short Exit', freq = alert.freq_once_per_bar_close)

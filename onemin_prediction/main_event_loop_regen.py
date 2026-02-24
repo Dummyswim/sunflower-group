@@ -640,103 +640,329 @@ def compute_setup_conditional_label(
 
 # ========== FUTURES SIDECAR FEATURE INGEST ==========
 
-_FUT_CACHE: Dict[str, Any] = {"mtime": None, "last_row": None, "prev_row": None}
+_FUT_SHARED_STATE: Dict[str, Any] = {"latest": None, "by_stream": {}}
+_FUT_STREAM_ACCUM: Dict[str, Dict[str, Any]] = {}
+_FUT_SNAPSHOT_CACHE: Dict[str, Any] = {"path": None, "mtime": None, "snapshot": None}
 
-def _read_latest_fut_features(path: str, spot_last_px: float) -> Dict[str, float]:
-    """
-    Read latest futures VWAP/CVD/volume features from sidecar CSV.
-    Returns bounded, NaN-safe regime/orderflow proxies.
-    """
-    feats: Dict[str, float] = {}
+
+def _infer_stream_role(name: str, cfg: Any) -> str:
+    seg = str(getattr(cfg, "nifty_exchange_segment", getattr(cfg, "exchange_segment", "")) or "").upper()
+    nm = str(name or "").upper()
+    if ("FNO" in seg) or ("FUT" in seg) or ("FUT" in nm):
+        return "FUT"
+    if ("IDX" in seg) or ("INDEX" in nm):
+        return "IDX"
+    return "IDX"
+
+
+def _to_ist_datetime(ts: Any) -> datetime:
     try:
-        if not path or not os.path.exists(path):
-            return feats
+        if isinstance(ts, pd.Timestamp):
+            ts = ts.to_pydatetime()
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None or ts.tzinfo.utcoffset(ts) is None:
+                return ts.replace(tzinfo=IST)
+            return ts.astimezone(IST)
+    except Exception:
+        pass
+    return datetime.now(IST)
 
-        mtime = os.path.getmtime(path)
-        if _FUT_CACHE["mtime"] != mtime:
-            df = pd.read_csv(path)
-            if df is None or df.empty:
-                return feats
 
-            # Headerless sidecar fallback: assign expected columns when missing
-            if "session_vwap" not in df.columns:
-                expected = ["ts", "open", "high", "low", "close", "volume", "tick_count", "session_vwap", "cvd", "cum_volume"]
-                cols = expected[: len(df.columns)]
-                cols += [f"col_{i}" for i in range(len(df.columns) - len(cols))]
-                df.columns = cols
+def _update_fut_shared_from_row(name: str, row_ts: Any, row: Mapping[str, Any]) -> None:
+    try:
+        ts = _to_ist_datetime(row_ts)
+        close_px = float(row.get("close", 0.0) or 0.0)
+        vol = float(row.get("volume", 0.0) or 0.0)
+        tick_count = float(row.get("tick_count", 0.0) or 0.0)
+        candle_vol = vol if vol > 0.0 else max(0.0, tick_count)
+        if not np.isfinite(close_px) or close_px <= 0.0:
+            return
 
-            if "cum_volume" not in df.columns:
-                if "volume" in df.columns:
-                    df["cum_volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).cumsum()
-                elif "tick_count" in df.columns:
-                    df["cum_volume"] = pd.to_numeric(df["tick_count"], errors="coerce").fillna(0.0).cumsum()
-                else:
-                    df["cum_volume"] = 0.0
-            if "cvd" not in df.columns:
-                df["cvd"] = 0.0
-
-            df = df.tail(2).copy()
-            _FUT_CACHE["mtime"] = mtime
-            _FUT_CACHE["prev_row"] = df.iloc[0].to_dict() if len(df) > 1 else None
-            _FUT_CACHE["last_row"] = df.iloc[-1].to_dict()
-
-        last = _FUT_CACHE["last_row"] or {}
-        prev = _FUT_CACHE["prev_row"] or {}
-
-        cur_vwap = float(last.get("session_vwap", 0.0) or 0.0)
-        cur_cvd = float(last.get("cvd", 0.0) or 0.0)
-        cur_vol = float(last.get("cum_volume", 0.0) or 0.0)
-        cur_candle_vol = float(last.get("volume", 0.0) or 0.0)
-        cur_tick_count = float(last.get("tick_count", 0.0) or 0.0)
-
-        prev_cvd = float(prev.get("cvd", cur_cvd) or cur_cvd)
-        prev_vol = float(prev.get("cum_volume", cur_vol) or cur_vol)
-
-        cvd_delta = cur_cvd - prev_cvd
-        vol_delta = cur_vol - prev_vol
-        candle_vol = cur_candle_vol if cur_candle_vol > 0.0 else max(0.0, vol_delta)
-
-        # Bounded order-flow proxies
-        cvd_norm = float(np.tanh(cvd_delta / max(1.0, cur_vol)))
-        vol_norm = float(np.tanh(vol_delta / 10000.0))
-
-        fut_last_px = 0.0
-        for key in ("close", "last", "ltp", "price"):
-            try:
-                val = float(last.get(key, 0.0) or 0.0)
-                if np.isfinite(val) and val > 0.0:
-                    fut_last_px = val
-                    break
-            except Exception:
-                continue
-        ref_px = fut_last_px if fut_last_px > 0.0 else spot_last_px
-        if cur_vwap > 0.0 and ref_px > 0.0:
-            vwap_dev = (ref_px - cur_vwap) / max(1e-9, cur_vwap)
-        else:
-            vwap_dev = 0.0
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "[FUT] vwap_dev ref=%.2f fut_last=%.2f spot=%.2f vwap=%.2f -> %.5f",
-                float(ref_px),
-                float(fut_last_px),
-                float(spot_last_px),
-                float(cur_vwap),
-                float(vwap_dev),
+        state = _FUT_STREAM_ACCUM.setdefault(
+            str(name),
+            {
+                "session_date": ts.date(),
+                "cum_volume": 0.0,
+                "cum_pv": 0.0,
+                "cvd": 0.0,
+                "prev_close": None,
+                "prev_cvd": 0.0,
+                "prev_cum_volume": 0.0,
+            },
+        )
+        if state.get("session_date") != ts.date():
+            state.update(
+                {
+                    "session_date": ts.date(),
+                    "cum_volume": 0.0,
+                    "cum_pv": 0.0,
+                    "cvd": 0.0,
+                    "prev_close": None,
+                    "prev_cvd": 0.0,
+                    "prev_cum_volume": 0.0,
+                }
             )
-        vwap_dev = float(np.clip(vwap_dev, -0.01, 0.01))
 
-        feats.update({
-            "fut_session_vwap": cur_vwap,
-            "fut_vwap_dev": vwap_dev,
-            "fut_cvd_delta": cvd_norm,
-            "fut_vol_delta": vol_norm,
-            "fut_candle_volume": float(candle_vol),
-            "fut_cum_volume": float(cur_vol),
-            "fut_tick_count": float(cur_tick_count),
-        })
+        prev_close = state.get("prev_close")
+        state["cum_volume"] = float(state.get("cum_volume", 0.0)) + float(max(0.0, candle_vol))
+        state["cum_pv"] = float(state.get("cum_pv", 0.0)) + (float(close_px) * float(max(0.0, candle_vol)))
+        if prev_close is not None:
+            if close_px > float(prev_close):
+                state["cvd"] = float(state.get("cvd", 0.0)) + float(max(0.0, candle_vol))
+            elif close_px < float(prev_close):
+                state["cvd"] = float(state.get("cvd", 0.0)) - float(max(0.0, candle_vol))
+        state["prev_close"] = float(close_px)
+
+        cum_volume = float(state.get("cum_volume", 0.0))
+        cum_pv = float(state.get("cum_pv", 0.0))
+        cvd = float(state.get("cvd", 0.0))
+        prev_cvd = float(state.get("prev_cvd", cvd))
+        prev_cum_vol = float(state.get("prev_cum_volume", cum_volume))
+        cvd_delta_raw = float(cvd - prev_cvd)
+        vol_delta_raw = float(cum_volume - prev_cum_vol)
+        session_vwap = float(cum_pv / max(1.0, cum_volume)) if cum_volume > 0.0 else float(close_px)
+
+        state["prev_cvd"] = float(cvd)
+        state["prev_cum_volume"] = float(cum_volume)
+
+        snapshot = {
+            "source": "inproc",
+            "stream": str(name),
+            "feature_ts": ts,
+            "ingest_ts": datetime.now(IST),
+            "fut_last_px": float(close_px),
+            "fut_session_vwap": float(session_vwap),
+            "fut_cvd_raw": float(cvd),
+            "fut_cvd_delta_raw": float(cvd_delta_raw),
+            "fut_cvd_delta": float(np.tanh(cvd_delta_raw / max(1.0, cum_volume))),
+            "fut_vol_delta_raw": float(vol_delta_raw),
+            "fut_vol_delta": float(np.tanh(vol_delta_raw / 10000.0)),
+            "fut_candle_volume": float(max(0.0, candle_vol)),
+            "fut_cum_volume": float(max(0.0, cum_volume)),
+            "fut_tick_count": float(max(0.0, tick_count)),
+        }
+        _FUT_SHARED_STATE["by_stream"][str(name)] = snapshot
+        latest = _FUT_SHARED_STATE.get("latest")
+        if (latest is None) or (_to_ist_datetime(snapshot.get("ingest_ts")) >= _to_ist_datetime((latest or {}).get("ingest_ts"))):
+            _FUT_SHARED_STATE["latest"] = snapshot
     except Exception as e:
-        logger.debug(f"[FUT] read_latest_fut_features failed: {e}", exc_info=True)
-    return feats
+        logger.debug(f"[FUT] shared-state update failed: {e}", exc_info=True)
+
+
+def _latest_fut_snapshot() -> Optional[Dict[str, Any]]:
+    inproc_snap: Optional[Dict[str, Any]] = None
+    try:
+        snap = _FUT_SHARED_STATE.get("latest")
+        if isinstance(snap, dict):
+            inproc_snap = dict(snap)
+    except Exception:
+        pass
+
+    sidecar_snap: Optional[Dict[str, Any]] = None
+    try:
+        sidecar_snap = _read_sidecar_snapshot()
+    except Exception:
+        sidecar_snap = None
+
+    if inproc_snap and sidecar_snap:
+        # Prefer the freshest snapshot by ingest timestamp.
+        inproc_ts = _to_ist_datetime(inproc_snap.get("ingest_ts"))
+        sidecar_ts = _to_ist_datetime(sidecar_snap.get("ingest_ts"))
+        chosen = sidecar_snap if sidecar_ts >= inproc_ts else inproc_snap
+        return dict(chosen)
+    if inproc_snap:
+        return dict(inproc_snap)
+    if sidecar_snap:
+        try:
+            _FUT_SHARED_STATE["by_stream"][str(sidecar_snap.get("stream", "sidecar"))] = dict(sidecar_snap)
+            _FUT_SHARED_STATE["latest"] = dict(sidecar_snap)
+        except Exception:
+            pass
+        return dict(sidecar_snap)
+    return None
+
+
+def _read_sidecar_snapshot() -> Optional[Dict[str, Any]]:
+    """
+    Cross-process fallback for futures features:
+    read latest snapshot produced by futures_vwap_cvd_sidecar.py.
+    """
+    snap_path = str(os.getenv("FUT_SNAPSHOT_PATH", "runtime/fut_snapshot.json") or "").strip()
+    if not snap_path:
+        return None
+    p = Path(snap_path)
+    if not p.exists() or not p.is_file():
+        return None
+
+    try:
+        mtime = float(p.stat().st_mtime)
+    except Exception:
+        mtime = None
+
+    if (
+        _FUT_SNAPSHOT_CACHE.get("path") == str(p)
+        and _FUT_SNAPSHOT_CACHE.get("mtime") == mtime
+        and isinstance(_FUT_SNAPSHOT_CACHE.get("snapshot"), dict)
+    ):
+        return dict(_FUT_SNAPSHOT_CACHE.get("snapshot"))
+
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(raw, dict):
+        return None
+
+    feature_ts = _to_ist_datetime(raw.get("feature_ts", raw.get("ts_iso", raw.get("ts"))))
+    ingest_ts = _to_ist_datetime(raw.get("ingest_ts", feature_ts))
+    snapshot = {
+        "source": "sidecar",
+        "stream": str(raw.get("stream", "sidecar")),
+        "feature_ts": feature_ts,
+        "ingest_ts": ingest_ts,
+        "fut_last_px": float(_safe_float(raw.get("fut_last_px", 0.0), 0.0)),
+        "fut_session_vwap": float(_safe_float(raw.get("fut_session_vwap", 0.0), 0.0)),
+        "fut_cvd_raw": float(_safe_float(raw.get("fut_cvd_raw", 0.0), 0.0)),
+        "fut_cvd_delta_raw": float(_safe_float(raw.get("fut_cvd_delta_raw", 0.0), 0.0)),
+        "fut_cvd_delta": float(_safe_float(raw.get("fut_cvd_delta", 0.0), 0.0)),
+        "fut_vol_delta_raw": float(_safe_float(raw.get("fut_vol_delta_raw", 0.0), 0.0)),
+        "fut_vol_delta": float(_safe_float(raw.get("fut_vol_delta", 0.0), 0.0)),
+        "fut_candle_volume": float(_safe_float(raw.get("fut_candle_volume", 0.0), 0.0)),
+        "fut_cum_volume": float(_safe_float(raw.get("fut_cum_volume", 0.0), 0.0)),
+        "fut_tick_count": float(_safe_float(raw.get("fut_tick_count", 0.0), 0.0)),
+    }
+
+    _FUT_SNAPSHOT_CACHE["path"] = str(p)
+    _FUT_SNAPSHOT_CACHE["mtime"] = mtime
+    _FUT_SNAPSHOT_CACHE["snapshot"] = dict(snapshot)
+    return snapshot
+
+
+def _build_data_health(*, idx_ts: Any, idx_last_px: float, interval_sec: int, fut_snapshot: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    now = datetime.now(IST)
+    idx_dt = _to_ist_datetime(idx_ts)
+    idx_age_ms = max(0, int((now - idx_dt).total_seconds() * 1000.0))
+    idx_max_age_ms = max(1500, int(_safe_float(os.getenv("IDX_FRESH_MAX_MS", str(max(2000, int(interval_sec) * 2000))), max(2000, int(interval_sec) * 2000))))
+    idx_ok = bool(idx_age_ms <= idx_max_age_ms)
+
+    fut_age_ms: Optional[int] = None
+    align_delta_ms: Optional[int] = None
+    fut_ok = False
+    alignment_ok = False
+    basis_ok = False
+    basis_abs_pct: Optional[float] = None
+    fut_stream = None
+    fut_source = "none"
+    reasons: List[str] = []
+
+    if fut_snapshot:
+        fut_stream = str(fut_snapshot.get("stream", ""))
+        fut_source = str(fut_snapshot.get("source", "inproc") or "inproc")
+        ingest_ts = _to_ist_datetime(fut_snapshot.get("ingest_ts"))
+        fut_ts = _to_ist_datetime(fut_snapshot.get("feature_ts"))
+        fut_age_ms = max(0, int((now - ingest_ts).total_seconds() * 1000.0))
+        fut_max_age_ms = max(1500, int(_safe_float(os.getenv("FUT_FRESH_MAX_MS", str(max(2000, int(interval_sec) * 2000))), max(2000, int(interval_sec) * 2000))))
+        fut_ok = bool(fut_age_ms <= fut_max_age_ms)
+
+        align_delta_ms = abs(int((idx_dt - fut_ts).total_seconds() * 1000.0))
+        align_max_ms = max(500, int(_safe_float(os.getenv("FUT_ALIGN_MAX_MS", str(max(1000, int(interval_sec) * 1000))), max(1000, int(interval_sec) * 1000))))
+        alignment_ok = bool(align_delta_ms <= align_max_ms)
+
+        fut_px = _safe_float(fut_snapshot.get("fut_last_px", 0.0), 0.0)
+        basis_thr = float(np.clip(_safe_float(os.getenv("FUT_BASIS_MAX_PCT", "0.03"), 0.03), 0.001, 0.20))
+        if fut_px > 0.0 and idx_last_px > 0.0:
+            basis_abs_pct = abs(float(fut_px) - float(idx_last_px)) / max(1e-9, abs(float(idx_last_px)))
+            basis_ok = bool(basis_abs_pct <= basis_thr)
+
+    if not idx_ok:
+        reasons.append("idx_stale")
+    if not fut_snapshot:
+        reasons.append("fut_missing")
+    else:
+        if not fut_ok:
+            reasons.append("fut_stale")
+        if not alignment_ok:
+            reasons.append("fut_misaligned")
+        if not basis_ok:
+            reasons.append("basis_unreliable")
+
+    return {
+        "idx_age_ms": int(idx_age_ms),
+        "idx_ok": bool(idx_ok),
+        "fut_age_ms": int(fut_age_ms) if fut_age_ms is not None else None,
+        "fut_ok": bool(fut_ok),
+        "alignment_delta_ms": int(align_delta_ms) if align_delta_ms is not None else None,
+        "alignment_ok": bool(alignment_ok),
+        "basis_ok": bool(basis_ok),
+        "basis_abs_pct": float(basis_abs_pct) if basis_abs_pct is not None else None,
+        "fut_stream": fut_stream,
+        "fut_source": fut_source,
+        "reasons": list(reasons),
+    }
+
+
+def _fut_features_from_snapshot(*, fut_snapshot: Optional[Mapping[str, Any]], spot_last_px: float, data_health: Mapping[str, Any]) -> Dict[str, float]:
+    reliable = bool(
+        fut_snapshot
+        and data_health.get("fut_ok", False)
+        and data_health.get("alignment_ok", False)
+        and data_health.get("basis_ok", False)
+    )
+    if not fut_snapshot:
+        return {
+            "fut_session_vwap": 0.0,
+            "fut_vwap_dev": 0.0,
+            "fut_cvd_delta": 0.0,
+            "fut_vol_delta": 0.0,
+            "fut_candle_volume": 0.0,
+            "fut_cum_volume": 0.0,
+            "fut_tick_count": 0.0,
+            "fut_reliable": 0.0,
+        }
+
+    session_vwap = _safe_float(fut_snapshot.get("fut_session_vwap", 0.0), 0.0)
+    fut_px = _safe_float(fut_snapshot.get("fut_last_px", 0.0), 0.0)
+    ref_px = fut_px if fut_px > 0.0 else float(max(0.0, spot_last_px))
+    if reliable and session_vwap > 0.0 and ref_px > 0.0:
+        vwap_dev = float(np.clip((ref_px - session_vwap) / max(1e-9, session_vwap), -0.01, 0.01))
+    else:
+        vwap_dev = 0.0
+
+    return {
+        "fut_session_vwap": float(session_vwap),
+        "fut_vwap_dev": float(vwap_dev),
+        "fut_cvd_delta": float(_safe_float(fut_snapshot.get("fut_cvd_delta", 0.0), 0.0)) if reliable else 0.0,
+        "fut_vol_delta": float(_safe_float(fut_snapshot.get("fut_vol_delta", 0.0), 0.0)) if reliable else 0.0,
+        "fut_candle_volume": float(_safe_float(fut_snapshot.get("fut_candle_volume", 0.0), 0.0)) if data_health.get("fut_ok", False) else 0.0,
+        "fut_cum_volume": float(_safe_float(fut_snapshot.get("fut_cum_volume", 0.0), 0.0)) if data_health.get("fut_ok", False) else 0.0,
+        "fut_tick_count": float(_safe_float(fut_snapshot.get("fut_tick_count", 0.0), 0.0)) if data_health.get("fut_ok", False) else 0.0,
+        "fut_reliable": 1.0 if reliable else 0.0,
+    }
+
+
+def _get_fut_features_and_health(*, idx_ts: Any, spot_last_px: float, interval_sec: int) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    snapshot = _latest_fut_snapshot()
+    health = _build_data_health(
+        idx_ts=idx_ts,
+        idx_last_px=float(spot_last_px or 0.0),
+        interval_sec=max(1, int(interval_sec)),
+        fut_snapshot=snapshot,
+    )
+    feats = _fut_features_from_snapshot(fut_snapshot=snapshot, spot_last_px=float(spot_last_px or 0.0), data_health=health)
+    return feats, health
+
+
+def _update_fut_shared_from_df(name: str, df: pd.DataFrame) -> None:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return
+        row_ts = df.index[-1]
+        row = df.iloc[-1]
+        row_map = row.to_dict() if hasattr(row, "to_dict") else {}
+        _update_fut_shared_from_row(name=name, row_ts=row_ts, row=row_map)
+    except Exception as e:
+        logger.debug(f"[FUT] update from df failed: {e}", exc_info=True)
 
 
 def _compute_vol_features(candle_df: pd.DataFrame) -> Dict[str, float]:
@@ -1216,7 +1442,9 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
     _log_env_audit([
         "HTF_MIN_CONS", "RULE_MIN_SIG", "FLOW_VWAP_EXT", "FLOW_STRONG_MIN", "STRUCT_OPPOSE_FLOW_MIN",
         "POLICY_MIN_SUCCESS", "POLICY_BUY_PATH", "POLICY_SELL_PATH",
-        "POLICY_VETO_STRICT", "POLICY_MIN_SIZE_MULT",
+        "POLICY_MIN_SIZE_MULT",
+        "POLICY_GATE_USE_RAW", "POLICY_CALIB_FALLBACK_RAW", "POLICY_RAW_FALLBACK_MIN",
+        "POLICY_CALIB_RAW_RATIO_MIN", "POLICY_CALIB_RAW_GAP_MIN", "POLICY_INELIGIBLE_OVERRIDE_MIN",
         "CALIB_BUY_PATH", "CALIB_SELL_PATH",
         "FEATURE_SCHEMA_COLS_PATH", "POLICY_SCHEMA_COLS_PATH",
         "TREND_MIN_SIGNALS", "TREND_LANE_SIZE_MULT",
@@ -1232,7 +1460,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
         "USE_MOVE_HEAD", "MOVE_HEAD_MODE", "MOVE_HEAD_FALLBACK_PROXY",
         "MOVE_EDGE_MIN", "MOVE_EDGE_TREND_ONLY", "MOVE_PROXY_ATR_MULT", "POLICY_MOVE_PATH",
         "RV_ATR_MIN", "TRAIN_FALLBACK_ATR_MIN_RET",
-        "FLOW_LOCK_IMB_MIN", "FLOW_LOCK_CVD_MIN",
+        "FLOW_CVD_MIN", "FLOW_LOCK_IMB_MIN", "FLOW_LOCK_CVD_MIN",
     ])
 
     # Normalize connections (single connection default)
@@ -1397,6 +1625,8 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
     for name, cfg in connections:
         try:
             ws_handler = WSHandler(cfg)
+            stream_role = _infer_stream_role(name, cfg)
+            logger.info("[%s] Stream role resolved: %s", name, stream_role)
 
             ob_ring = deque(maxlen=10)
             staged_map: Dict[datetime, Dict[str, Any]] = {}   # features staged per reference candle start (2-min horizon)
@@ -1417,9 +1647,9 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                 alpha=float(os.getenv("DYN_TUNE_ALPHA", "0.15") or "0.15"),
             )
             tuner = DynamicTuner(tuner_cfg)
-            setup_ready_at: Optional[datetime] = None  # setup READY timestamp for delayed entry
+            setup_ready_state: Dict[str, Optional[datetime]] = {"ready_at": None}
 
-            async def _on_tick_cb(tick: Dict[str, Any]):
+            async def _on_tick_cb(tick: Dict[str, Any], name=name, ob_ring=ob_ring):
                 try:
                     best_px, mid_px = _extract_best_and_mid_from_tick(tick)
                     ob_snapshot = {
@@ -1431,10 +1661,25 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     logger.debug(f"[{name}] on_tick callback error (ignored): {e}")
 
             # ---------- PRE-CLOSE: STAGE FEATURES AT CURRENT CANDLE START (2-MIN HORIZON) ----------
-            async def _on_preclose_cb(preview_df: pd.DataFrame, full_df: pd.DataFrame):  # pyright: ignore[reportGeneralTypeIssues]
+            async def _on_preclose_cb(
+                preview_df: pd.DataFrame,
+                full_df: pd.DataFrame,
+                name=name,
+                cfg=cfg,
+                ws_handler=ws_handler,
+                ob_ring=ob_ring,
+                staged_map=staged_map,
+                decision_state=decision_state,
+                tuner=tuner,
+                setup_ready_state=setup_ready_state,
+                stream_role=stream_role,
+            ):  # pyright: ignore[reportGeneralTypeIssues]
                 try:
-                    nonlocal setup_ready_at
                     if preview_df is None or preview_df.empty:
+                        return
+
+                    if stream_role == "FUT":
+                        _update_fut_shared_from_df(name=name, df=preview_df)
                         return
 
                     # Current bucket start time t (candle being closed now)
@@ -1525,11 +1770,21 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
 
                     last_px = float(prices[-1])
 
-                    # --- Futures sidecar features (used for flow + volume proxies) ---
-                    fut_path = os.getenv("FUT_SIDECAR_PATH", "trained_models/production/fut_candles_vwap_cvd.csv")
-                    fut_feats = _read_latest_fut_features(fut_path, spot_last_px=last_px)
+                    # --- Futures in-process shared features + health ---
+                    fut_feats, data_health = _get_fut_features_and_health(
+                        idx_ts=current_bucket_start,
+                        spot_last_px=last_px,
+                        interval_sec=interval_sec,
+                    )
                     if fut_feats:
-                        logger.debug(f"[FUT] injected futures features: {fut_feats}")
+                        logger.debug("[%s] [FUT] injected shared futures features: %s", name, fut_feats)
+                    if data_health.get("reasons"):
+                        logger.info(
+                            "[%s] [DATA-HEALTH] source=%s %s",
+                            name,
+                            str(data_health.get("fut_source", "none")),
+                            ",".join(data_health.get("reasons", [])),
+                        )
 
                     # Apply volume fallback before TA/MTF (futures volume or tick_count proxy)
                     fut_candle_vol = None
@@ -1736,6 +1991,11 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         **vol_feats,
                         **tod_feats,
                         **fut_feats,
+                        "idx_age_ms": float(data_health.get("idx_age_ms", 0.0) or 0.0),
+                        "fut_age_ms": float(data_health.get("fut_age_ms", 0.0) or 0.0) if data_health.get("fut_age_ms") is not None else 0.0,
+                        "fut_alignment_ok": 1.0 if data_health.get("alignment_ok", False) else 0.0,
+                        "fut_basis_ok": 1.0 if data_health.get("basis_ok", False) else 0.0,
+                        "fut_ok": 1.0 if data_health.get("fut_ok", False) else 0.0,
                         'micro_slope': micro_slope_normed,
                         'micro_imbalance': float(micro_ctx.get('imbalance', 0.0)),
                         'mean_drift_pct': float(micro_ctx.get('mean_drift_pct', 0.0)),
@@ -2048,10 +2308,37 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
 
                     teacher_tradeable = bool(decision.get('tradeable', False))
                     tradeable_flag = bool(teacher_tradeable)
-                    gate_reasons = list(decision.get('gate_reasons', []))
-                    gate_reasons_teacher = list(gate_reasons)
-                    lane = str(decision.get('lane', 'NONE'))
+                    lane = str(decision.get('lane_tag', decision.get('lane', 'NONE')))
                     size_mult = float(decision.get('size_mult', 0.0))
+                    teacher_score = float(decision.get("teacher_score", decision.get("score", 0.0)))
+                    lane_score = float(decision.get("lane_score", 0.0))
+                    teacher_hard_veto = list(decision.get("teacher_hard_veto", decision.get("hard_veto", [])))
+                    teacher_soft_penalties = dict((decision.get("teacher_soft_penalties", decision.get("soft_penalties", {})) or {}))
+                    tags = list(decision.get("tags", []))
+                    blockers = list(decision.get("blockers", teacher_hard_veto))
+                    gate_reasons_teacher = list(blockers)
+
+                    # Data-health contributes explicit reasons. By default FUT health degrades size; IDX staleness vetoes.
+                    health_reasons = list((data_health or {}).get("reasons", []))
+                    if "idx_stale" in health_reasons and "idx_stale" not in blockers:
+                        blockers.append("idx_stale")
+                        tradeable_flag = False
+                    fut_issues = [r for r in health_reasons if r in ("fut_missing", "fut_stale", "fut_misaligned", "basis_unreliable")]
+                    if (not _safe_getenv_bool("REQUIRE_FUT_STREAM", default=False)) and ("fut_missing" in fut_issues):
+                        fut_issues = [r for r in fut_issues if r != "fut_missing"]
+                    if fut_issues:
+                        tags.append("data_health_degraded")
+                        try:
+                            fut_health_mult = float(os.getenv("FUT_HEALTH_SIZE_MULT", "0.50") or "0.50")
+                        except Exception:
+                            fut_health_mult = 0.50
+                        size_mult *= float(np.clip(fut_health_mult, 0.05, 1.0))
+                        if _safe_getenv_bool("FUT_HEALTH_HARD_VETO", default=False):
+                            for reason in fut_issues:
+                                if reason in ("fut_missing", "fut_stale", "fut_misaligned", "basis_unreliable") and reason not in blockers:
+                                    blockers.append(reason)
+                                    tradeable_flag = False
+
                     gates = {
                         "lane": lane,
                         "tape_conflict_level": str(decision.get('tape_conflict_level', tape_conflict_level)),
@@ -2072,9 +2359,20 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         policy_max_micro = 0.25
                     p_success_raw = None
                     p_success_cal = None
+                    p_success_gate = None
+                    p_success_source = "none"
                     p_move = None
                     p_edge = None
                     policy_features = None
+                    edge_min = None
+                    edge_min_adj = None
+                    def _score_or_none(x):
+                        try:
+                            v = float(x)
+                            return v if np.isfinite(v) else None
+                        except Exception:
+                            return None
+
                     if isinstance(model_pipe, PolicyPipeline) and rule_dir in ("BUY", "SELL"):
                         policy_features = compose_policy_features(
                             features=features,
@@ -2089,6 +2387,33 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                             feature_values=feat_vals,
                             teacher_dir=rule_dir,
                         )
+                        p_success_raw = _score_or_none(p_success_raw)
+                        p_success_cal = _score_or_none(p_success_cal)
+                    use_raw_gate = _safe_getenv_bool("POLICY_GATE_USE_RAW", default=False)
+                    use_raw_fallback = _safe_getenv_bool("POLICY_CALIB_FALLBACK_RAW", default=True)
+                    raw_fallback_min = _safe_float(os.getenv("POLICY_RAW_FALLBACK_MIN", "0.60"), 0.60)
+                    raw_cal_ratio = _safe_float(os.getenv("POLICY_CALIB_RAW_RATIO_MIN", "0.45"), 0.45)
+                    raw_cal_gap = _safe_float(os.getenv("POLICY_CALIB_RAW_GAP_MIN", "0.20"), 0.20)
+                    if p_success_cal is None and p_success_raw is not None:
+                        p_success_gate = float(p_success_raw)
+                        p_success_source = "raw_no_calib"
+                    elif p_success_cal is not None:
+                        p_success_gate = float(p_success_cal)
+                        p_success_source = "calib"
+                    if (
+                        use_raw_fallback
+                        and p_success_raw is not None
+                        and p_success_cal is not None
+                        and float(p_success_raw) >= raw_fallback_min
+                        and (
+                            float(p_success_cal) <= (float(p_success_raw) * raw_cal_ratio)
+                            or (float(p_success_raw) - float(p_success_cal)) >= raw_cal_gap
+                        )
+                    ):
+                        use_raw_gate = True
+                    if use_raw_gate and p_success_raw is not None:
+                        p_success_gate = float(p_success_raw)
+                        p_success_source = "raw"
                     use_move_head = _safe_getenv_bool("USE_MOVE_HEAD", default=False)
                     if use_move_head:
                         mode = str(os.getenv("MOVE_HEAD_MODE", "proxy") or "proxy").lower().strip()
@@ -2108,6 +2433,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                                     feature_names=feat_names,
                                     feature_values=feat_vals,
                                 )
+                                p_move = _score_or_none(p_move)
                             except Exception:
                                 p_move = None
                             if p_move is None and fallback_proxy:
@@ -2128,18 +2454,29 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
 
                     policy_authorized = False
                     override_reason = "NONE"
+                    policy_reason = "teacher_ineligible"
+                    move_reason = "not_applied"
                     if teacher_tradeable:
-                        if p_success_cal is None:
+                        if p_success_gate is None:
                             tradeable_flag = False
-                            gate_reasons.append("policy_no_score")
+                            if "policy_no_score" not in blockers:
+                                blockers.append("policy_no_score")
+                            policy_reason = "policy_no_score"
                         else:
-                            if float(p_success_cal) >= policy_min:
+                            policy_reason = "policy_veto"
+                            if float(p_success_gate) >= policy_min:
+                                policy_reason = "policy_pass"
+                                policy_authorized = True
+                                tradeable_flag = True
+                                denom = max(1e-6, 1.0 - policy_min)
+                                scale = float(np.clip((float(p_success_gate) - policy_min) / denom, 0.0, 1.0))
+                                size_mult *= scale
                                 if use_move_head and p_move is not None:
                                     try:
                                         edge_min = float(os.getenv("MOVE_EDGE_MIN", "0.30") or "0.30")
                                     except Exception:
                                         edge_min = 0.30
-                                    p_edge = float(p_success_cal) * float(p_move)
+                                    p_edge = float(p_success_gate) * float(p_move)
                                     bb_bw_pct = _safe_float(features_raw.get("ta_bb_bw_pct", 0.5), 0.5)
                                     di_spread = _safe_float(features_raw.get("ta_di_spread", 0.0), 0.0)
                                     st_dir = int(round(_safe_float(features_raw.get("ta_supertrend_dir", 0.0), 0.0)))
@@ -2165,23 +2502,33 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                                     apply_move_gate = True
                                     if move_edge_trend_only and lane not in ("TREND", "BREAKOUT"):
                                         apply_move_gate = False
-                                    if apply_move_gate and p_edge < edge_min_adj:
-                                        tradeable_flag = False
-                                        gate_reasons.append("move_edge_veto")
-                                        policy_authorized = False
-                                        override_reason = "move_edge_veto"
+                                    if apply_move_gate:
+                                        move_reason = "move_edge_scale"
+                                        edge_ratio = float(p_edge) / max(1e-6, float(edge_min_adj))
+                                        edge_scale = float(np.clip(edge_ratio, 0.0, 1.0))
+                                        size_mult *= edge_scale
+                                        try:
+                                            high_conf = float(os.getenv("MOVE_EDGE_HIGH_CONF", "0.85") or "0.85")
+                                        except Exception:
+                                            high_conf = 0.85
+                                        try:
+                                            hard_veto_ratio = float(os.getenv("MOVE_EDGE_HARD_VETO_RATIO", "0.35") or "0.35")
+                                        except Exception:
+                                            hard_veto_ratio = 0.35
+                                        if lane in ("TREND", "BREAKOUT") and (len(teacher_hard_veto) == 0) and (float(p_success_gate) >= high_conf):
+                                            move_reason = "move_edge_bypass_high_conf"
+                                        elif edge_ratio < hard_veto_ratio:
+                                            tradeable_flag = False
+                                            policy_authorized = False
+                                            override_reason = "move_edge_veto"
+                                            policy_reason = "move_edge_veto"
+                                            move_reason = "move_edge_veto"
+                                            if "move_edge_veto" not in blockers:
+                                                blockers.append("move_edge_veto")
                                     else:
-                                        denom = max(1e-6, 1.0 - policy_min)
-                                        scale = float(np.clip((float(p_success_cal) - policy_min) / denom, 0.0, 1.0))
-                                        size_mult *= scale
-                                        policy_authorized = True
-                                        tradeable_flag = True
-                                else:
-                                    denom = max(1e-6, 1.0 - policy_min)
-                                    scale = float(np.clip((float(p_success_cal) - policy_min) / denom, 0.0, 1.0))
-                                    size_mult *= scale
-                                    policy_authorized = True
-                                    tradeable_flag = True
+                                        move_reason = "move_gate_skipped_lane"
+                                elif use_move_head and p_move is None:
+                                    move_reason = "move_score_missing"
                             else:
                                 override_min = float(policy_min) * float(policy_override_ratio)
                                 flow_side = int(round(float(rule_signals.get("flow_side", 0.0))))
@@ -2206,30 +2553,80 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                                 flow_align = (flow_side == side)
                                 htf_align = (mtf_cons >= htf_neutral and side == 1) or (mtf_cons <= -htf_neutral and side == -1)
                                 htf_veto = (mtf_cons >= htf_strong_veto and side == -1) or (mtf_cons <= -htf_strong_veto and side == 1)
-                                hard_veto = list(decision.get("hard_veto", []))
-                                override_ok = bool(flow_align and htf_align and (not htf_veto) and (len(hard_veto) == 0) and (float(p_success_cal) >= override_min))
+                                hard_veto = list(teacher_hard_veto)
+                                override_ok = bool(flow_align and htf_align and (not htf_veto) and (len(hard_veto) == 0) and (float(p_success_gate) >= override_min))
                                 if override_ok:
                                     policy_authorized = True
                                     tradeable_flag = True
                                     size_mult = min(float(size_mult), float(policy_max_micro))
                                     override_reason = "policy_micro_override"
-                                    if "policy_micro_override" not in gate_reasons:
-                                        gate_reasons.append("policy_micro_override")
+                                    policy_reason = "policy_micro_override"
+                                    if "policy_micro_override" not in tags:
+                                        tags.append("policy_micro_override")
                                 else:
                                     tradeable_flag = False
-                                    if "policy_veto" not in gate_reasons:
-                                        gate_reasons.append("policy_veto")
+                                    policy_reason = "policy_veto"
+                                    if "policy_veto" not in blockers:
+                                        blockers.append("policy_veto")
                     else:
                         tradeable_flag = False
-                        if "no_direction" not in gate_reasons and "teacher_ineligible" not in gate_reasons:
-                            gate_reasons.append("teacher_ineligible")
+                        if "teacher_ineligible" not in blockers:
+                            blockers.append("teacher_ineligible")
+                        policy_reason = "teacher_ineligible"
+                        if p_success_gate is not None and lane in ("TREND", "SETUP", "BREAKOUT") and rule_dir in ("BUY", "SELL"):
+                            try:
+                                ineligible_min = float(os.getenv("POLICY_INELIGIBLE_OVERRIDE_MIN", "0.62") or "0.62")
+                            except Exception:
+                                ineligible_min = 0.62
+                            try:
+                                htf_neutral = float(os.getenv("HTF_NEUTRAL_MIN", "0.35") or "0.35")
+                            except Exception:
+                                htf_neutral = 0.35
+                            flow_side = int(round(float(rule_signals.get("flow_side", 0.0))))
+                            mtf_cons = _safe_float(rule_signals.get("mtf_consensus", 0.0), 0.0)
+                            side = 1 if rule_dir == "BUY" else -1
+                            flow_align = (flow_side == side)
+                            htf_align = (mtf_cons >= htf_neutral and side == 1) or (mtf_cons <= -htf_neutral and side == -1)
+                            hard_blockers = {"no_direction", "lane_score_low", "idx_stale", "fut_stale", "fut_misaligned"}
+                            no_hard_blockers = (len(teacher_hard_veto) == 0) and all(b not in hard_blockers for b in blockers)
+                            if flow_align and htf_align and no_hard_blockers and float(p_success_gate) >= ineligible_min:
+                                policy_authorized = True
+                                tradeable_flag = True
+                                override_reason = "teacher_ineligible_override"
+                                policy_reason = "teacher_ineligible_override"
+                                min_size = _safe_float(os.getenv("POLICY_MIN_SIZE_MULT", "0.15"), 0.15)
+                                size_mult = min(max(float(size_mult), min_size), float(policy_max_micro))
+                                blockers = [b for b in blockers if b != "teacher_ineligible"]
+
+                    blockers = list(dict.fromkeys(str(x) for x in blockers if x))
+                    gate_reasons = list(blockers)
+                    policy_gate = {
+                        "p_success": float(p_success_raw) if p_success_raw is not None else None,
+                        "p_success_cal": float(p_success_cal) if p_success_cal is not None else None,
+                        "p_success_gate": float(p_success_gate) if p_success_gate is not None else None,
+                        "p_success_source": str(p_success_source),
+                        "policy_min": float(policy_min),
+                        "authorized": bool(policy_authorized),
+                        "reason": str(policy_reason),
+                    }
+                    move_gate = {
+                        "p_move": float(p_move) if p_move is not None else None,
+                        "p_edge": float(p_edge) if p_edge is not None else None,
+                        "edge_min": float(edge_min) if edge_min is not None else None,
+                        "edge_min_adj": float(edge_min_adj) if edge_min_adj is not None else None,
+                        "applied": bool(use_move_head and p_move is not None),
+                        "reason": str(move_reason),
+                    }
                     # Structured decision log (machine-readable)
                     logger.info(
                         "[%s] [DECISION] lane=%s intent=%s tradeable=%s teacher_eligible=%s policy_auth=%s override=%s "
-                        "size=%.2f score=%.3f edge_req=%.3f edge_q=%.3f str_center=%.3f str_raw=%.3f "
+                        "size=%.2f teacher_score=%.3f lane_score=%.3f edge_req=%.3f edge_q=%.3f str_center=%.3f str_raw=%.3f "
+                        "policy_min=%.3f p_success=%s p_success_cal=%s p_success_gate=%s score_src=%s "
+                        "p_move=%s p_edge=%s edge_min=%s edge_min_adj=%s "
                         "trend_sig=%d trend_str=%.2f trigger=%s(%s) tape=%s conflict=%s would_trade_wo_soft=%s "
+                        "idx_age_ms=%s fut_age_ms=%s fut_ok=%s align_ok=%s basis_ok=%s "
                         "regime=%s reg_age=%d vol=%s rev_risk=%s "
-                        "hard=%s soft=%s",
+                        "blockers=%s tags=%s soft=%s policy_reason=%s move_reason=%s",
                         name,
                         lane,
                         str(decision.get('intent', 'NA')),
@@ -2238,11 +2635,21 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         bool(policy_authorized),
                         str(override_reason),
                         float(size_mult),
-                        float(decision.get('score', 0.0)),
+                        float(teacher_score),
+                        float(lane_score),
                         float(decision.get('edge_required', 0.0)),
                         float(decision.get('edge_quantile', 0.0)),
                         float(decision.get('centered_strength', 0.0)),
                         float(decision.get('raw_strength', 0.0)),
+                        float(policy_min),
+                        f"{p_success_raw:.4f}" if p_success_raw is not None else "NA",
+                        f"{p_success_cal:.4f}" if p_success_cal is not None else "NA",
+                        f"{p_success_gate:.4f}" if p_success_gate is not None else "NA",
+                        str(p_success_source),
+                        f"{p_move:.4f}" if p_move is not None else "NA",
+                        f"{p_edge:.4f}" if p_edge is not None else "NA",
+                        f"{edge_min:.4f}" if edge_min is not None else "NA",
+                        f"{edge_min_adj:.4f}" if edge_min_adj is not None else "NA",
                         int(decision.get('trend_signals', 0)),
                         float(decision.get('trend_strength', 0.0)),
                         bool(decision.get('trigger', False)),
@@ -2250,12 +2657,20 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         str(decision.get('tape_conflict_level', 'none')),
                         str(decision.get('conflict', 'na')),
                         bool(decision.get('would_trade_without_soft', False)),
+                        data_health.get("idx_age_ms"),
+                        data_health.get("fut_age_ms"),
+                        bool(data_health.get("fut_ok", False)),
+                        bool(data_health.get("alignment_ok", False)),
+                        bool(data_health.get("basis_ok", False)),
                         str(regime),
                         int(regime_age),
                         str(vol_band),
                         bool(reversal_risk),
-                        list(decision.get('hard_veto', [])),
-                        list((decision.get('soft_penalties', {}) or {}).keys()),
+                        list(blockers),
+                        list(dict.fromkeys(tags)),
+                        list(teacher_soft_penalties.keys()),
+                        str(policy_reason),
+                        str(move_reason),
                     )
 
                     try:
@@ -2275,17 +2690,19 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
 
                     entry_delay_min = int(os.getenv("SETUP_ENTRY_DELAY_MIN", "0") or "0")
                     if not is_any_setup:
-                        setup_ready_at = None
+                        setup_ready_state["ready_at"] = None
                     else:
-                        if setup_state == "READY" and setup_ready_at is None:
-                            setup_ready_at = current_bucket_start
-                        if setup_ready_at is not None and entry_delay_min > 0:
-                            ready_after = setup_ready_at + timedelta(minutes=entry_delay_min)
+                        if setup_state == "READY" and setup_ready_state.get("ready_at") is None:
+                            setup_ready_state["ready_at"] = current_bucket_start
+                        if setup_ready_state.get("ready_at") is not None and entry_delay_min > 0:
+                            ready_after = setup_ready_state["ready_at"] + timedelta(minutes=entry_delay_min)
                             if current_bucket_start < ready_after:
                                 tradeable_flag = False
-                                gate_reasons.append("entry_delay")
+                                if "entry_delay" not in blockers:
+                                    blockers.append("entry_delay")
+                                gate_reasons = list(dict.fromkeys(blockers))
                             elif current_bucket_start >= ready_after:
-                                setup_ready_at = None  # consumed delay window
+                                setup_ready_state["ready_at"] = None  # consumed delay window
 
                     logger.info(
                         f"[{name}] [SETUP] state={setup_state} "
@@ -2299,25 +2716,110 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     dir_overall = intent if intent in ("BUY", "SELL") else "FLAT"
                     if dir_overall in ("NEUTRAL", "FLAT"):
                         tradeable_flag = False
-                        if "no_direction" not in gate_reasons and "teacher_flat" not in gate_reasons:
-                            gate_reasons.append("teacher_flat")
+                        if "teacher_flat" not in blockers:
+                            blockers.append("teacher_flat")
+                        gate_reasons = list(dict.fromkeys(blockers))
+
+                    pending_intent = getattr(decision_state, "_pending_intent", None)
+                    now_bucket_ts = _to_ist_datetime(current_bucket_start)
+                    interval_sec = int(getattr(cfg, "candle_interval_seconds", 60))
+                    if isinstance(pending_intent, dict):
+                        exp_ts = pending_intent.get("expire_ts")
+                        if exp_ts is not None and now_bucket_ts >= _to_ist_datetime(exp_ts):
+                            decision_state._pending_intent = None
+                            pending_intent = None
+
+                    pending_promoted = False
+                    if isinstance(pending_intent, dict) and dir_overall in ("BUY", "SELL"):
+                        pending_dir = str(pending_intent.get("dir", "")).upper()
+                        if (
+                            pending_dir == dir_overall
+                            and bool(decision.get("trigger", False))
+                            and bool(policy_authorized)
+                            and len(blockers) == 0
+                        ):
+                            tradeable_flag = True
+                            pending_promoted = True
+                            tags.append("pending_promoted")
+                            decision_state._pending_intent = None
+
+                    final_action = "NO_TRADE"
+                    if tradeable_flag and policy_authorized and dir_overall in ("BUY", "SELL"):
+                        final_action = "ENTER"
+                        decision_state._pending_intent = None
+                    elif dir_overall in ("BUY", "SELL") and len(blockers) == 0:
+                        final_action = "WAIT_CONFIRM"
+                        ttl_bars = max(1, int(_safe_float(os.getenv("WAIT_CONFIRM_TTL_BARS", "2"), 2.0)))
+                        required_trigger = "ema_or_setup_trigger"
+                        try:
+                            trig_name = str(decision.get("trigger_name", "none"))
+                            if trig_name and trig_name != "none":
+                                required_trigger = trig_name
+                        except Exception:
+                            pass
+                        decision_state._pending_intent = {
+                            "dir": str(dir_overall),
+                            "lane": str(lane),
+                            "expire_ts": now_bucket_ts + timedelta(seconds=int(interval_sec * ttl_bars)),
+                            "required_trigger": str(required_trigger),
+                        }
+                    else:
+                        decision_state._pending_intent = None
+
+                    final_tradeable = bool(final_action == "ENTER")
+                    entry_mode = "MARKET" if final_action == "ENTER" else ("WAIT_TRIGGER" if final_action == "WAIT_CONFIRM" else "NONE")
+                    effective_health_reasons = [
+                        r for r in list(health_reasons)
+                        if (r != "fut_missing" or _safe_getenv_bool("REQUIRE_FUT_STREAM", default=False))
+                    ]
+                    final_reasons = list(dict.fromkeys(list(blockers) + list(effective_health_reasons)))
+                    gate_reasons = list(dict.fromkeys(blockers))
+                    decision_obj = {
+                        "lane_tag": str(lane),
+                        "tags": list(dict.fromkeys(tags)),
+                        "teacher_hard_veto": list(teacher_hard_veto),
+                        "teacher_soft_penalties": dict(teacher_soft_penalties),
+                        "policy_gate": dict(policy_gate),
+                        "move_gate": dict(move_gate),
+                        "data_health": dict(data_health),
+                        "final": {
+                            "tradeable": bool(final_tradeable),
+                            "action": str(final_action),
+                            "size_mult": float(size_mult),
+                            "entry_mode": str(entry_mode),
+                            "reasons": list(final_reasons),
+                        },
+                    }
+                    try:
+                        logger.info("[%s] [DECISION-OBJ] %s", name, json.dumps(decision_obj, default=str, sort_keys=True))
+                    except Exception:
+                        pass
 
                     # Signal record: prediction for close at t+2*interval
-                    suggest_tradeable = bool(tradeable_flag)
+                    suggest_tradeable = bool(final_tradeable)
                     sig = {
                         "pred_for": target_start.isoformat(), # where target_start = t + 2*interval
                         "decision": "USER",
                         "teacher_dir": str(rule_dir),
                         "teacher_tradeable": bool(teacher_tradeable),
-                        "exec_tradeable": bool(tradeable_flag),
+                        "exec_tradeable": bool(final_tradeable),
                         "policy_authorized": bool(policy_authorized),
                         "override_reason": str(override_reason),
                         "teacher_strength": float(teacher_strength),
                         "policy_success_raw": float(p_success_raw) if p_success_raw is not None else None,
                         "policy_success_calib": float(p_success_cal) if p_success_cal is not None else None,
+                        "policy_success_gate": float(p_success_gate) if p_success_gate is not None else None,
+                        "policy_success_source": str(p_success_source),
                         "policy_move_p": float(p_move) if p_move is not None else None,
                         "policy_edge_p": float(p_edge) if p_edge is not None else None,
                         "policy_min_success": float(policy_min),
+                        "policy_gate": dict(policy_gate),
+                        "move_gate": dict(move_gate),
+                        "data_health": dict(data_health),
+                        "decision_object": dict(decision_obj),
+                        "final_action": str(final_action),
+                        "final_entry_mode": str(entry_mode),
+                        "pending_promoted": bool(pending_promoted),
                         "tape_valid": bool(tape_valid),
                         "ema_decision_tf": (ema_meta or {}).get("decision_tf"),
                         "ema_filter_tf": (ema_meta or {}).get("filter_tf"),
@@ -2339,17 +2841,21 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         "rule_signal": float(rule_sig) if rule_sig is not None else None,
                         "rule_direction": rule_dir,
                         "direction": dir_overall,
-                        "tradeable": tradeable_flag,
+                        "tradeable": bool(final_tradeable),
                         "lane": lane,
                         "size_mult": float(size_mult),
                         "edge_required": float(decision.get('edge_required', 0.0)) if isinstance(decision, dict) else None,
-                        "score": float(decision.get('score', 0.0)) if isinstance(decision, dict) else None,
+                        "score": float(teacher_score),
+                        "teacher_score": float(teacher_score),
+                        "lane_score": float(lane_score),
+                        "blockers": list(blockers),
                         "gate_reasons": list(gate_reasons),
+                        "tags": list(dict.fromkeys(tags)),
                         "is_bull_setup": bool(is_bull_setup),
                         "is_bear_setup": bool(is_bear_setup),
                         "is_any_setup": bool(is_any_setup),
                         "setup_state": setup_state,
-                        "setup_ready_at": setup_ready_at.isoformat() if setup_ready_at else None,
+                        "setup_ready_at": setup_ready_state["ready_at"].isoformat() if setup_ready_state.get("ready_at") else None,
                     }
 
                     spath = getattr(cfg, "signals_path", "trained_models/production/signals.jsonl")
@@ -2357,7 +2863,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     with open(spath, "a", encoding="utf-8") as f:
                         f.write(json.dumps(sig) + "\n")
 
-                    p_success = p_success_cal if p_success_cal is not None else p_success_raw
+                    p_success = p_success_gate if p_success_gate is not None else p_success_raw
                     if p_success is None:
                         conf_bucket = "NA"
                     elif p_success >= 0.70:
@@ -2368,9 +2874,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         conf_bucket = "LOW"
 
                     rule_dir_display = rule_dir or "n/a"
-                    if tradeable_flag and not gate_reasons:
-                        gate_reasons.append('pass')
-                    gate_reason_str = ",".join(gate_reasons) if gate_reasons else "n/a"
+                    gate_reason_str = ",".join(gate_reasons) if gate_reasons else ("pass" if final_tradeable else "n/a")
                     p_success_txt = f"{p_success*100:.1f}%" if p_success is not None else "NA"
 
                     interval_min = max(
@@ -2381,7 +2885,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     scalper_line = _scalper_playbook_line(
                         features_raw=features_raw,
                         dir_overall=dir_overall,
-                        tradeable=tradeable_flag,
+                        tradeable=final_tradeable,
                         gate_reasons=gate_reasons,
                         rule_dir=rule_dir_display,
                         teacher_strength=teacher_strength,
@@ -2397,7 +2901,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     prev_tradeable = bool(getattr(decision_state, "_last_tradeable", False))
                     action_line = _scalper_action_line(
                         intent=dir_overall,
-                        tradeable=tradeable_flag,
+                        tradeable=final_tradeable,
                         policy_authorized=policy_authorized,
                         reversal_risk=bool(reversal_risk),
                         prev_intent=prev_intent,
@@ -2405,20 +2909,20 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         gate_reasons=gate_reasons,
                     )
                     logger.info(f"[{name}] {interval_min}-min {action_line}")
-                    if tradeable_flag and policy_authorized and dir_overall in ("BUY", "SELL"):
+                    if final_tradeable and policy_authorized and dir_overall in ("BUY", "SELL"):
                         logger.info(
                             f"[{name}] {interval_min}-min [SCALPER ALERT] ENTER_{dir_overall} NOW | "
                             f"p_success={p_success_txt} | strength={teacher_strength:.3f} | gate={gate_reason_str}"
                         )
                     decision_state._last_intent = dir_overall
-                    decision_state._last_tradeable = bool(tradeable_flag)
+                    decision_state._last_tradeable = bool(final_tradeable)
 
 
                     logger.info(
                         f"[{name}] {interval_min}-min view: "
                         f"p_success={p_success_txt} | "
                         f"dir={dir_overall} (teacher_dir={rule_dir_display}) | strength={teacher_strength:.3f} ({conf_bucket}) | "
-                        f"tradeable={tradeable_flag} "
+                        f"tradeable={final_tradeable} "
                         f"| gate={gate_reason_str}"
                     )
                     logger.info(
@@ -2449,23 +2953,51 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                             "tape_conflict_level": str(tape_conflict_level),
                             "tape_conflict_reasons": list(tape_conflict_reasons or []),
                             "gate_reasons": list(gate_reasons),
+                            "blockers": list(blockers),
+                            "tags": list(dict.fromkeys(tags)),
+                            "final_action": str(final_action),
+                            "policy_gate": dict(policy_gate),
+                            "move_gate": dict(move_gate),
+                            "data_health": dict(data_health),
                         },
-                        "tradeable": bool(tradeable_flag),
+                        "tradeable": bool(final_tradeable),
+                        "final_action": str(final_action),
+                        "decision_object": dict(decision_obj),
+                        "data_health": dict(data_health),
                         "lane": lane,
                         "size_mult": float(size_mult),
                         "edge_required": float(decision.get('edge_required', 0.0)) if isinstance(decision, dict) else None,
-                        "score": float(decision.get('score', 0.0)) if isinstance(decision, dict) else None,
+                        "score": float(teacher_score),
                         "policy_success_raw": float(p_success_raw) if p_success_raw is not None else None,
                         "policy_success_calib": float(p_success_cal) if p_success_cal is not None else None,
+                        "policy_success_gate": float(p_success_gate) if p_success_gate is not None else None,
+                        "policy_success_source": str(p_success_source),
+                        "policy_move_p": float(p_move) if p_move is not None else None,
+                        "policy_edge_p": float(p_edge) if p_edge is not None else None,
+                        "policy_min_success": float(policy_min),
                     }
 
                 except Exception as e:
                     logger.error(f"[{name}] on_preclose error: {e}", exc_info=True)
 
             # ---------- CANDLE CLOSE: 2-MIN LABEL (close_{t+2} vs close_t) ----------
-            async def _on_candle_cb(candle_df: pd.DataFrame, full_df: pd.DataFrame):
+            async def _on_candle_cb(
+                candle_df: pd.DataFrame,
+                full_df: pd.DataFrame,
+                name=name,
+                cfg=cfg,
+                staged_map=staged_map,
+                decision_state=decision_state,
+                tuner=tuner,
+                train_log_path=train_log_path,
+                stream_role=stream_role,
+            ):
                 try:
                     if not isinstance(candle_df, pd.DataFrame) or candle_df.empty:
+                        return
+
+                    if stream_role == "FUT":
+                        _update_fut_shared_from_df(name=name, df=candle_df)
                         return
 
                     idx_ts = candle_df.index[-1]
@@ -2475,9 +3007,12 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     if vol_val <= 0.0:
                         fut_candle_vol = None
                         try:
-                            fut_path = os.getenv("FUT_SIDECAR_PATH", "trained_models/production/fut_candles_vwap_cvd.csv")
                             spot_px = float(row_t2.get("close", 0.0) or 0.0)
-                            fut_feats = _read_latest_fut_features(fut_path, spot_last_px=spot_px)
+                            fut_feats, _health = _get_fut_features_and_health(
+                                idx_ts=idx_ts,
+                                spot_last_px=spot_px,
+                                interval_sec=int(getattr(cfg, "candle_interval_seconds", 60)),
+                            )
                             fut_candle_vol = float(fut_feats.get("fut_candle_volume", 0.0)) if fut_feats else 0.0
                         except Exception:
                             fut_candle_vol = 0.0
@@ -2586,6 +3121,11 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     gates = dict((staged or {}).get("gates", {}))
                     policy_success_raw = (staged or {}).get("policy_success_raw")
                     policy_success_calib = (staged or {}).get("policy_success_calib")
+                    policy_success_gate = (staged or {}).get("policy_success_gate")
+                    policy_success_source = (staged or {}).get("policy_success_source")
+                    policy_move_p = (staged or {}).get("policy_move_p")
+                    policy_edge_p = (staged or {}).get("policy_edge_p")
+                    policy_min_success = (staged or {}).get("policy_min_success")
 
                     # Vol proxies from features (optional)
                     rv10 = features_for_log.get("rv_10")
@@ -2596,6 +3136,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     #   - inside that subset, direction is sign-of-return with eps band
                     
                     label_source = "setup"
+                    used_fallback_label = False
                     label, aux_info = compute_setup_conditional_label(
                         df=full_df,
                         idx_ref=idx_ref,
@@ -2609,6 +3150,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                     # but with lower weight so we don't drown the model in chop.
                     if label in (None, LABEL_SKIP):
                         label_source = "window"
+                        used_fallback_label = True
                         try:
                             tp_ret = float(getattr(cfg, "trade_tp_pct", float(os.getenv("TRADE_TP_PCT", "0.0005") or "0.0005")))
                         except Exception:
@@ -2636,7 +3178,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                             f"[{name}] [TRAIN] Label skipped for {idx_ts.strftime('%H:%M:%S')} (no setup + cannot label window)"
                         )
                         return
-
+                    if used_fallback_label:
                         logger.info(
                             f"[{name}] [TRAIN] Using fallback window label for {idx_ts.strftime('%H:%M:%S')} "
                             f"(ref={pd.to_datetime(ref_start).strftime('%H:%M:%S')}) label={label}"
@@ -2661,7 +3203,7 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         _fmt_float(rv10),
                         _fmt_float(atr1),
                         teacher_tradeable,
-                        f"{policy_success_calib:.4f}" if policy_success_calib is not None else "NA",
+                        f"{policy_success_gate:.4f}" if policy_success_gate is not None else "NA",
                     )
 
                     try:
@@ -2747,6 +3289,11 @@ async def main_loop(config, policy_pipe: PolicyPipeline, train_features, token_b
                         model={
                             "p_success_raw": policy_success_raw,
                             "p_success_calib": policy_success_calib,
+                            "p_success_gate": policy_success_gate,
+                            "p_success_source": policy_success_source,
+                            "p_move": policy_move_p,
+                            "p_edge": policy_edge_p,
+                            "policy_min": policy_min_success,
                         },
                     )
 

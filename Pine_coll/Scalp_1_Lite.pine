@@ -1,0 +1,415 @@
+//@version=6
+indicator("FrankenScalper LITE (VWAP-gated + HTF15 + No TP/WinLoss)", overlay=true,
+     max_bars_back=2000, max_labels_count=250, max_boxes_count=120, max_lines_count=120)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Helpers
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tf_minutes() =>
+    float m = na
+    if timeframe.isseconds
+        m := math.max(1.0, timeframe.multiplier) / 60.0
+    else if timeframe.isminutes
+        m := timeframe.multiplier
+    else if timeframe.isdaily
+        m := 1440.0 * timeframe.multiplier
+    else if timeframe.isweekly
+        m := 10080.0 * timeframe.multiplier
+    else
+        m := 43200.0 * timeframe.multiplier
+    m
+
+adxCalc(_len) =>
+    float upMove   = high - high[1]
+    float downMove = low[1] - low
+    float plusDM   = (upMove > downMove and upMove > 0) ? upMove : 0.0
+    float minusDM  = (downMove > upMove and downMove > 0) ? downMove : 0.0
+    float tr       = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+    float smTR     = ta.rma(tr, _len)
+    float smP      = ta.rma(plusDM, _len)
+    float smM      = ta.rma(minusDM, _len)
+    float plusDI   = smTR != 0 ? 100.0 * smP / smTR : 0.0
+    float minusDI  = smTR != 0 ? 100.0 * smM / smTR : 0.0
+    float dx       = (plusDI + minusDI != 0) ? 100.0 * math.abs(plusDI - minusDI) / (plusDI + minusDI) : 0.0
+    ta.rma(dx, _len)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Inputs
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+groupCore = "Core: Session VWAP + Opening Range"
+useSession = input.bool(true, "Use session", group=groupCore)
+sessionStr = input.session("0915-1530", "Session", group=groupCore)
+showVWAP   = input.bool(true, "Show Session VWAP", group=groupCore)
+showOR     = input.bool(true, "Show Opening Range", group=groupCore)
+orMode     = input.string("Manual", "OR Mode", options=["Auto","Manual"], group=groupCore)
+orAutoK    = input.float(3.0, "OR Auto: K × TF minutes", step=0.5, group=groupCore)
+orMin      = input.int(30, "OR Manual minutes", minval=1, group=groupCore)
+
+groupTrend = "Trend Filter (HTF default = 15)"
+trendMode  = input.string("EMA+ADX", "Mode", options=["Off","EMA","EMA+ADX","EMA+Dist"], group=groupTrend)
+useHTF     = input.bool(true, "Use HTF", group=groupTrend)
+tfHTF      = input.timeframe("15", "HTF timeframe", group=groupTrend)  // ✅ default 15
+emaFastLen = input.int(34, "HTF EMA Fast", minval=1, group=groupTrend)
+emaSlowLen = input.int(89, "HTF EMA Slow", minval=2, group=groupTrend)
+adxLen     = input.int(14, "ADX Len", minval=1, group=groupTrend)
+adxThr     = input.float(18, "ADX ≥", step=0.5, group=groupTrend)
+distATRMin = input.float(0.20, "EMA Dist min (× ATR)", step=0.01, group=groupTrend)
+plotHTFEMAs = input.bool(false, "Plot HTF EMAs", group=groupTrend)
+
+groupEntry = "Entry: Pullback + Momentum"
+entryEmaLen = input.int(20, "Entry EMA length", minval=1, group=groupEntry)
+atrLen      = input.int(14, "ATR length", minval=1, group=groupEntry)
+minBodyATR  = input.float(0.30, "Min body (× ATR)", step=0.01, group=groupEntry)
+wickMaxPct  = input.float(0.55, "Max opposite wick (0..1)", step=0.05, minval=0.0, maxval=1.0, group=groupEntry)
+gateVWAP    = input.bool(true, "Gate by VWAP (long above, short below)", group=groupEntry) // ✅ default ON
+gateOR      = input.bool(false, "Gate by OR (long above ORH, short below ORL)", group=groupEntry)
+
+groupRe = "Re-entry Control"
+reMode       = input.string("MoveAway+Retest", "Re-entry mode", options=["Cooldown","MoveAway+Retest","Either"], group=groupRe)
+cooldownBars = input.int(10, "Cooldown bars", minval=1, group=groupRe)
+resetMoveATR = input.float(0.60, "Move-away reset (× ATR)", step=0.05, group=groupRe)
+
+groupAct = "Activity Marker (pick ONE)"
+activityMode = input.string("Densities", "Mode", options=["Off","Bubbles","Densities"], group=groupAct)
+deltaMode    = input.string("RangeWeighted", "Delta proxy", options=["RangeWeighted","CloseVsPrev","CloseVsOpen"], group=groupAct)
+qLen         = input.int(200, "Quantile lookback", minval=50, group=groupAct)
+qPct         = input.float(92, "Quantile %", step=0.5, minval=60, maxval=99.9, group=groupAct)
+
+groupDen = "Densities settings"
+denMetricSrc = input.string("AbsDelta", "Metric", options=["AbsDelta","Volume"], group=groupDen)
+denDepth     = input.float(0.45, "Depth × ATR", step=0.05, group=groupDen)
+denExtend    = input.int(150, "Extend (bars)", minval=10, group=groupDen)
+mergeX       = input.float(0.30, "Merge if |Δprice| < × ATR", step=0.05, group=groupDen)
+volLen       = input.int(20, "Volume MA", group=groupDen)
+breakMult    = input.float(1.2, "Delete if break vol > MA×", step=0.1, group=groupDen)
+maxDenBoxes  = input.int(20, "Max density boxes", minval=5, maxval=60, group=groupDen)
+
+groupZones = "Zones (ONE set, non-hindsight)"
+showZones  = input.bool(true, "Show Zones", group=groupZones)
+zDepth     = input.float(0.60, "Zone depth × ATR", step=0.05, group=groupZones)
+zExtend    = input.int(120, "Extend (bars)", minval=10, group=groupZones)
+Lz         = input.int(8, "Pivot Left", minval=2, group=groupZones)
+Rz         = input.int(8, "Pivot Right", minval=2, group=groupZones)
+showZoneMid = input.bool(true, "Show zone midline", group=groupZones)
+zonesOnlyInTrend = input.bool(false, "Zones only in trend", group=groupZones)
+
+groupViz = "Visuals"
+showCloud    = input.bool(true, "Trend cloud background", group=groupViz)
+showSignals  = input.bool(true, "Signal labels", group=groupViz)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Core calcs
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float atrVal = ta.atr(atrLen)
+float tfMin  = tf_minutes()
+
+bool inSess  = useSession ? not na(time(timeframe.period, sessionStr)) : true
+bool newSess = useSession ? (inSess and not inSess[1]) : (ta.change(time("D")) != 0)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Session VWAP (session anchored)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var float cumPV = na
+var float cumV  = na
+
+if newSess or na(cumPV)
+    cumPV := 0.0
+    cumV  := 0.0
+
+if inSess
+    cumPV += hlc3 * volume
+    cumV  += volume
+
+float vwap = (cumV > 0) ? (cumPV / cumV) : na
+plot(showVWAP ? vwap : na, "Session VWAP", color=color.new(color.yellow, 0), linewidth=2)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Opening Range
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float orLenMin = (orMode == "Auto") ? (orAutoK * tfMin) : orMin
+int orBars = math.max(1, int(math.ceil(orLenMin / math.max(tfMin, 1))))
+
+var float orH = na
+var float orL = na
+var int   orCount = 0
+
+if newSess
+    orH := na
+    orL := na
+    orCount := 0
+
+if inSess and orCount < orBars
+    orH := na(orH) ? high : math.max(orH, high)
+    orL := na(orL) ? low  : math.min(orL, low)
+    orCount += 1
+
+plot(showOR and orCount > 0 ? orH : na, "OR High", color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+plot(showOR and orCount > 0 ? orL : na, "OR Low",  color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+bool orReady = (orCount >= orBars)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HTF Trend Filter
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float srcCloseHTF = useHTF ? request.security(syminfo.tickerid, tfHTF, close) : close
+float atrHTF      = useHTF ? request.security(syminfo.tickerid, tfHTF, ta.atr(atrLen)) : atrVal
+float emaF        = ta.ema(srcCloseHTF, emaFastLen)
+float emaS        = ta.ema(srcCloseHTF, emaSlowLen)
+bool  trendUp     = emaF > emaS
+float adxTF       = useHTF ? request.security(syminfo.tickerid, tfHTF, adxCalc(adxLen)) : adxCalc(adxLen)
+float emaDist     = math.abs(emaF - emaS)
+bool  strongDist  = emaDist > (atrHTF * distATRMin)
+
+bool longOK  = trendMode == "Off" ? true :
+     trendMode == "EMA" ? trendUp :
+     trendMode == "EMA+ADX" ? (trendUp and adxTF >= adxThr) :
+     (trendUp and strongDist)
+
+bool shortOK = trendMode == "Off" ? true :
+     trendMode == "EMA" ? (not trendUp) :
+     trendMode == "EMA+ADX" ? ((not trendUp) and adxTF >= adxThr) :
+     ((not trendUp) and strongDist)
+
+plot(plotHTFEMAs ? emaF : na, "HTF EMA Fast", color=color.new(color.teal, 0), linewidth=1)
+plot(plotHTFEMAs ? emaS : na, "HTF EMA Slow", color=color.new(color.orange, 0), linewidth=1)
+
+// bg cloud (global scope)
+color bgCol = na
+if showCloud
+    bgCol := longOK ? color.new(color.rgb(0,180,120), 88) : shortOK ? color.new(color.rgb(200,50,50), 88) : na
+bgcolor(bgCol)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Entry: Pullback + Momentum
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float emaEntry = ta.ema(close, entryEmaLen)
+
+float bodySize = math.abs(close - open)
+float rng      = math.max(high - low, syminfo.mintick)
+float upperW   = high - math.max(open, close)
+float lowerW   = math.min(open, close) - low
+
+bool validBody     = bodySize > (atrVal * minBodyATR)
+bool validWickBull = rng > 0 ? (upperW / rng <= wickMaxPct) : true
+bool validWickBear = rng > 0 ? (lowerW / rng <= wickMaxPct) : true
+
+bool vwapBullOK = (not gateVWAP) or (close >= vwap)
+bool vwapBearOK = (not gateVWAP) or (close <= vwap)
+
+bool orBullOK = (not gateOR) or (orReady and close >= orH)
+bool orBearOK = (not gateOR) or (orReady and close <= orL)
+
+bool bullSetup = inSess and longOK and low <= emaEntry and close > emaEntry and validBody and validWickBull and vwapBullOK and orBullOK
+bool bearSetup = inSess and shortOK and high >= emaEntry and close < emaEntry and validBody and validWickBear and vwapBearOK and orBearOK
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Re-entry control (no permanent lockout)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var int lastBullBar = na
+var int lastBearBar = na
+var bool bullMovedAway = false
+var bool bearMovedAway = false
+var bool bullEligible = true
+var bool bearEligible = true
+
+if not na(lastBullBar)
+    if close >= emaEntry + atrVal * resetMoveATR
+        bullMovedAway := true
+    if bullMovedAway and low <= emaEntry
+        bullEligible := true
+
+if not na(lastBearBar)
+    if close <= emaEntry - atrVal * resetMoveATR
+        bearMovedAway := true
+    if bearMovedAway and high >= emaEntry
+        bearEligible := true
+
+bool coolBullOK = na(lastBullBar) ? true : (bar_index - lastBullBar >= cooldownBars)
+bool coolBearOK = na(lastBearBar) ? true : (bar_index - lastBearBar >= cooldownBars)
+
+bool bullReOK = reMode == "Cooldown" ? coolBullOK : reMode == "MoveAway+Retest" ? bullEligible : (coolBullOK or bullEligible)
+bool bearReOK = reMode == "Cooldown" ? coolBearOK : reMode == "MoveAway+Retest" ? bearEligible : (coolBearOK or bearEligible)
+
+// Final signals (no TP/SL simulation, no win/loss)
+bool bullSignal = bullSetup and bullReOK
+bool bearSignal = bearSetup and bearReOK
+
+// Labels
+color bullColor = color.rgb(0, 180, 120)
+color bearColor = color.rgb(200, 50, 50)
+
+if showSignals and bullSignal
+    label.new(bar_index, low, "LONG", style=label.style_label_up, color=bullColor, textcolor=color.white, size=size.normal)
+if showSignals and bearSignal
+    label.new(bar_index, high, "SHORT", style=label.style_label_down, color=bearColor, textcolor=color.white, size=size.normal)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Activity marker (ONE): bubbles OR densities
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float rng2  = math.max(high - low, syminfo.mintick)
+float dRW   = rng2 > 0 ? volume * (close - open) / rng2 : 0.0
+float dCP   = close >= close[1] ? volume : -volume
+float dCO   = close >= open ? volume : -volume
+float delta = deltaMode == "RangeWeighted" ? dRW : deltaMode == "CloseVsOpen" ? dCO : dCP
+float absDel = math.abs(delta)
+
+// Bubbles (capped)
+var label[] bubArr = array.new_label()
+int maxBubs = 80
+float thrBub = ta.percentile_linear_interpolation(absDel, qLen, math.max(50.0, qPct - 7.0))
+
+if activityMode == "Bubbles" and absDel >= math.max(thrBub, 1)
+    if array.size(bubArr) >= maxBubs
+        label old = array.shift(bubArr)
+        if not na(old)
+            label.delete(old)
+
+    float y = delta >= 0 ? low : high
+    color c0 = delta >= 0 ? color.lime : color.red
+    float ratio = absDel / math.max(thrBub, 1)
+    int transp = 85 - int(math.min(60.0, (ratio - 1.0) * 30.0))
+    label lb = label.new(bar_index, y, "", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_circle,
+        color=color.new(c0, transp), textcolor=color.new(c0, transp), size=size.tiny)
+    array.push(bubArr, lb)
+
+// Densities (capped)
+float denMetric = denMetricSrc == "AbsDelta" ? absDel : volume
+float denThr    = ta.percentile_linear_interpolation(denMetric, qLen, qPct)
+float volMA     = ta.sma(volume, volLen)
+
+var box[]  dBoxes = array.new_box()
+var line[] dLines = array.new_line()
+var float[] dTop  = array.new_float()
+var float[] dBot  = array.new_float()
+var float[] dMid  = array.new_float()
+var int[]   dEnd  = array.new_int()
+var int[]   dDir  = array.new_int()
+
+newDensity(_mid, _isDemand) =>
+    float half = atrVal * denDepth
+    float top  = _mid + half
+    float bot  = _mid - half
+    color fillCol = _isDemand ? color.new(#4CAF50, 90) : color.new(#F44336, 90)
+    color brdCol  = _isDemand ? color.new(#4CAF50, 60) : color.new(#F44336, 60)
+
+    if array.size(dBoxes) >= maxDenBoxes
+        box ob = array.shift(dBoxes)
+        line ol = array.shift(dLines)
+        array.shift(dTop), array.shift(dBot), array.shift(dMid), array.shift(dEnd), array.shift(dDir)
+        if not na(ob)
+            box.delete(ob)
+        if not na(ol)
+            line.delete(ol)
+
+    box b = box.new(bar_index, top, bar_index, bot, xloc=xloc.bar_index, bgcolor=fillCol, border_color=brdCol)
+    line ln = line.new(bar_index, _mid, bar_index, _mid, xloc=xloc.bar_index, extend=extend.right,
+        color=color.new(color.gray, 50), style=line.style_dashed, width=1)
+
+    array.push(dBoxes, b), array.push(dLines, ln), array.push(dTop, top), array.push(dBot, bot), array.push(dMid, _mid)
+    array.push(dEnd, bar_index + denExtend), array.push(dDir, _isDemand ? 1 : -1)
+
+if activityMode == "Densities" and inSess and denMetric >= denThr
+    float midp = close
+    bool merged = false
+    int sz = array.size(dBoxes)
+    if sz > 0
+        for i = 0 to sz - 1
+            if not merged and math.abs(midp - array.get(dMid, i)) <= atrVal * mergeX
+                array.set(dEnd, i, bar_index + denExtend)
+                merged := true
+    if not merged
+        newDensity(midp, delta >= 0)
+
+int sz2 = array.size(dBoxes)
+if sz2 > 0
+    for i = sz2 - 1 to 0
+        box b = array.get(dBoxes, i)
+        line ln = array.get(dLines, i)
+        float top = array.get(dTop, i)
+        float bot = array.get(dBot, i)
+        float midp = array.get(dMid, i)
+        int right = math.min(bar_index + 1, array.get(dEnd, i))
+
+        box.set_right(b, right)
+        line.set_x2(ln, right)
+        line.set_y1(ln, midp)
+        line.set_y2(ln, midp)
+
+        int dir = array.get(dDir, i)
+        bool breakUp   = close > top and volume > volMA * breakMult
+        bool breakDown = close < bot and volume > volMA * breakMult
+        bool eaten = (dir == 1 and breakDown) or (dir == -1 and breakUp)
+
+        if eaten or bar_index >= array.get(dEnd, i)
+            box.delete(b), line.delete(ln)
+            array.remove(dBoxes, i), array.remove(dLines, i), array.remove(dTop, i), array.remove(dBot, i), array.remove(dMid, i), array.remove(dEnd, i), array.remove(dDir, i)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Zones (ONE set, non-hindsight)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+color colSupIn  = color.new(#E57373, 76)
+color colSupBr  = color.new(#E57373, 25)
+color colDemIn  = color.new(#81C784, 76)
+color colDemBr  = color.new(#81C784, 25)
+color midCol    = color.new(color.gray, 50)
+
+var box  supBox = na
+var box  demBox = na
+var line supMid = na
+var line demMid = na
+var float supTop = na
+var float supBot = na
+var float demTop = na
+var float demBot = na
+
+float ph = ta.pivothigh(high, Lz, Rz)
+float pl = ta.pivotlow(low,  Lz, Rz)
+
+bool supTrendOK = (not zonesOnlyInTrend) or shortOK
+bool demTrendOK = (not zonesOnlyInTrend) or longOK
+
+if showZones and not na(ph) and supTrendOK
+    supTop := ph
+    supBot := ph - zDepth * atrVal
+    if not na(supBox)
+        box.delete(supBox)
+    if not na(supMid)
+        line.delete(supMid)
+    supBox := box.new(bar_index, supTop, bar_index + zExtend, supBot, xloc=xloc.bar_index, bgcolor=colSupIn, border_color=colSupBr)
+    if showZoneMid
+        float m = (supTop + supBot) * 0.5
+        supMid := line.new(bar_index, m, bar_index + zExtend, m, xloc=xloc.bar_index, extend=extend.none, style=line.style_dashed, color=midCol, width=1)
+
+if showZones and not na(pl) and demTrendOK
+    demBot := pl
+    demTop := pl + zDepth * atrVal
+    if not na(demBox)
+        box.delete(demBox)
+    if not na(demMid)
+        line.delete(demMid)
+    demBox := box.new(bar_index, demTop, bar_index + zExtend, demBot, xloc=xloc.bar_index, bgcolor=colDemIn, border_color=colDemBr)
+    if showZoneMid
+        float m = (demTop + demBot) * 0.5
+        demMid := line.new(bar_index, m, bar_index + zExtend, m, xloc=xloc.bar_index, extend=extend.none, style=line.style_dashed, color=midCol, width=1)
+
+if not na(supBox)
+    box.set_right(supBox, bar_index + zExtend)
+if not na(demBox)
+    box.set_right(demBox, bar_index + zExtend)
+if not na(supMid) and not na(supTop) and not na(supBot)
+    float m = (supTop + supBot) * 0.5
+    line.set_x2(supMid, bar_index + zExtend), line.set_y1(supMid, m), line.set_y2(supMid, m)
+if not na(demMid) and not na(demTop) and not na(demBot)
+    float m = (demTop + demBot) * 0.5
+    line.set_x2(demMid, bar_index + zExtend), line.set_y1(demMid, m), line.set_y2(demMid, m)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Plots + Alerts
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+plot(emaEntry, "Entry EMA", color=color.new(color.teal, 0), linewidth=2)
+
+alertcondition(bullSignal, "FrankenScalper LITE LONG", "LONG: HTF trend OK + pullback reclaim + momentum + VWAP gate")
+alertcondition(bearSignal, "FrankenScalper LITE SHORT", "SHORT: HTF trend OK + pullback reject + momentum + VWAP gate")
+alertcondition(showVWAP and ta.crossover(close, vwap), "Cross Above VWAP", "Price crossed above Session VWAP")
+alertcondition(showVWAP and ta.crossunder(close, vwap), "Cross Below VWAP", "Price crossed below Session VWAP")
+alertcondition(orReady and close > orH, "OR Break Up", "Price broke above OR High")
+alertcondition(orReady and close < orL, "OR Break Down", "Price broke below OR Low")

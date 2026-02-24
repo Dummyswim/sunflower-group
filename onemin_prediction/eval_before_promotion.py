@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -64,6 +64,8 @@ def evaluate_holdout(
     schema_cols: List[str],
     buy_model,
     sell_model,
+    *,
+    holdout_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     if not rows:
         return False, {"reason": "no_rows"}
@@ -72,9 +74,12 @@ def evaluate_holdout(
     holdout_frac = min(max(holdout_frac, 0.05), 0.5)
     min_holdout = int(os.getenv("PREPROMO_MIN_HOLDOUT_ROWS", "500") or "500")
 
-    rows_sorted = sorted(rows, key=lambda r: r.get("ts_target_close") or "")
-    split = int(len(rows_sorted) * (1.0 - holdout_frac))
-    holdout = rows_sorted[split:]
+    if holdout_rows is None:
+        rows_sorted = sorted(rows, key=lambda r: r.get("ts_target_close") or "")
+        split = int(len(rows_sorted) * (1.0 - holdout_frac))
+        holdout = rows_sorted[split:]
+    else:
+        holdout = sorted(holdout_rows, key=lambda r: r.get("ts_target_close") or "")
 
     report: Dict[str, Any] = {"holdout_total": len(holdout)}
 

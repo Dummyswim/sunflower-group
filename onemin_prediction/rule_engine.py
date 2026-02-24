@@ -724,6 +724,8 @@ class DecisionSnapshot:
     trend_strength: float
     trend_signals: int
     conflict: str
+    tags: list
+    blockers: list
     hard_veto: list
     soft_penalties: dict
     muted_only_soft: bool
@@ -790,8 +792,10 @@ class DecisionState:
         self._counts[f"tradeable:{int(bool(snap.tradeable))}"] += 1
         if bool(getattr(snap, 'muted_only_soft', False)):
             self._counts['muted_only_soft'] += 1
-        for r in (snap.hard_veto or []):
+        for r in (snap.blockers or snap.hard_veto or []):
             self._counts[f"hard:{r}"] += 1
+        for t in (snap.tags or []):
+            self._counts[f"tag:{t}"] += 1
         for r in (snap.soft_penalties or {}).keys():
             self._counts[f"soft:{r}"] += 1
 
@@ -850,10 +854,13 @@ def decide_trade(
     if 'data_invalid' in hard:
         return {
             'lane': 'NONE',
+            'lane_tag': 'NONE',
             'intent': 'FLAT',
             'tradeable': False,
             'size_mult': 0.0,
             'score': 0.0,
+            'teacher_score': 0.0,
+            'lane_score': 0.0,
             'edge_required': 0.0,
             'edge_quantile': 0.0,
             'trend_strength': 0.0,
@@ -862,6 +869,10 @@ def decide_trade(
             'tape_conflict_level': str(conflict_level or 'none'),
             'tape_conflict_reasons': list(conflict_reasons or []),
             'tape_valid': bool(tape_valid),
+            'tags': ['lane:none'],
+            'blockers': list(hard),
+            'teacher_hard_veto': list(hard),
+            'teacher_soft_penalties': {},
             'hard_veto': list(hard),
             'soft_penalties': {},
             'gate_reasons': list(hard),
@@ -874,10 +885,13 @@ def decide_trade(
     if intent not in ('BUY', 'SELL'):
         return {
             'lane': 'NONE',
+            'lane_tag': 'NONE',
             'intent': 'FLAT',
             'tradeable': False,
             'size_mult': 0.0,
             'score': 0.0,
+            'teacher_score': 0.0,
+            'lane_score': 0.0,
             'edge_required': 0.0,
             'edge_quantile': 0.0,
             'trend_strength': 0.0,
@@ -885,6 +899,10 @@ def decide_trade(
             'conflict': 'na',
             'tape_conflict_level': str(conflict_level or 'none'),
             'tape_conflict_reasons': list(conflict_reasons or []),
+            'tags': ['lane:none'],
+            'blockers': hard + ['no_direction'],
+            'teacher_hard_veto': hard + ['no_direction'],
+            'teacher_soft_penalties': soft,
             'hard_veto': hard + ['no_direction'],
             'soft_penalties': soft,
             'gate_reasons': hard + ['no_direction'],
@@ -912,10 +930,13 @@ def decide_trade(
             gate_reasons.append('min_teacher_strength')
         return {
             'lane': lane,
+            'lane_tag': lane,
             'intent': intent,
             'tradeable': bool(tradeable),
             'size_mult': 1.0 if tradeable else 0.0,
             'score': float(abs(float(teacher_strength))),
+            'teacher_score': float(abs(float(teacher_strength))),
+            'lane_score': 0.0,
             'edge_required': float(min_edge),
             'edge_quantile': 0.0,
             'trend_strength': 0.0,
@@ -929,9 +950,13 @@ def decide_trade(
             'raw_strength': float(abs(float(teacher_strength))),
             'centered_strength': float(abs(float(teacher_strength))),
             'would_trade_without_soft': bool(tradeable),
+            'tags': [f'lane:{str(lane).lower()}', 'trigger:backfill'],
+            'blockers': list(gate_reasons),
+            'teacher_hard_veto': [],
+            'teacher_soft_penalties': {},
             'hard_veto': [],
             'soft_penalties': {},
-            'gate_reasons': gate_reasons,
+            'gate_reasons': list(gate_reasons),
         }
 
     tape_conflict = str(conflict_level or 'none').lower()
@@ -1142,7 +1167,7 @@ def decide_trade(
     if tape_conflict == 'yellow' and lane == 'TREND' and not trigger:
         hard.append('tape_yellow_need_trigger')
     if bb_squeeze and lane in ('TREND', 'BREAKOUT') and not trigger:
-        hard.append('bb_squeeze_chop')
+        soft['bb_squeeze_chop'] = float(os.getenv('PEN_BB_SQUEEZE_CHOP', '0.02') or '0.02')
 
     if lane == 'NONE':
         hard.append('lane_score_low')
@@ -1156,7 +1181,7 @@ def decide_trade(
     rv_atr = abs(rv_10) / atr_1t if atr_1t > 0 else 0.0
     if rv_atr_min > 0.0 and (lane in ('TREND', 'BREAKOUT')) and (not setup_lane):
         if rv_atr < rv_atr_min:
-            hard.append('rv_atr_low')
+            soft['rv_atr_low'] = float(os.getenv('PEN_RV_ATR_LOW', '0.02') or '0.02')
 
     vwap_ext_dyn = None
     if dynamic_thresholds and "FLOW_VWAP_EXT" in dynamic_thresholds:
@@ -1183,7 +1208,7 @@ def decide_trade(
         if trend_signals >= 2 and trend_flow_agree:
             ema_chop_hard_min *= 0.90
         if (not trend_flow_agree) and (not breakout_lane) and (lane_score < ema_chop_hard_min):
-            hard.append('ema_chop_hard')
+            soft['ema_chop_veto'] = float(os.getenv('PEN_CHOP_HARD_ZONE', '0.03') or '0.03')
         else:
             soft['ema_chop_veto'] = float(os.getenv('PEN_CHOP', '0.02') or '0.02')
 
@@ -1290,15 +1315,17 @@ def decide_trade(
             hard.append('ema15_break_against')
             tradeable = False
 
-    gate_reasons = []
-    gate_reasons.extend(hard)
-    gate_reasons.extend(list(soft.keys()))
-    if lane == 'TREND':
-        gate_reasons.append('lane_trend')
-    elif lane == 'SETUP':
-        gate_reasons.append('lane_setup')
-    elif lane == 'BREAKOUT':
-        gate_reasons.append('lane_breakout')
+    blockers = list(dict.fromkeys(hard))
+    tags = [f"lane:{str(lane).lower()}"]
+    if trigger:
+        tags.append(f"trigger:{str(trigger_name)}")
+    if continuation:
+        tags.append("trend_continuation")
+    if momentum_override:
+        tags.append("momentum_override")
+    if bool(would_trade_wo_soft and (not tradeable) and (len(soft) > 0) and (len(hard) == 0)):
+        tags.append("muted_by_soft_only")
+    gate_reasons = list(blockers)
 
     try:
         state._last_lane = lane
@@ -1322,6 +1349,8 @@ def decide_trade(
         trend_strength=float(trend_strength),
         trend_signals=int(trend_signals),
         conflict=str(conflict),
+        tags=list(tags),
+        blockers=list(blockers),
         hard_veto=list(hard),
         soft_penalties=dict(soft),
         muted_only_soft=bool(would_trade_wo_soft and (not tradeable) and (len(soft) > 0) and (len(hard) == 0)),
@@ -1330,10 +1359,13 @@ def decide_trade(
 
     return {
         'lane': lane,
+        'lane_tag': lane,
         'intent': intent,
         'tradeable': bool(tradeable),
         'size_mult': float(size_mult),
         'score': float(score),
+        'teacher_score': float(score),
+        'lane_score': float(lane_score),
         'edge_required': float(edge_required),
         'edge_quantile': float(edge_q),
         'trend_strength': float(trend_strength),
@@ -1347,7 +1379,11 @@ def decide_trade(
         'raw_strength': float(raw_strength),
         'centered_strength': float(centered_strength),
         'would_trade_without_soft': bool(would_trade_wo_soft),
+        'tags': list(tags),
+        'blockers': list(blockers),
+        'teacher_hard_veto': list(blockers),
+        'teacher_soft_penalties': dict(soft),
         'hard_veto': list(hard),
         'soft_penalties': dict(soft),
-        'gate_reasons': gate_reasons,
+        'gate_reasons': list(gate_reasons),
     }

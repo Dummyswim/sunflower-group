@@ -184,6 +184,15 @@ else
   exit 1
 fi
 
+# --- pretrain gate defaults (stable for current schema/cache workflow) ---
+export PRETRAIN_MIN_DIR_ROWS="${PRETRAIN_MIN_DIR_ROWS:-200}"
+if [ "${PRETRAIN_SAMPLE_MAX:-0}" -lt 10000 ]; then
+  export PRETRAIN_SAMPLE_MAX=50000
+fi
+export PRETRAIN_MAX_ZERO_VAR_FRAC="${PRETRAIN_MAX_ZERO_VAR_FRAC:-0.40}"
+export PRETRAIN_MIN_POS_RATIO="${PRETRAIN_MIN_POS_RATIO:-0.18}"
+echo "[POST] Pretrain gates: PRETRAIN_MIN_DIR_ROWS=${PRETRAIN_MIN_DIR_ROWS} PRETRAIN_SAMPLE_MAX=${PRETRAIN_SAMPLE_MAX:-unset} PRETRAIN_MAX_ZERO_VAR_FRAC=${PRETRAIN_MAX_ZERO_VAR_FRAC} PRETRAIN_MIN_POS_RATIO=${PRETRAIN_MIN_POS_RATIO}"
+
 echo "[POST] Running offline trainer: $TRAINER"
 /home/hanumanth/Documents/pyvirtualenv/venv/bin/python "$TRAINER" --log "$TRAIN_LOG_PATH"
 

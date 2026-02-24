@@ -5,12 +5,14 @@ Consolidates: enhanced_websocket_handler.py, microstructure_features.py, latency
 import asyncio
 import struct
 import logging
+import os
 from typing import Dict, Optional, Any, List, Tuple, Callable, Awaitable
 import pandas as pd
 import numpy as np
 import base64
 from collections import deque
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -105,6 +107,11 @@ class UnifiedWebSocketHandler:
         # Rolling PnL / PF history
         self._pnl_hist = deque(maxlen=200)
         self._pf_default = 1.0
+        self._idx_ticks_path: Optional[Path] = None
+        self._idx_tick_rows: List[str] = []
+        self._idx_tick_flush_n = max(1, int(getattr(config, "idx_tick_flush_n", 200)))
+        self._idx_tick_write_warned = False
+        self._init_idx_tick_capture()
 
                 
         
@@ -114,6 +121,60 @@ class UnifiedWebSocketHandler:
 
         # NEW: decode credentials once for logging/use (masked in logs)
         self._decode_credentials()
+
+    def _init_idx_tick_capture(self) -> None:
+        raw = str(getattr(self.config, "idx_ticks_path", "") or "").strip()
+        if not raw:
+            raw = str(os.getenv("IDX_TICKS_PATH", "") or "").strip()
+        if not raw:
+            return
+        try:
+            path = Path(raw)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists() or path.stat().st_size == 0:
+                path.write_text(
+                    "ts_ist,ltp,packet_type,tick_count\n",
+                    encoding="utf-8",
+                )
+            self._idx_ticks_path = path
+            logger.info("[WS] Index tick capture enabled: %s", str(path))
+        except Exception as e:
+            self._idx_ticks_path = None
+            logger.warning("[WS] Index tick capture disabled (init failed): %s", e)
+
+    def _flush_idx_tick_rows(self) -> None:
+        if self._idx_ticks_path is None or not self._idx_tick_rows:
+            return
+        try:
+            with self._idx_ticks_path.open("a", encoding="utf-8") as f:
+                f.writelines(self._idx_tick_rows)
+            self._idx_tick_rows.clear()
+            self._idx_tick_write_warned = False
+        except Exception as e:
+            if not self._idx_tick_write_warned:
+                logger.warning("[WS] Index tick capture write failed: %s", e)
+                self._idx_tick_write_warned = True
+
+    def _append_idx_tick_row(self, tick_data: Dict[str, Any]) -> None:
+        if self._idx_ticks_path is None:
+            return
+        try:
+            ts = tick_data.get("timestamp")
+            if hasattr(ts, "isoformat"):
+                ts_ist = ts.isoformat()
+            else:
+                ts_ist = ""
+            ltp = float(tick_data.get("ltp", 0.0) or 0.0)
+            if not np.isfinite(ltp):
+                ltp = 0.0
+            packet_type = str(tick_data.get("packet_type", ""))
+            self._idx_tick_rows.append(f"{ts_ist},{ltp:.6f},{packet_type},{int(self.tick_count)}\n")
+            if len(self._idx_tick_rows) >= self._idx_tick_flush_n:
+                self._flush_idx_tick_rows()
+        except Exception as e:
+            if not self._idx_tick_write_warned:
+                logger.warning("[WS] Index tick capture append failed: %s", e)
+                self._idx_tick_write_warned = True
 
     # NEW: util to mask secrets safely for logs
     @staticmethod
@@ -548,6 +609,7 @@ class UnifiedWebSocketHandler:
             self.last_packet_time = datetime.now(IST)
             self.tick_count += 1
             self.tick_buffer.append(tick_data)
+            self._append_idx_tick_row(tick_data)
 
 
             # Emit periodic info-level logs so the operator can see ticks arriving
@@ -726,6 +788,7 @@ class UnifiedWebSocketHandler:
 
 
             self._bucket_closed = True
+            self._flush_idx_tick_rows()
 
             if self.on_candle:
                 # Pass a copy of full history to avoid accidental mutation
@@ -851,6 +914,7 @@ class UnifiedWebSocketHandler:
                 except Exception:
                     pass
             logger.info("UnifiedWebSocketHandler disconnected")
+            self._flush_idx_tick_rows()
         except Exception as e:
             logger.debug(f"disconnect error (ignored): {e}")
 

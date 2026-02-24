@@ -17,6 +17,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -336,6 +337,48 @@ def _write_bundle_and_promote(
     return bundle_dir
 
 
+def _merge_policy_schema_with_base(
+    policy_schema: Optional[List[str]],
+    base_schema: Optional[List[str]],
+) -> Optional[List[str]]:
+    if not base_schema:
+        return list(policy_schema) if policy_schema else policy_schema
+    target = compose_policy_schema(list(base_schema))
+    if not policy_schema:
+        return list(target)
+    merged = list(policy_schema)
+    merged_set = set(merged)
+    add_cols = [c for c in target if c not in merged_set]
+    if add_cols:
+        logger.info("[TRAIN] extending policy schema with %d cols from base schema", len(add_cols))
+        merged.extend(add_cols)
+    return merged
+
+
+def _time_split_rows(rows: List[Dict[str, Any]], holdout_frac: float) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not rows:
+        return [], []
+    frac = min(max(float(holdout_frac), 0.05), 0.5)
+    rows_sorted = sorted(rows, key=lambda r: r.get("ts_target_close") or "")
+    split = int(len(rows_sorted) * (1.0 - frac))
+    split = min(max(split, 1), len(rows_sorted) - 1) if len(rows_sorted) > 1 else 0
+    return rows_sorted[:split], rows_sorted[split:]
+
+
+def _write_trainer_status(payload: Dict[str, Any]) -> None:
+    path_raw = str(os.getenv("TRAIN_STATUS_PATH", "runtime/trainer_status.json") or "").strip()
+    if not path_raw:
+        return
+    try:
+        out = dict(payload)
+        out["ts_utc"] = datetime.now(timezone.utc).isoformat()
+        path = Path(path_raw)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(out, ensure_ascii=True, sort_keys=True, indent=2), encoding="utf-8")
+    except Exception:
+        logger.debug("[TRAIN] status write failed", exc_info=True)
+
+
 def _train_and_promote_sync(
     feature_log_path: str,
     buy_out_path: str,
@@ -353,32 +396,61 @@ def _train_and_promote_sync(
         rows = load_signal_log(feature_log_path, max_rows=max_rows, schema_cols=None)
         base_schema = _infer_base_schema_from_rows(rows)
 
-    if not policy_schema and base_schema:
-        policy_schema = compose_policy_schema(list(base_schema))
+    policy_schema = _merge_policy_schema_with_base(policy_schema, base_schema)
     if not policy_schema:
         policy_schema = _infer_policy_schema_from_rows(rows)
 
     if not policy_schema:
         raise SchemaResolutionError("POLICY_SCHEMA_COLS_PATH missing and schema inference failed")
 
-    if len(rows) < int(min_rows):
-        return {"status": "wait", "rows": len(rows)}
+    holdout_frac = float(os.getenv("PREPROMO_HOLDOUT_FRAC", "0.1") or "0.1")
+    train_rows, holdout_rows = _time_split_rows(rows, holdout_frac)
+    if len(train_rows) < int(min_rows):
+        return {
+            "status": "wait",
+            "rows": len(train_rows),
+            "total_rows": len(rows),
+            "holdout_rows": len(holdout_rows),
+            "policy_schema": list(policy_schema),
+        }
 
-    ok, report = validate_pretrain(rows, schema_cols=list(policy_schema))
+    ok, report = validate_pretrain(train_rows, schema_cols=list(policy_schema))
     if not ok:
-        reasons = report.get("reasons") or []
-        soft_block = {"min_rows", "low_live_coverage"}
-        if reasons and set(reasons).issubset(soft_block):
+        reasons = [str(x) for x in (report.get("reasons") or []) if x]
+        # Online trainer should keep waiting on sample-quality gates instead of hard failing.
+        wait_reasons = {
+            "min_rows",
+            "low_live_coverage",
+            "no_teacher_tradeable_rows",
+            "teacher_dir_skew",
+            "too_few_teacher_dir_rows",
+            "too_many_flat",
+            "too_many_zero_var_features",
+            "label_skew_buy",
+            "label_skew_sell",
+        }
+        if reasons and set(reasons).issubset(wait_reasons):
             return {
                 "status": "wait",
                 "reason": "pretrain_insufficient",
                 "report": report,
-                "rows": len(rows),
+                "rows": len(train_rows),
+                "total_rows": len(rows),
+                "holdout_rows": len(holdout_rows),
+                "policy_schema": list(policy_schema),
             }
-        return {"status": "error", "reason": "pretrain_validation_failed", "report": report}
+        return {
+            "status": "error",
+            "reason": "pretrain_validation_failed",
+            "report": report,
+            "rows": len(train_rows),
+            "total_rows": len(rows),
+            "holdout_rows": len(holdout_rows),
+            "policy_schema": list(policy_schema),
+        }
 
-    buy_data = build_policy_dataset(rows, schema_cols=policy_schema, teacher_dir="BUY")
-    sell_data = build_policy_dataset(rows, schema_cols=policy_schema, teacher_dir="SELL")
+    buy_data = build_policy_dataset(train_rows, schema_cols=policy_schema, teacher_dir="BUY")
+    sell_data = build_policy_dataset(train_rows, schema_cols=policy_schema, teacher_dir="SELL")
 
     buy_model = train_policy_model(buy_data)
     sell_model = train_policy_model(sell_data)
@@ -386,27 +458,35 @@ def _train_and_promote_sync(
     if buy_model is None or sell_model is None:
         return {
             "status": "skip",
-            "rows": len(rows),
+            "rows": len(train_rows),
+            "total_rows": len(rows),
+            "holdout_rows": len(holdout_rows),
             "buy_rows": int(buy_data.n_rows),
             "sell_rows": int(sell_data.n_rows),
-            "cols": len(schema),
+            "cols": len(policy_schema),
+            "policy_schema": list(policy_schema),
         }
 
     if not os.getenv("PREPROMO_MIN_HOLDOUT_ROWS"):
-        holdout_frac = float(os.getenv("PREPROMO_HOLDOUT_FRAC", "0.1") or "0.1")
         tradeable_counts = {
-            "BUY": int(buy_data.n_rows),
-            "SELL": int(sell_data.n_rows),
+            "BUY": sum(1 for r in holdout_rows if str(r.get("teacher_dir", "")).upper() == "BUY" and bool(r.get("teacher_tradeable"))),
+            "SELL": sum(1 for r in holdout_rows if str(r.get("teacher_dir", "")).upper() == "SELL" and bool(r.get("teacher_tradeable"))),
         }
         min_dir = min(tradeable_counts.values()) if tradeable_counts else 0
-        expected = int(min_dir * holdout_frac)
+        expected = int(min_dir)
         if expected >= 500:
             dyn_min = 500
         else:
-            dyn_min = max(50, int(expected * 0.8))
+            dyn_min = max(30, int(expected * 0.8))
         os.environ["PREPROMO_MIN_HOLDOUT_ROWS"] = str(dyn_min)
 
-    eval_ok, eval_report = evaluate_holdout(rows, list(policy_schema), buy_model, sell_model)
+    eval_ok, eval_report = evaluate_holdout(
+        train_rows,
+        list(policy_schema),
+        buy_model,
+        sell_model,
+        holdout_rows=holdout_rows,
+    )
     if not eval_ok:
         reasons = []
         if isinstance(eval_report, dict):
@@ -419,23 +499,28 @@ def _train_and_promote_sync(
                 "status": "wait",
                 "reason": "eval_holdout_too_small",
                 "report": eval_report,
-                "rows": len(rows),
+                "rows": len(train_rows),
+                "total_rows": len(rows),
+                "holdout_rows": len(holdout_rows),
                 "buy_rows": int(buy_data.n_rows),
                 "sell_rows": int(sell_data.n_rows),
+                "policy_schema": list(policy_schema),
             }
         return {"status": "error", "reason": "eval_gate_failed", "report": eval_report}
 
     notes = {
         "trainer": "online_trainer_policy",
-        "rows": len(rows),
+        "rows": len(train_rows),
+        "rows_total": len(rows),
+        "holdout_rows": len(holdout_rows),
         "buy_rows": int(buy_data.n_rows),
         "sell_rows": int(sell_data.n_rows),
         "min_rows": int(min_rows),
         "pretrain_report": report,
         "eval_report": eval_report,
     }
-    src_counts = summarize_sources(rows)
-    drange = data_range(rows)
+    src_counts = summarize_sources(train_rows)
+    drange = data_range(train_rows)
 
     bundle_dir = _write_bundle_and_promote(
         buy_model=buy_model,
@@ -455,10 +540,13 @@ def _train_and_promote_sync(
         "bundle_dir": bundle_dir,
         "buy_model": buy_model,
         "sell_model": sell_model,
-        "rows": len(rows),
+        "rows": len(train_rows),
+        "total_rows": len(rows),
+        "holdout_rows": len(holdout_rows),
         "buy_rows": int(buy_data.n_rows),
         "sell_rows": int(sell_data.n_rows),
         "cols": len(policy_schema),
+        "policy_schema": list(policy_schema),
     }
 
 
@@ -533,6 +621,7 @@ async def background_trainer_loop(
                             pipeline_ref.replace_models(
                                 buy_model=result.get("buy_model"),
                                 sell_model=result.get("sell_model"),
+                                schema_cols=result.get("policy_schema"),
                             )
                             logger.info("[TRAIN] pipeline_ref models replaced")
                         except Exception:
@@ -549,9 +638,53 @@ async def background_trainer_loop(
                         int(result.get("cols", 0)),
                     )
 
+                _write_trainer_status(
+                    {
+                        "status": str(status or "unknown"),
+                        "reason": result.get("reason"),
+                        "rows": int(result.get("rows", 0) or 0),
+                        "total_rows": int(result.get("total_rows", result.get("rows_total", 0)) or 0),
+                        "holdout_rows": int(result.get("holdout_rows", 0) or 0),
+                        "buy_rows": int(result.get("buy_rows", 0) or 0),
+                        "sell_rows": int(result.get("sell_rows", 0) or 0),
+                        "bundle_dir": result.get("bundle_dir"),
+                        "report": result.get("report"),
+                        "train_log_path": str(p),
+                    }
+                )
                 last_mtime = mtime
+            else:
+                _write_trainer_status(
+                    {
+                        "status": "wait",
+                        "reason": "train_log_missing",
+                        "rows": 0,
+                        "total_rows": 0,
+                        "holdout_rows": 0,
+                        "buy_rows": 0,
+                        "sell_rows": 0,
+                        "bundle_dir": None,
+                        "report": None,
+                        "train_log_path": str(p),
+                    }
+                )
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error("[TRAIN] loop error: %s", e, exc_info=True)
+            _write_trainer_status(
+                {
+                    "status": "error",
+                    "reason": "trainer_loop_exception",
+                    "error": str(e),
+                    "rows": 0,
+                    "total_rows": 0,
+                    "holdout_rows": 0,
+                    "buy_rows": 0,
+                    "sell_rows": 0,
+                    "bundle_dir": None,
+                    "report": None,
+                    "train_log_path": feature_log_path,
+                }
+            )
         await asyncio.sleep(interval_sec)
