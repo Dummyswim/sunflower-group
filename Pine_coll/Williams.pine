@@ -1,0 +1,231 @@
+//@version=6
+indicator("Williams R Momentum Scalp", shorttitle="W%R Momentum", overlay=false, max_labels_count=200)
+
+// ─── Input Groups ─────────────────────────────────────────────────────────────
+
+grpCore = "01) Core"
+length       = input.int(21,     "Williams Length",   minval=1,                          group=grpCore)
+sigLen       = input.int(13,     "Signal Length",     minval=1,                          group=grpCore)
+sigType      = input.string("EMA","Signal Type",      options=["EMA","SMA","RMA","WMA"], group=grpCore)
+obLevel      = input.float(-20.0,"Overbought",        minval=-100, maxval=0,             group=grpCore)
+osLevel      = input.float(-80.0,"Oversold",          minval=-100, maxval=0,             group=grpCore)
+entryMode    = input.string("Hybrid","Entry Mode",    options=["Signal Cross In Zone","Level Exit","Hybrid"], group=grpCore)
+cooldownBars = input.int(3, "Signal Cooldown Bars",   minval=1, maxval=100,              group=grpCore)
+
+grpFilters = "02) Filters"
+useTrendFilter  = input.bool(true,  "Use Trend Filter (price EMA)", group=grpFilters)
+trendLen        = input.int(50,     "Trend EMA Length",  minval=1,  group=grpFilters)
+useVolumeFilter = input.bool(false, "Use Volume Filter",            group=grpFilters)
+volLen          = input.int(20,     "Volume SMA Length", minval=1,  group=grpFilters)
+volMult         = input.float(1.0,  "Volume >= SMA x", minval=0.1, step=0.1, group=grpFilters)
+useSessionFilter = input.bool(false,"Use Session Filter",           group=grpFilters)
+sessionStr      = input.session("0915-1530","Session",              group=grpFilters,
+     tooltip="Uses exchange timezone by default. Change 'Session Timezone' below if switching between asset classes or during DST.")
+// FIX #3 — constrained common timezone options instead of free text to eliminate typo risk
+sessionTz       = input.string("exchange", "Session Timezone",
+     options=["exchange","UTC","America/New_York","America/Chicago","Europe/London","Asia/Kolkata","Asia/Tokyo","Australia/Sydney"],
+     group=grpFilters,
+     tooltip="Select the timezone that matches your instrument's trading session. 'exchange' uses the symbol's own exchange clock.")
+
+grpHTF = "03) HTF Confirmation"
+useHTFConfirm = input.bool(false,    "Use HTF Confirmation", group=grpHTF)
+htfTf         = input.timeframe("5","HTF Timeframe",         group=grpHTF)
+htfMode       = input.string("Same Direction","HTF Mode",    options=["Same Direction","Momentum Bias"], group=grpHTF)
+
+grpViz = "04) Visuals"
+showSignals = input.bool(true,  "Show Buy/Sell Markers", group=grpViz)
+showZoneBg  = input.bool(true,  "Show OB/OS Background", group=grpViz)
+showMidline = input.bool(true,  "Show Midline (-50)",     group=grpViz)
+showHTFLine = input.bool(false, "Show HTF %R (faint)",    group=grpViz)
+
+grpExtra = "05) Extra Filters"
+useMomFilter = input.bool(false,"Use Momentum Slope Filter", group=grpExtra,
+     tooltip="Buy only when %R is rising bar-by-bar. Sell only when %R is falling bar-by-bar.")
+useDivFilter = input.bool(false,"Use Divergence Filter",     group=grpExtra,
+     tooltip="Pivot-based regular divergence: uses confirmed swing highs/lows (ta.pivothigh/low) with a freshness check. More precise than rolling-extreme divergence.")
+divLeft      = input.int(3, "Pivot Left Bars",  minval=1, maxval=10, group=grpExtra)
+divRight     = input.int(2, "Pivot Right Bars", minval=1, maxval=10, group=grpExtra,
+     tooltip="Higher values = more confirmed pivots but more lag. For 1m scalping keep this at 1–2.")
+divFreshness = input.int(10,"Divergence Max Age (bars)", minval=3, maxval=50, group=grpExtra,
+     tooltip="Ignore divergence signals older than this many bars. Prevents stale divergence firing in chop.")
+
+// ─── Functions ────────────────────────────────────────────────────────────────
+
+f_ma(src, len, typ) =>
+    float out = na
+    if typ == "EMA"
+        out := ta.ema(src, len)
+    else if typ == "SMA"
+        out := ta.sma(src, len)
+    else if typ == "RMA"
+        out := ta.rma(src, len)
+    else if typ == "WMA"
+        out := ta.wma(src, len)
+    else
+        out := ta.ema(src, len)
+    out
+
+f_wr(_len) =>
+    float hh      = ta.highest(high, _len)
+    float ll      = ta.lowest(low,  _len)
+    float prRange = math.max(hh - ll, syminfo.mintick)
+    100.0 * (close - hh) / prRange
+
+// FIX #1 — single local %R variable, returned as tuple with its signal
+// f_wr(length) is now called ONCE inside this helper; request.security uses
+// this function so the duplicate f_wr call inside the tuple expression is gone.
+f_wr_sig(_len, _sigLen, _sigType) =>
+    float _wr = f_wr(_len)
+    [_wr, f_ma(_wr, _sigLen, _sigType)]
+
+// ─── Core %R ──────────────────────────────────────────────────────────────────
+
+float wr    = f_wr(length)
+float wrSig = f_ma(wr, sigLen, sigType)
+
+// ─── HTF — one request, one tuple, f_wr called once inside helper ─────────────
+
+float wrHTF    = na
+float wrSigHTF = na
+
+if useHTFConfirm or showHTFLine
+    [_a, _b] = request.security(syminfo.tickerid, htfTf,
+                 f_wr_sig(length, sigLen, sigType),
+                 barmerge.gaps_off, barmerge.lookahead_off)
+    wrHTF    := _a
+    wrSigHTF := _b
+
+// ─── Filters ──────────────────────────────────────────────────────────────────
+
+float trendEma = ta.ema(close, trendLen)
+bool  trendBull = close >= trendEma
+bool  trendBear = close <  trendEma
+
+float volSma = ta.sma(volume, volLen)
+bool  volOK  = (not useVolumeFilter) or (volume >= volSma * volMult)
+
+bool inSession = (not useSessionFilter) or (not na(time(timeframe.period, sessionStr, sessionTz)))
+
+bool htfBull = (not useHTFConfirm) or (htfMode == "Same Direction" ? (wrHTF > wrSigHTF) : (wrHTF > -50))
+bool htfBear = (not useHTFConfirm) or (htfMode == "Same Direction" ? (wrHTF < wrSigHTF) : (wrHTF < -50))
+
+// Momentum slope
+bool momBull = (not useMomFilter) or (wr > wr[1])
+bool momBear = (not useMomFilter) or (wr < wr[1])
+
+// FIX #2 — Pivot-based divergence with freshness gate
+// Uses ta.pivotlow/pivothigh for confirmed swing points instead of
+// rolling ta.lowest/highest which fired too frequently in chop.
+// A freshness check (barssince) discards pivots older than divFreshness bars.
+
+float pivLow  = ta.pivotlow(wr,   divLeft, divRight)
+float pivHigh = ta.pivothigh(wr,  divLeft, divRight)
+float pricePivLow  = ta.pivotlow(low,  divLeft, divRight)
+float pricePivHigh = ta.pivothigh(high, divLeft, divRight)
+
+// Track last confirmed pivot values and their ages
+var float lastWRLow       = na
+var float lastPriceLow    = na
+var float lastWRHigh      = na
+var float lastPriceHigh   = na
+var int   lastWRLowBar    = na
+var int   lastWRHighBar   = na
+
+if not na(pivLow)
+    lastWRLow    := pivLow
+    lastPriceLow := pricePivLow
+    lastWRLowBar := bar_index
+
+if not na(pivHigh)
+    lastWRHigh    := pivHigh
+    lastPriceHigh := pricePivHigh
+    lastWRHighBar := bar_index
+
+// Bullish divergence: price made lower low but %R made higher low — pivot confirmed & fresh
+bool divBull = false
+bool divBear = false
+
+if useDivFilter and not na(lastWRLow) and not na(lastPriceLow)
+    bool freshBull = (bar_index - lastWRLowBar) <= divFreshness
+    // Compare current bar's low & %R to last confirmed pivot low
+    divBull := freshBull and (low < lastPriceLow) and (wr > lastWRLow)
+
+if useDivFilter and not na(lastWRHigh) and not na(lastPriceHigh)
+    bool freshBear = (bar_index - lastWRHighBar) <= divFreshness
+    divBear := freshBear and (high > lastPriceHigh) and (wr < lastWRHigh)
+
+bool divBullOK = (not useDivFilter) or divBull
+bool divBearOK = (not useDivFilter) or divBear
+
+// ─── Raw Entry Conditions ─────────────────────────────────────────────────────
+
+bool crossUpSig = ta.crossover(wr,  wrSig)
+bool crossDnSig = ta.crossunder(wr, wrSig)
+bool crossUpOS  = ta.crossover(wr,  osLevel)
+bool crossDnOB  = ta.crossunder(wr, obLevel)
+
+bool buyRaw  = false
+bool sellRaw = false
+
+if entryMode == "Signal Cross In Zone"
+    buyRaw  := crossUpSig and wr <= osLevel
+    sellRaw := crossDnSig and wr >= obLevel
+else if entryMode == "Level Exit"
+    buyRaw  := crossUpOS
+    sellRaw := crossDnOB
+else
+    buyRaw  := (crossUpSig and wr <= osLevel) or (crossUpOS and wr > wrSig)
+    sellRaw := (crossDnSig and wr >= obLevel) or (crossDnOB and wr < wrSig)
+
+// ─── Combined Filters ─────────────────────────────────────────────────────────
+
+bool longFilter  = (not useTrendFilter or trendBull) and volOK and inSession and htfBull and momBull and divBullOK
+bool shortFilter = (not useTrendFilter or trendBear) and volOK and inSession and htfBear and momBear and divBearOK
+
+// ─── Cooldown ─────────────────────────────────────────────────────────────────
+
+var int lastBuyBar  = na
+var int lastSellBar = na
+
+bool buyCoolOK  = na(lastBuyBar)  or (bar_index - lastBuyBar  >= cooldownBars)
+bool sellCoolOK = na(lastSellBar) or (bar_index - lastSellBar >= cooldownBars)
+
+bool buySignal  = buyRaw  and longFilter  and buyCoolOK
+bool sellSignal = sellRaw and shortFilter and sellCoolOK
+
+if buySignal
+    lastBuyBar  := bar_index
+if sellSignal
+    lastSellBar := bar_index
+
+// ─── Visuals ──────────────────────────────────────────────────────────────────
+
+hOb  = hline(obLevel, "Overbought", color=color.new(color.red,  0))
+hOs  = hline(osLevel, "Oversold",   color=color.new(color.teal, 0))
+hMid = hline(-50, "Midline",
+         color     = showMidline ? color.new(color.gray, 30) : color.new(color.gray, 100),
+         linestyle = hline.style_dotted)
+
+fill(hOb, hOs, title="OB/OS Fill", color=color.new(color.silver, 94))
+
+bgcolor(showZoneBg and wr >= obLevel ? color.new(color.red,  92) : na, title="OB BG")
+bgcolor(showZoneBg and wr <= osLevel ? color.new(color.teal, 92) : na, title="OS BG")
+
+plot(wr,    "%R",     color=color.new(color.yellow,  0), linewidth=2)
+plot(wrSig, "Signal", color=color.new(color.aqua,    0), linewidth=2)
+plot(showHTFLine ? wrHTF : na, "HTF %R", color=color.new(color.fuchsia, 70), linewidth=1)
+
+plotshape(showSignals and buySignal,  title="Buy",
+         style=shape.triangleup,   location=location.bottom,
+         color=color.new(color.lime, 0), size=size.small,
+         text="BUY",  textcolor=color.white)
+
+plotshape(showSignals and sellSignal, title="Sell",
+         style=shape.triangledown, location=location.top,
+         color=color.new(color.red,  0), size=size.small,
+         text="SELL", textcolor=color.white)
+
+// ─── Alerts ───────────────────────────────────────────────────────────────────
+
+alertcondition(buySignal,  "Williams BUY",  "Williams %R BUY signal on {{ticker}} {{interval}}")
+alertcondition(sellSignal, "Williams SELL", "Williams %R SELL signal on {{ticker}} {{interval}}")

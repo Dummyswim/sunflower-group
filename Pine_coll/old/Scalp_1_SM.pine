@@ -1,9 +1,9 @@
 //@version=5
-VERSION = 'HTF SD Crossover Strategy'
+VERSION = 'v6_1_23_fixed_2026_02_21'
 
 strategy(
-     'HTF SD Crossover Scalper',
-     shorttitle              = 'HTFSDX',
+     'XXX',
+     shorttitle              = 'XXX ' + VERSION,
      overlay                 = true,
      explicit_plot_zorder    = true,
      pyramiding              = 0,
@@ -19,7 +19,7 @@ strategy(
 G_SCRIPT01   = '■ ' + 'SAIYAN OCC'
 
 // NON REPAINT / EXECUTION
-res                       = input.timeframe('5',   'HTF TIMEFRAME (for signals)', group ="NON REPAINT")
+res                       = input.timeframe('15',  'HTF TIMEFRAME (for signals)', group ="NON REPAINT")
 htfConfirmedSignals       = input.bool(true,       'Use CONFIRMED HTF bars only (strict non-repaint)', group="NON REPAINT",
      tooltip="ON = uses previous closed HTF bar. Signals will not repaint but will be later.\nOFF = uses developing HTF bar (no future leak), may change until HTF closes.")
 useRes                    = input(true,            'Use HTF signals', group="NON REPAINT")
@@ -247,7 +247,7 @@ reso(exp, use, tf) =>
 closeSeries = variant(basisType, close[delayOffset], basisLen, offsetSigma, offsetALMA)
 openSeries  = variant(basisType, open[delayOffset],  basisLen, offsetSigma, offsetALMA)
 
-// IMPORTANT: use user-selected HTF res
+// IMPORTANT: use user-selected HTF `res`
 closeSeriesAlt = reso(closeSeries, useRes, res)
 openSeriesAlt  = reso(openSeries,  useRes, res)
 
@@ -278,13 +278,13 @@ O_SXMSGB   = 'Short TP2'
 O_SXMSGC   = 'Short TP3'
 O_SXMSGX   = 'Short Exit'
 
-i_lxLvlTP1 = input.float(0.35, 'Level TP1', group = G_RISK, tooltip=T_LVL)
-i_lxQtyTP1 = input.float(60,   'Qty   TP1', group = G_RISK, tooltip=T_QTY)
-i_lxLvlTP2 = input.float(0.70, 'Level TP2', group = G_RISK, tooltip=T_LVL)
-i_lxQtyTP2 = input.float(25,   'Qty   TP2', group = G_RISK, tooltip=T_QTY)
-i_lxLvlTP3 = input.float(1.10, 'Level TP3', group = G_RISK, tooltip=T_LVL)
-i_lxQtyTP3 = input.float(15,   'Qty   TP3', group = G_RISK, tooltip=T_QTY)
-i_lxLvlSL  = input.float(0.30, 'Stop Loss', group = G_RISK, tooltip=T_LVL)
+i_lxLvlTP1 = input.float(1,   'Level TP1', group = G_RISK, tooltip=T_LVL)
+i_lxQtyTP1 = input.float(50,  'Qty   TP1', group = G_RISK, tooltip=T_QTY)
+i_lxLvlTP2 = input.float(1.5, 'Level TP2', group = G_RISK, tooltip=T_LVL)
+i_lxQtyTP2 = input.float(30,  'Qty   TP2', group = G_RISK, tooltip=T_QTY)
+i_lxLvlTP3 = input.float(2,   'Level TP3', group = G_RISK, tooltip=T_LVL)
+i_lxQtyTP3 = input.float(20,  'Qty   TP3', group = G_RISK, tooltip=T_QTY)
+i_lxLvlSL  = input.float(0.5, 'Stop Loss', group = G_RISK, tooltip=T_LVL)
 
 i_sxLvlTP1 = i_lxLvlTP1
 i_sxQtyTP1 = i_lxQtyTP1
@@ -316,74 +316,22 @@ G_EXEC     = 'Execution'
 flatOnly   = input.bool(false, 'Flat-only entries (no reversals)', group=G_EXEC)
 exitOnOpp  = input.bool(true,  'Exit on opposite signal',          group=G_EXEC)
 
-G_SCALP    = 'Scalper Filters'
-i_sessionFilterOn         = input.bool(true,  'Use Session Filter', group=G_SCALP)
-i_tradeSession            = input.session('0930-1130,1300-1530', 'Trade Session', group=G_SCALP)
-i_forceFlatOutsideSession = input.bool(true,  'Force Flat Outside Session', group=G_SCALP)
-i_trendFilterOn           = input.bool(true,  'Use EMA Trend Filter', group=G_SCALP)
-i_trendLen                = input.int(55,     'EMA Trend Length', minval=1, group=G_SCALP)
-i_atrFilterOn             = input.bool(true,  'Use ATR% Volatility Filter', group=G_SCALP)
-i_atrFilterLen            = input.int(14,     'ATR Filter Length', minval=1, group=G_SCALP)
-i_minAtrPct               = input.float(0.05, 'Min ATR% (avoid dead market)', minval=0.0, step=0.01, group=G_SCALP)
-i_maxAtrPct               = input.float(1.20, 'Max ATR% (avoid disorder)', minval=0.0, step=0.01, group=G_SCALP)
-i_volumeFilterOn          = input.bool(true,  'Use Relative Volume Filter', group=G_SCALP)
-i_volumeLen               = input.int(20,     'Volume SMA Length', minval=1, group=G_SCALP)
-i_minRelVolume            = input.float(0.90, 'Min Relative Volume', minval=0.0, step=0.05, group=G_SCALP)
-i_cooldownBars            = input.int(2,      'Cooldown Bars After Entry', minval=0, group=G_SCALP)
-i_maxBarsInTrade          = input.int(20,     'Max Bars In Trade (0=Off)', minval=0, group=G_SCALP)
-
-G_SCALP_RISK              = 'Scalper Risk Controls'
-i_atrStopFloorOn          = input.bool(true,  'Use ATR Stop Floor', group=G_SCALP_RISK)
-i_atrStopLen              = input.int(14,     'ATR Stop Length', minval=1, group=G_SCALP_RISK)
-i_atrStopMult             = input.float(0.75, 'ATR Stop Multiplier', minval=0.1, step=0.05, group=G_SCALP_RISK)
-i_breakEvenOn             = input.bool(true,  'Use Break-even Stop', group=G_SCALP_RISK)
-i_breakEvenAt             = input.float(0.35, 'Break-even Trigger %', minval=0.0, step=0.01, group=G_SCALP_RISK)
-i_breakEvenPlus           = input.float(0.02, 'Break-even Lock %', minval=0.0, step=0.01, group=G_SCALP_RISK)
-i_trailOn                 = input.bool(true,  'Use ATR Trailing Stop', group=G_SCALP_RISK)
-i_trailAfterTp1           = input.bool(true,  'Arm Trail Only After TP1', group=G_SCALP_RISK)
-i_trailAtrMult            = input.float(0.60, 'Trail ATR Multiplier', minval=0.1, step=0.05, group=G_SCALP_RISK)
-
 allowLong  = tradeType == 'LONG'  or tradeType == 'BOTH'
 allowShort = tradeType == 'SHORT' or tradeType == 'BOTH'
 
-trendEma        = ta.ema(close, i_trendLen)
-trendUp         = close > trendEma and trendEma > trendEma[1]
-trendDown       = close < trendEma and trendEma < trendEma[1]
-longTrendOk     = not i_trendFilterOn or trendUp
-shortTrendOk    = not i_trendFilterOn or trendDown
-inSession       = not i_sessionFilterOn or not na(time(timeframe.period, i_tradeSession))
-atrFilterValue  = ta.atr(i_atrFilterLen)
-atrPct          = close != 0.0 ? (atrFilterValue / close) * 100.0 : 0.0
-volatilityOk    = not i_atrFilterOn or (atrPct >= i_minAtrPct and atrPct <= i_maxAtrPct)
-volumeSma       = ta.sma(volume, i_volumeLen)
-relVolume       = na(volumeSma) or volumeSma == 0.0 ? 1.0 : volume / volumeSma
-liquidityOk     = not i_volumeFilterOn or relVolume >= i_minRelVolume
-
-var int lastEntryBar = na
-cooldownOk      = na(lastEntryBar) or (bar_index - lastEntryBar > i_cooldownBars)
-entryFilterOk   = inSession and volatilityOk and liquidityOk and cooldownOk
-longEntrySignal = allowLong  and leTrigger and tradeType != 'NONE' and longTrendOk  and entryFilterOk
-shortEntrySignal = allowShort and seTrigger and tradeType != 'NONE' and shortTrendOk and entryFilterOk
-
 // Entries/Exits
 if barstate.isconfirmed
-    if i_sessionFilterOn and i_forceFlatOutsideSession and not inSession
-        if strategy.position_size > 0
-            strategy.close('Long',  alert_message=i_lxMsg, comment='SessionFlat')
-        if strategy.position_size < 0
-            strategy.close('Short', alert_message=i_sxMsg, comment='SessionFlat')
-
     if exitOnOpp and strategy.position_size > 0 and seTrigger
         strategy.close('Long',  alert_message=i_lxMsg, comment='LX')
     if exitOnOpp and strategy.position_size < 0 and leTrigger
         strategy.close('Short', alert_message=i_sxMsg, comment='SX')
 
-    if longEntrySignal and (not flatOnly or strategy.position_size == 0)
+    if allowLong and leTrigger and tradeType != 'NONE' and (not flatOnly or strategy.position_size == 0)
         if strategy.position_size < 0
             strategy.close('Short', alert_message=i_sxMsg, comment='SX')
         strategy.entry('Long', strategy.long, alert_message=i_leMsg, comment='LE')
 
-    if shortEntrySignal and (not flatOnly or strategy.position_size == 0)
+    if allowShort and seTrigger and tradeType != 'NONE' and (not flatOnly or strategy.position_size == 0)
         if strategy.position_size > 0
             strategy.close('Long', alert_message=i_lxMsg, comment='LX')
         strategy.entry('Short', strategy.short, alert_message=i_seMsg, comment='SE') // FIXED: i_seMsg
@@ -394,9 +342,6 @@ var float slLine    = na
 var float tp1Line   = na
 var float tp2Line   = na
 var float tp3Line   = na
-var bool  trailLongArmed = false
-var bool  trailShortArmed = false
-var int   posEntryBar = na
 
 enteredLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
 enteredShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
@@ -404,80 +349,22 @@ toFlat       = strategy.position_size == 0 and strategy.position_size[1] != 0
 
 if enteredLong
     entryLine := strategy.position_avg_price
+    slLine    := entryLine * (1 - i_lxLvlSL/100)
     tp1Line   := entryLine * (1 + i_lxLvlTP1/100)
     tp2Line   := entryLine * (1 + i_lxLvlTP2/100)
     tp3Line   := entryLine * (1 + i_lxLvlTP3/100)
-    trailLongArmed := false
 
-if enteredShort
-    entryLine := strategy.position_avg_price
-    tp1Line   := entryLine * (1 - i_sxLvlTP1/100)
-    tp2Line   := entryLine * (1 - i_sxLvlTP2/100)
-    tp3Line   := entryLine * (1 - i_sxLvlTP3/100)
-    trailShortArmed := false
-
-if enteredLong or enteredShort
-    posEntryBar := bar_index
-    lastEntryBar := bar_index
-
-if barstate.isconfirmed and i_maxBarsInTrade > 0 and strategy.position_size != 0 and not na(posEntryBar) and (bar_index - posEntryBar) >= i_maxBarsInTrade
-    if strategy.position_size > 0
-        strategy.close('Long', alert_message=i_lxMsg, comment='TimeStop')
-    else
-        strategy.close('Short', alert_message=i_sxMsg, comment='TimeStop')
-
-if strategy.position_size > 0
-    entryRef = na(entryLine) ? strategy.position_avg_price : entryLine
-    entryLine := entryRef
-    tp1Line   := entryRef * (1 + i_lxLvlTP1 / 100)
-    tp2Line   := entryRef * (1 + i_lxLvlTP2 / 100)
-    tp3Line   := entryRef * (1 + i_lxLvlTP3 / 100)
-
-    baseStopLong = entryRef * (1 - i_lxLvlSL / 100)
-    stopDistLong = entryRef - baseStopLong
-    atrRisk      = ta.atr(i_atrStopLen)
-    atrDist      = atrRisk * i_atrStopMult
-    dynStopLong  = i_atrStopFloorOn ? entryRef - math.max(stopDistLong, atrDist) : baseStopLong
-
-    if i_breakEvenOn and high >= entryRef * (1 + i_breakEvenAt / 100)
-        dynStopLong := math.max(dynStopLong, entryRef * (1 + i_breakEvenPlus / 100))
-
-    if i_trailOn
-        if (not i_trailAfterTp1) or high >= tp1Line
-            trailLongArmed := true
-        if trailLongArmed
-            trailStopLong = close - atrRisk * i_trailAtrMult
-            dynStopLong := math.max(dynStopLong, trailStopLong)
-
-    slLine := dynStopLong
     strategy.exit('LXTP1','Long', qty_percent=i_lxQtyTP1, limit=tp1Line, stop=slLine, alert_profit=i_lxMsgTP1, alert_loss=i_lxMsgSL)
     strategy.exit('LXTP2','Long', qty_percent=i_lxQtyTP2, limit=tp2Line, stop=slLine, alert_profit=i_lxMsgTP2, alert_loss=i_lxMsgSL)
     strategy.exit('LXTP3','Long', qty_percent=i_lxQtyTP3, limit=tp3Line, stop=slLine, alert_profit=i_lxMsgTP3, alert_loss=i_lxMsgSL)
 
-if strategy.position_size < 0
-    entryRef = na(entryLine) ? strategy.position_avg_price : entryLine
-    entryLine := entryRef
-    tp1Line   := entryRef * (1 - i_sxLvlTP1 / 100)
-    tp2Line   := entryRef * (1 - i_sxLvlTP2 / 100)
-    tp3Line   := entryRef * (1 - i_sxLvlTP3 / 100)
+if enteredShort
+    entryLine := strategy.position_avg_price
+    slLine    := entryLine * (1 + i_sxLvlSL/100)
+    tp1Line   := entryLine * (1 - i_sxLvlTP1/100)
+    tp2Line   := entryLine * (1 - i_sxLvlTP2/100)
+    tp3Line   := entryLine * (1 - i_sxLvlTP3/100)
 
-    baseStopShort = entryRef * (1 + i_sxLvlSL / 100)
-    stopDistShort = baseStopShort - entryRef
-    atrRisk       = ta.atr(i_atrStopLen)
-    atrDist       = atrRisk * i_atrStopMult
-    dynStopShort  = i_atrStopFloorOn ? entryRef + math.max(stopDistShort, atrDist) : baseStopShort
-
-    if i_breakEvenOn and low <= entryRef * (1 - i_breakEvenAt / 100)
-        dynStopShort := math.min(dynStopShort, entryRef * (1 - i_breakEvenPlus / 100))
-
-    if i_trailOn
-        if (not i_trailAfterTp1) or low <= tp1Line
-            trailShortArmed := true
-        if trailShortArmed
-            trailStopShort = close + atrRisk * i_trailAtrMult
-            dynStopShort := math.min(dynStopShort, trailStopShort)
-
-    slLine := dynStopShort
     strategy.exit('SXTP1','Short', qty_percent=i_sxQtyTP1, limit=tp1Line, stop=slLine, alert_profit=i_sxMsgTP1, alert_loss=i_sxMsgSL)
     strategy.exit('SXTP2','Short', qty_percent=i_sxQtyTP2, limit=tp2Line, stop=slLine, alert_profit=i_sxMsgTP2, alert_loss=i_sxMsgSL)
     strategy.exit('SXTP3','Short', qty_percent=i_sxQtyTP3, limit=tp3Line, stop=slLine, alert_profit=i_sxMsgTP3, alert_loss=i_sxMsgSL)
@@ -488,9 +375,6 @@ if toFlat
     tp1Line   := na
     tp2Line   := na
     tp3Line   := na
-    trailLongArmed := false
-    trailShortArmed := false
-    posEntryBar := na
 
 // Visuals
 inPos   = strategy.position_size != 0

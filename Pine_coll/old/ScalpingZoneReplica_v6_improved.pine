@@ -23,7 +23,7 @@
 // ============================================================================
 
 //@version=6
-indicator("Scalping Zone Toolkit", overlay=true,
+indicator("Scalping Zone Replica (v6) - Improved", overlay=true,
           max_boxes_count=100, max_labels_count=100)
 
 // ─────────────────────────────────────────────────────────────────────────────
