@@ -1,0 +1,1598 @@
+//@version=6
+indicator("Mobile Future_GTI_MovingLine", shorttitle="GTIMapV4", overlay=true, max_boxes_count=20, max_labels_count=200, max_lines_count=100)
+
+//====================================================
+// INPUTS
+//====================================================
+grpMap = "1) Value Map"
+rangeLen        = input.int(60, "Map Lookback", minval=20, maxval=300, group=grpMap)
+extremePct      = input.float(0.10, "Extreme Zone %", minval=0.03, maxval=0.20, step=0.01, group=grpMap)
+innerPct        = input.float(0.10, "Inner Zone %", minval=0.03, maxval=0.25, step=0.01, group=grpMap)
+battlePct       = input.float(0.18, "Battleground %", minval=0.06, maxval=0.35, step=0.01, group=grpMap)
+extendBars      = input.int(18, "Zone Extension Bars", minval=2, maxval=100, group=grpMap)
+mapSmoothLen    = input.int(8, "Zone Stickiness (Smoothing)", minval=1, maxval=80, group=grpMap)
+
+grpLines = "2) Moving Lines"
+fastLen         = input.int(9, "Fast Line", minval=2, maxval=50, group=grpLines)
+slowLen         = input.int(21, "Slow Line", minval=5, maxval=100, group=grpLines)
+trendLen        = input.int(50, "Trend EMA", minval=10, maxval=200, group=grpLines)
+reclaimBars     = input.int(3, "Reclaim Window Bars", minval=1, maxval=8, group=grpLines)
+lineSpreadATR   = input.float(0.35, "Line Compression ATR Mult", minval=0.05, maxval=2.0, step=0.05, group=grpLines)
+spreadSlopeThresh = input.float(0.01, "Spread Slope ATR Threshold", minval=0.0, maxval=1.0, step=0.01, group=grpLines)
+maxContinuationTouches = input.int(2, "Max Continuation Touches", minval=1, maxval=5, group=grpLines)
+exitCooldownBars = input.int(3, "Exit Cooldown Bars", minval=1, maxval=10, group=grpLines)
+linePlotStyle = input.string("Stepped", "Moving Line Plot Style", options=["Stepped", "Smooth"], group=grpLines)
+eventMemoryBars = input.int(2, "Event Memory Bars", minval=1, maxval=5, group=grpLines)
+
+grpPattern = "3) Patterns / Traps / Structure"
+swingLen        = input.int(4, "Swing Length", minval=2, maxval=10, group=grpPattern)
+wickATRMult     = input.float(0.20, "Sweep Wick ATR Mult", minval=0.05, maxval=2.0, step=0.05, group=grpPattern)
+retestBars      = input.int(10, "BOS Retest Window Bars", minval=2, maxval=30, group=grpPattern)
+dispATRMult     = input.float(0.80, "Displacement ATR Mult", minval=0.10, maxval=5.0, step=0.05, group=grpPattern)
+dispBodyPct     = input.float(0.60, "Displacement Body %", minval=0.20, maxval=0.95, step=0.05, group=grpPattern)
+indecisionBodyPct = input.float(0.25, "Indecision Max Body %", minval=0.05, maxval=0.50, step=0.01, group=grpPattern)
+indecisionWickRatio = input.float(1.10, "Indecision Wick/Body Ratio", minval=0.5, maxval=5.0, step=0.1, group=grpPattern)
+exhaustWickPct  = input.float(0.45, "Exhaustion Wick % of Range", minval=0.2, maxval=0.9, step=0.05, group=grpPattern)
+exhaustBodyPct  = input.float(0.35, "Exhaustion Max Body %", minval=0.05, maxval=0.80, step=0.05, group=grpPattern)
+instVolMult     = input.float(1.50, "Institutional Activity Vol Mult", minval=1.0, maxval=5.0, step=0.1, group=grpPattern)
+
+grpCompression = "4) Compression / Expansion"
+compressionATR  = input.float(2.00, "Compression Gap ATR Threshold", minval=0.20, maxval=10.0, step=0.05, group=grpCompression)
+expansionATR    = input.float(1.20, "Unfair Value ATR Threshold", minval=0.20, maxval=10.0, step=0.05, group=grpCompression)
+compressionLookback = input.int(8, "Compression Memory Bars", minval=2, maxval=40, group=grpCompression)
+
+grpHTF = "5) Higher Timeframe Filter"
+useHTF          = input.bool(true, "Use HTF Bias", group=grpHTF)
+htfTf           = input.timeframe("15", "HTF Timeframe", group=grpHTF)
+htfRangeLen     = input.int(60, "HTF Map Lookback", minval=20, maxval=500, group=grpHTF)
+
+grpEngine = "6) Engine Refactor"
+useTfBuckets = input.bool(true, "Use TF Buckets", group=grpEngine)
+useContinuationBias = input.bool(true, "Use Continuation Bias", group=grpEngine)
+useCountertrendLabels = input.bool(true, "Use Countertrend Labels", group=grpEngine)
+useRideStateSignals = input.bool(true, "Use Ride State Signals", group=grpEngine)
+useReentryCooldown = input.bool(true, "Use Re-entry Cooldown", group=grpEngine)
+useLocationPenaltyModel = input.bool(true, "Use Location Penalty Model", group=grpEngine)
+useConfirmedHTF = input.bool(true, "Use Confirmed HTF Bars", group=grpEngine)
+useScoreExecutionGate = input.bool(true, "Gate Execution With Scores", group=grpEngine)
+
+grpScore = "7) Score Weights"
+weightTrend       = input.int(20, "Weight Trend", minval=0, maxval=100, group=grpScore)
+weightValue       = input.int(25, "Weight Value", minval=0, maxval=100, group=grpScore)
+weightStructure   = input.int(25, "Weight Structure", minval=0, maxval=100, group=grpScore)
+weightCompression = input.int(15, "Weight Compression", minval=0, maxval=100, group=grpScore)
+weightHTF         = input.int(15, "Weight HTF", minval=0, maxval=100, group=grpScore)
+minExecutionScore = input.int(55, "Execution Min Score", minval=0, maxval=100, group=grpScore)
+minExecutionEdge = input.int(8, "Execution Min Score Edge", minval=0, maxval=100, group=grpScore)
+
+grpStyle = "8) Style"
+displayMode     = input.string("Scalper Clean", "Display Mode", options=["Execution Minimal", "Scalper Clean", "Detailed"], group=grpStyle)
+showZones       = input.bool(true, "Show Zones", group=grpStyle)
+showMapLabels   = input.bool(true, "Show Zone Labels", group=grpStyle)
+showFastSlow    = input.bool(true, "Show Fast/Slow Lines", group=grpStyle)
+showTrendEMA    = input.bool(true, "Show Trend EMA", group=grpStyle)
+showPanel       = input.bool(true, "Show State Panel", group=grpStyle)
+panelLayout     = input.string("Mobile Compact", "Panel Layout", options=["Mobile Compact", "Full"], group=grpStyle)
+panelPosition   = input.string("Bottom Right", "Panel Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=grpStyle)
+showSignals     = input.bool(true, "Show Signals", group=grpStyle)
+showAdvanced    = input.bool(true, "Show Advanced Markers", group=grpStyle)
+showBgTint      = input.bool(true, "Show Background Tint", group=grpStyle)
+showInstitutional = input.bool(true, "Show Institutional Proxy", group=grpStyle)
+
+isExecutionMinimal = displayMode == "Execution Minimal"
+isScalperClean = displayMode == "Scalper Clean"
+isDetailed = displayMode == "Detailed"
+isCompactPanel = panelLayout == "Mobile Compact"
+panelTextSize = isCompactPanel ? size.tiny : size.small
+panelAnchor = panelPosition == "Top Left" ? position.top_left :
+     panelPosition == "Top Center" ? position.top_center :
+     panelPosition == "Top Right" ? position.top_right :
+     panelPosition == "Middle Left" ? position.middle_left :
+     panelPosition == "Middle Center" ? position.middle_center :
+     panelPosition == "Middle Right" ? position.middle_right :
+     panelPosition == "Bottom Left" ? position.bottom_left :
+     panelPosition == "Bottom Center" ? position.bottom_center : position.bottom_right
+
+PRIMARY_BEAR = -1
+PRIMARY_NEUTRAL = 0
+PRIMARY_BULL = 1
+
+ARCH_NONE = 0
+ARCH_TREND_RIDE = 1
+ARCH_COUNTERTREND_BOUNCE = 2
+ARCH_REVERSAL = 3
+
+CAMPAIGN_NONE = 0
+CAMPAIGN_LONG = 1
+CAMPAIGN_SHORT = -1
+
+sec_htf(tf, expr) =>
+    useConfirmedHTF ? request.security(syminfo.tickerid, tf, expr[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : request.security(syminfo.tickerid, tf, expr, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+//====================================================
+// CORE SERIES
+//====================================================
+atr = ta.atr(14)
+vol = volume
+volMA = ta.sma(vol, 20)
+
+fastLine = ta.ema(close, fastLen)
+slowLine = ta.ema(close, slowLen)
+trendEMA = ta.ema(close, trendLen)
+
+fastUp = fastLine > fastLine[1]
+fastDn = fastLine < fastLine[1]
+slowUp = slowLine > slowLine[1]
+slowDn = slowLine < slowLine[1]
+
+priceAboveLines = close > fastLine and close > slowLine
+priceBelowLines = close < fastLine and close < slowLine
+
+reclaimFastLongEvent = ta.crossover(close, fastLine)
+reclaimSlowLongEvent = ta.crossover(close, slowLine)
+reclaimFastShortEvent = ta.crossunder(close, fastLine)
+reclaimSlowShortEvent = ta.crossunder(close, slowLine)
+
+loseFastLongEvent = ta.crossunder(close, fastLine)
+loseSlowLongEvent = ta.crossunder(close, slowLine)
+loseFastShortEvent = ta.crossover(close, fastLine)
+loseSlowShortEvent = ta.crossover(close, slowLine)
+
+fastCrossAboveSlow = ta.crossover(fastLine, slowLine)
+fastCrossBelowSlow = ta.crossunder(fastLine, slowLine)
+
+lineSpread = math.abs(fastLine - slowLine)
+lineSpreadSlope = ta.ema(lineSpread - lineSpread[1], 3)
+lineSpreadSlopeATR = atr > 0 ? lineSpreadSlope / atr : 0.0
+linesCompressed = lineSpread < atr * lineSpreadATR
+linesExpanding = lineSpreadSlopeATR > spreadSlopeThresh
+linesContracting = lineSpreadSlopeATR < -spreadSlopeThresh
+
+tfSec = timeframe.in_seconds(timeframe.period)
+isLowTfBucket = useTfBuckets and tfSec <= 180
+isMidTfBucket = useTfBuckets and tfSec > 180 and tfSec <= 300
+isRideTfBucket = useTfBuckets and tfSec > 300
+tfBucket = isLowTfBucket ? "LOW TF" : isMidTfBucket ? "MID TF" : "RIDE TF"
+
+htfClose = sec_htf(htfTf, close)
+htfEMA = sec_htf(htfTf, ta.ema(close, trendLen))
+htfHH = sec_htf(htfTf, ta.highest(high, htfRangeLen))
+htfLL = sec_htf(htfTf, ta.lowest(low, htfRangeLen))
+htfBull = htfClose > htfEMA
+htfBear = htfClose < htfEMA
+htfRng = math.max(htfHH - htfLL, syminfo.mintick * 20)
+htfEq = (htfHH + htfLL) / 2.0
+htfBattleTop = htfEq + htfRng * battlePct / 2.0
+htfBattleBot = htfEq - htfRng * battlePct / 2.0
+htfExtremeSellBot = htfHH - htfRng * extremePct
+htfSellBot = htfHH - htfRng * (extremePct + innerPct)
+htfExtremeBuyTop = htfLL + htfRng * extremePct
+htfBuyTop = htfLL + htfRng * (extremePct + innerPct)
+
+htfInExtremeSell = close >= htfExtremeSellBot
+htfInSell = close < htfExtremeSellBot and close >= htfSellBot
+htfInBattle = close <= htfBattleTop and close >= htfBattleBot
+htfInBuy = close > htfExtremeBuyTop and close <= htfBuyTop
+htfInExtremeBuy = close <= htfExtremeBuyTop
+
+htfInSellerArea = htfInSell or htfInExtremeSell
+htfInBuyerArea = htfInBuy or htfInExtremeBuy
+htfLongAligned = not useHTF or (htfBull and (close <= htfBattleTop or htfInBuyerArea))
+htfShortAligned = not useHTF or (htfBear and (close >= htfBattleBot or htfInSellerArea))
+
+//====================================================
+// VALUE MAP (5 ZONES)
+//====================================================
+rawHH = ta.highest(high, rangeLen)
+rawLL = ta.lowest(low, rangeLen)
+smoothAlpha = 2.0 / (mapSmoothLen + 1.0)
+
+var float hhSticky = na
+var float llSticky = na
+
+if na(hhSticky)
+    hhSticky := rawHH
+    llSticky := rawLL
+else
+    hhSticky := hhSticky + (rawHH - hhSticky) * smoothAlpha
+    llSticky := llSticky + (rawLL - llSticky) * smoothAlpha
+
+hh = hhSticky
+ll = llSticky
+rng = math.max(hh - ll, syminfo.mintick * 10)
+eq = (hh + ll) / 2.0
+
+extremeSellTop = hh
+extremeSellBot = hh - rng * extremePct
+
+sellTop = extremeSellBot
+sellBot = hh - rng * (extremePct + innerPct)
+
+battleTop = eq + rng * battlePct / 2.0
+battleBot = eq - rng * battlePct / 2.0
+
+extremeBuyBot = ll
+extremeBuyTop = ll + rng * extremePct
+
+buyBot = extremeBuyTop
+buyTop = ll + rng * (extremePct + innerPct)
+
+inExtremeSell = close >= extremeSellBot
+inSell = close < extremeSellBot and close >= sellBot
+inBattle = close <= battleTop and close >= battleBot
+inBuy = close > extremeBuyTop and close <= buyTop
+inExtremeBuy = close <= extremeBuyTop
+
+inSellerArea = inSell or inExtremeSell
+inBuyerArea = inBuy or inExtremeBuy
+inUndervalue = close < eq
+inOvervalue = close > eq
+
+buyerMid = (buyTop + extremeBuyBot) / 2.0
+sellerMid = (extremeSellTop + sellBot) / 2.0
+zoneGap = math.max(sellerMid - buyerMid, 0.0)
+compressionRatio = atr > 0 ? zoneGap / atr : 0.0
+isCompressed = compressionRatio < compressionATR
+wasCompressedRecently = ta.barssince(isCompressed) <= compressionLookback
+
+distFromEqATR = atr > 0 ? math.abs(close - eq) / atr : 0.0
+lineCluster = (fastLine + slowLine) / 2.0
+distFromLineClusterATR = atr > 0 ? math.abs(close - lineCluster) / atr : 0.0
+unfairUp = close > eq and (distFromEqATR > expansionATR or distFromLineClusterATR > expansionATR)
+unfairDn = close < eq and (distFromEqATR > expansionATR or distFromLineClusterATR > expansionATR)
+
+blastUp = wasCompressedRecently and close > battleTop and fastUp and slowUp and linesExpanding
+blastDn = wasCompressedRecently and close < battleBot and fastDn and slowDn and linesExpanding
+
+//====================================================
+// PERSISTENT ZONE BOXES
+//====================================================
+var box bxExtremeSell = na
+var box bxSell = na
+var box bxBattle = na
+var box bxBuy = na
+var box bxExtremeBuy = na
+
+if barstate.isfirst
+    bxExtremeSell := box.new(left=bar_index - rangeLen, top=extremeSellTop, right=bar_index + extendBars, bottom=extremeSellBot, bgcolor=color.new(color.red, 84), border_color=color.new(color.red, 15))
+    bxSell := box.new(left=bar_index - rangeLen, top=sellTop, right=bar_index + extendBars, bottom=sellBot, bgcolor=color.new(color.orange, 86), border_color=color.new(color.red, 35))
+    bxBattle := box.new(left=bar_index - rangeLen, top=battleTop, right=bar_index + extendBars, bottom=battleBot, bgcolor=color.new(color.gray, 88), border_color=color.new(color.gray, 55))
+    bxBuy := box.new(left=bar_index - rangeLen, top=buyTop, right=bar_index + extendBars, bottom=buyBot, bgcolor=color.new(color.teal, 87), border_color=color.new(color.green, 35))
+    bxExtremeBuy := box.new(left=bar_index - rangeLen, top=extremeBuyTop, right=bar_index + extendBars, bottom=extremeBuyBot, bgcolor=color.new(color.blue, 84), border_color=color.new(color.blue, 15))
+else
+    // TODO: Add session-anchored mode so buy/sell/battleground boxes span full session (e.g., 09:15-15:30 IST) instead of rolling `rangeLen` bars.
+    box.set_left(bxExtremeSell, bar_index - rangeLen)
+    box.set_right(bxExtremeSell, bar_index + extendBars)
+    box.set_top(bxExtremeSell, extremeSellTop)
+    box.set_bottom(bxExtremeSell, extremeSellBot)
+    box.set_bgcolor(bxExtremeSell, showZones ? color.new(color.red, 84) : color.new(color.red, 100))
+    box.set_border_color(bxExtremeSell, showZones ? color.new(color.red, 15) : color.new(color.red, 100))
+
+    box.set_left(bxSell, bar_index - rangeLen)
+    box.set_right(bxSell, bar_index + extendBars)
+    box.set_top(bxSell, sellTop)
+    box.set_bottom(bxSell, sellBot)
+    box.set_bgcolor(bxSell, showZones ? color.new(color.orange, 86) : color.new(color.orange, 100))
+    box.set_border_color(bxSell, showZones ? color.new(color.red, 35) : color.new(color.red, 100))
+
+    box.set_left(bxBattle, bar_index - rangeLen)
+    box.set_right(bxBattle, bar_index + extendBars)
+    box.set_top(bxBattle, battleTop)
+    box.set_bottom(bxBattle, battleBot)
+    box.set_bgcolor(bxBattle, showZones ? color.new(color.gray, 88) : color.new(color.gray, 100))
+    box.set_border_color(bxBattle, showZones ? color.new(color.gray, 55) : color.new(color.gray, 100))
+
+    box.set_left(bxBuy, bar_index - rangeLen)
+    box.set_right(bxBuy, bar_index + extendBars)
+    box.set_top(bxBuy, buyTop)
+    box.set_bottom(bxBuy, buyBot)
+    box.set_bgcolor(bxBuy, showZones ? color.new(color.teal, 87) : color.new(color.teal, 100))
+    box.set_border_color(bxBuy, showZones ? color.new(color.green, 35) : color.new(color.green, 100))
+
+    box.set_left(bxExtremeBuy, bar_index - rangeLen)
+    box.set_right(bxExtremeBuy, bar_index + extendBars)
+    box.set_top(bxExtremeBuy, extremeBuyTop)
+    box.set_bottom(bxExtremeBuy, extremeBuyBot)
+    box.set_bgcolor(bxExtremeBuy, showZones ? color.new(color.blue, 84) : color.new(color.blue, 100))
+    box.set_border_color(bxExtremeBuy, showZones ? color.new(color.blue, 15) : color.new(color.blue, 100))
+
+//====================================================
+// STRUCTURE
+//====================================================
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+lastSwingHigh = ta.valuewhen(not na(ph), high[swingLen], 0)
+prevSwingHigh = ta.valuewhen(not na(ph), high[swingLen], 1)
+
+lastSwingLow = ta.valuewhen(not na(pl), low[swingLen], 0)
+prevSwingLow = ta.valuewhen(not na(pl), low[swingLen], 1)
+
+bosUp = not na(lastSwingHigh) and close > lastSwingHigh
+bosDn = not na(lastSwingLow) and close < lastSwingLow
+
+var float bosUpLevel = na
+var float bosDnLevel = na
+var int bosUpBar = na
+var int bosDnBar = na
+
+if bosUp
+    bosUpLevel := lastSwingHigh
+    bosUpBar := bar_index
+
+if bosDn
+    bosDnLevel := lastSwingLow
+    bosDnBar := bar_index
+
+bosUpRetestHold = not na(bosUpLevel) and not na(bosUpBar) and bar_index > bosUpBar and bar_index - bosUpBar <= retestBars and low <= bosUpLevel and close > bosUpLevel
+bosUpRetestFail = not na(bosUpLevel) and not na(bosUpBar) and bar_index > bosUpBar and bar_index - bosUpBar <= retestBars and close < bosUpLevel
+
+bosDnRetestHold = not na(bosDnLevel) and not na(bosDnBar) and bar_index > bosDnBar and bar_index - bosDnBar <= retestBars and high >= bosDnLevel and close < bosDnLevel
+bosDnRetestFail = not na(bosDnLevel) and not na(bosDnBar) and bar_index > bosDnBar and bar_index - bosDnBar <= retestBars and close > bosDnLevel
+
+//====================================================
+// CANDLE / SWEEP / TRAP LOGIC
+//====================================================
+bodyHi = math.max(open, close)
+bodyLo = math.min(open, close)
+upperWick = high - bodyHi
+lowerWick = bodyLo - low
+barRange = math.max(high - low, syminfo.mintick)
+bodySize = math.abs(close - open)
+bodyPct = bodySize / barRange
+upperWickPct = upperWick / barRange
+lowerWickPct = lowerWick / barRange
+
+bullCandle = close > open
+bearCandle = close < open
+
+sweepAbovePrevHigh = not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh
+sweepBelowPrevLow = not na(lastSwingLow) and low < lastSwingLow and close > lastSwingLow
+
+upperSweepStrong = upperWick > atr * wickATRMult
+lowerSweepStrong = lowerWick > atr * wickATRMult
+
+displacementBull = bullCandle and bodySize >= atr * dispATRMult and bodyPct >= dispBodyPct
+displacementBear = bearCandle and bodySize >= atr * dispATRMult and bodyPct >= dispBodyPct
+indecisionCandle = bodyPct <= indecisionBodyPct and upperWick >= bodySize * indecisionWickRatio and lowerWick >= bodySize * indecisionWickRatio
+
+exhaustionTop = inSellerArea and upperWickPct >= exhaustWickPct and bodyPct <= exhaustBodyPct
+exhaustionBottom = inBuyerArea and lowerWickPct >= exhaustWickPct and bodyPct <= exhaustBodyPct
+
+institutionalBuyActivity = inBuyerArea and displacementBull and vol > volMA * instVolMult
+institutionalSellActivity = inSellerArea and displacementBear and vol > volMA * instVolMult
+
+trapTopRaw = (
+    inSellerArea and
+    inOvervalue and
+    (
+        sweepAbovePrevHigh or
+        upperSweepStrong or
+        exhaustionTop
+    ) and
+    bearCandle
+)
+
+trapBottomRaw = (
+    inBuyerArea and
+    inUndervalue and
+    (
+        sweepBelowPrevLow or
+        lowerSweepStrong or
+        exhaustionBottom
+    ) and
+    bullCandle
+)
+
+barsSinceTrapTopRaw = ta.barssince(trapTopRaw)
+barsSinceTrapBottomRaw = ta.barssince(trapBottomRaw)
+
+trapTopTrigger = (
+    not na(barsSinceTrapTopRaw) and
+    barsSinceTrapTopRaw <= reclaimBars and
+    (reclaimFastShortEvent or reclaimSlowShortEvent or close < fastLine or close < slowLine)
+)
+
+trapBottomTrigger = (
+    not na(barsSinceTrapBottomRaw) and
+    barsSinceTrapBottomRaw <= reclaimBars and
+    (reclaimFastLongEvent or reclaimSlowLongEvent or close > fastLine or close > slowLine)
+)
+
+trapTopConfirm = (
+    trapTopTrigger and
+    (bosDn or bosDnRetestHold or displacementBear)
+)
+
+trapBottomConfirm = (
+    trapBottomTrigger and
+    (bosUp or bosUpRetestHold or displacementBull)
+)
+
+trapTopFailed = trapTopRaw and close > high[1]
+trapBottomFailed = trapBottomRaw and close < low[1]
+
+//====================================================
+// MOVING-LINE SCENARIOS
+//====================================================
+bullStack = fastLine > slowLine and slowLine > trendEMA
+bearStack = fastLine < slowLine and slowLine < trendEMA
+mixedStack = not bullStack and not bearStack
+
+priceAboveAllLines = close > fastLine and close > slowLine and close > trendEMA
+priceBelowAllLines = close < fastLine and close < slowLine and close < trendEMA
+
+fastSlopeATR = atr > 0 ? (fastLine - fastLine[2]) / atr : 0.0
+slowSlopeATR = atr > 0 ? (slowLine - slowLine[3]) / atr : 0.0
+trendSlopeATR = atr > 0 ? (trendEMA - trendEMA[5]) / atr : 0.0
+lineClusterSlopeATR = atr > 0 ? (lineCluster - lineCluster[3]) / atr : 0.0
+priceSlopeATR = atr > 0 ? (close - close[3]) / atr : 0.0
+
+linesUpStrong = fastSlopeATR > 0.05 and slowSlopeATR > 0.04 and trendSlopeATR > 0.03
+linesDnStrong = fastSlopeATR < -0.05 and slowSlopeATR < -0.04 and trendSlopeATR < -0.03
+linesUpWeak = fastSlopeATR > 0 and slowSlopeATR > 0 and trendSlopeATR >= 0
+linesDnWeak = fastSlopeATR < 0 and slowSlopeATR < 0 and trendSlopeATR <= 0
+
+trendGap = math.abs(slowLine - trendEMA)
+braidedLines = lineSpread < atr * math.min(lineSpreadATR, 0.20) and trendGap < atr * 0.25
+
+strongBullState = bullStack and linesUpStrong and close > slowLine and not braidedLines
+strongBearState = bearStack and linesDnStrong and close < slowLine and not braidedLines
+
+trendRideLong = bullStack and linesUpWeak and close >= slowLine and not braidedLines
+trendRideShort = bearStack and linesDnWeak and close <= slowLine and not braidedLines
+
+bullishLineDivergence = lineClusterSlopeATR > 0.03 and priceSlopeATR < -0.05 and close < fastLine and inUndervalue and not bearStack
+bearishLineDivergence = lineClusterSlopeATR < -0.03 and priceSlopeATR > 0.05 and close > fastLine and inOvervalue and not bullStack
+
+bullishDivergence = bullishLineDivergence
+bearishDivergence = bearishLineDivergence
+
+belowFastSlow = close < fastLine and close < slowLine
+aboveFastSlow = close > fastLine and close > slowLine
+belowAllLines = close < fastLine and close < slowLine and close < trendEMA
+aboveAllLines = close > fastLine and close > slowLine and close > trendEMA
+
+deepPullbackLong = bullStack and close < trendEMA
+deepPullbackShort = bearStack and close > trendEMA
+
+pullbackFastSlowLong = bullStack and low <= fastLine and close >= slowLine
+pullbackSlowTrendLong = bullStack and low <= slowLine and close >= trendEMA
+pullbackFastSlowShort = bearStack and high >= fastLine and close <= slowLine
+pullbackSlowTrendShort = bearStack and high >= slowLine and close <= trendEMA
+
+travelWithLinesLongState = trendRideLong and (pullbackFastSlowLong or pullbackSlowTrendLong)
+travelWithLinesShortState = trendRideShort and (pullbackFastSlowShort or pullbackSlowTrendShort)
+
+var int bullTouchCount = 0
+var int bearTouchCount = 0
+
+newBullTrend = bullStack and not bullStack[1]
+newBearTrend = bearStack and not bearStack[1]
+
+bullPocketTouch = bullStack and (low <= fastLine or low <= slowLine) and close > trendEMA and not (low[1] <= fastLine[1] or low[1] <= slowLine[1])
+bearPocketTouch = bearStack and (high >= fastLine or high >= slowLine) and close < trendEMA and not (high[1] >= fastLine[1] or high[1] >= slowLine[1])
+
+if newBullTrend or deepPullbackLong or bearStack
+    bullTouchCount := 0
+else if bullPocketTouch
+    bullTouchCount += 1
+
+if newBearTrend or deepPullbackShort or bullStack
+    bearTouchCount := 0
+else if bearPocketTouch
+    bearTouchCount += 1
+
+deepReclaimLong = bullStack and bullTouchCount > maxContinuationTouches and low <= slowLine and close > fastLine and close > slowLine
+deepReclaimShort = bearStack and bearTouchCount > maxContinuationTouches and high >= slowLine and close < fastLine and close < slowLine
+
+if deepReclaimLong or (bullTouchCount > maxContinuationTouches and (bosUpRetestHold or displacementBull))
+    bullTouchCount := 0
+if deepReclaimShort or (bearTouchCount > maxContinuationTouches and (bosDnRetestHold or displacementBear))
+    bearTouchCount := 0
+
+firstOrSecondBullTouch = bullTouchCount > 0 and bullTouchCount <= maxContinuationTouches
+firstOrSecondBearTouch = bearTouchCount > 0 and bearTouchCount <= maxContinuationTouches
+
+longBodyStrong = close > open and (close - open) >= atr * 0.08
+shortBodyStrong = close < open and (open - close) >= atr * 0.08
+
+goldenOpportunityLong = (inBuyerArea or inUndervalue) and belowFastSlow and (bullStack or linesUpWeak or bullishLineDivergence)
+goldenOpportunityShort = (inSellerArea or inOvervalue) and aboveFastSlow and (bearStack or linesDnWeak or bearishLineDivergence)
+
+barsSinceGoldenLong = ta.barssince(goldenOpportunityLong)
+barsSinceGoldenShort = ta.barssince(goldenOpportunityShort)
+
+reclaimLongState = (
+    not braidedLines and
+    not na(barsSinceGoldenLong) and
+    barsSinceGoldenLong <= reclaimBars and
+    close > fastLine and
+    close > slowLine
+)
+
+reclaimShortState = (
+    not braidedLines and
+    not na(barsSinceGoldenShort) and
+    barsSinceGoldenShort <= reclaimBars and
+    close < fastLine and
+    close < slowLine
+)
+
+reclaimLongImpulse = reclaimFastLongEvent or reclaimSlowLongEvent or fastCrossAboveSlow or (bullStack and longBodyStrong and (close[1] <= fastLine[1] or close[1] <= slowLine[1]))
+reclaimShortImpulse = reclaimFastShortEvent or reclaimSlowShortEvent or fastCrossBelowSlow or (bearStack and shortBodyStrong and (close[1] >= fastLine[1] or close[1] >= slowLine[1]))
+reclaimLongRaw = reclaimLongState and reclaimLongImpulse
+reclaimShortRaw = reclaimShortState and reclaimShortImpulse
+reclaimLongEvent = reclaimLongRaw and not reclaimLongRaw[1]
+reclaimShortEvent = reclaimShortRaw and not reclaimShortRaw[1]
+barsSinceReclaimLongEvent = ta.barssince(reclaimLongEvent)
+barsSinceReclaimShortEvent = ta.barssince(reclaimShortEvent)
+reclaimLongRecent = not na(barsSinceReclaimLongEvent) and barsSinceReclaimLongEvent <= eventMemoryBars
+reclaimShortRecent = not na(barsSinceReclaimShortEvent) and barsSinceReclaimShortEvent <= eventMemoryBars
+
+continuationLongSpreadOK = linesExpanding or (lineSpreadSlopeATR >= -spreadSlopeThresh * 1.5 and (strongBullState or bullStack) and (longBodyStrong or displacementBull))
+continuationShortSpreadOK = linesExpanding or (lineSpreadSlopeATR >= -spreadSlopeThresh * 1.5 and (strongBearState or bearStack) and (shortBodyStrong or displacementBear))
+continuationLongState = not braidedLines and trendRideLong and firstOrSecondBullTouch and close >= fastLine and continuationLongSpreadOK
+continuationShortState = not braidedLines and trendRideShort and firstOrSecondBearTouch and close <= fastLine and continuationShortSpreadOK
+continuationLongTrigger = continuationLongState and bullPocketTouch and (longBodyStrong or displacementBull)
+continuationShortTrigger = continuationShortState and bearPocketTouch and (shortBodyStrong or displacementBear)
+continuationLongEvent = continuationLongTrigger and not continuationLongTrigger[1]
+continuationShortEvent = continuationShortTrigger and not continuationShortTrigger[1]
+barsSinceContinuationLongEvent = ta.barssince(continuationLongEvent)
+barsSinceContinuationShortEvent = ta.barssince(continuationShortEvent)
+continuationLongRecent = not na(barsSinceContinuationLongEvent) and barsSinceContinuationLongEvent <= eventMemoryBars
+continuationShortRecent = not na(barsSinceContinuationShortEvent) and barsSinceContinuationShortEvent <= eventMemoryBars
+slowLineLossAcceptedLong = close < slowLine and close[1] < slowLine[1]
+slowLineRecoveryAcceptedShort = close > slowLine and close[1] > slowLine[1]
+
+failedBearReclaimLongState = bullStack and close > trendEMA and reclaimShortRecent and (low <= fastLine or low <= slowLine)
+failedBullReclaimShortState = bearStack and close < trendEMA and reclaimLongRecent and (high >= fastLine or high >= slowLine)
+
+directionalLongBias = bullStack or (fastLine > slowLine and fastUp and slowUp and close > trendEMA)
+directionalShortBias = bearStack or (fastLine < slowLine and fastDn and slowDn and close < trendEMA)
+pullbackResolvedLong = close > fastLine and close > slowLine and (close[1] <= fastLine[1] or low <= fastLine or low <= slowLine or reclaimShortRecent)
+pullbackResolvedShort = close < fastLine and close < slowLine and (close[1] >= fastLine[1] or high >= fastLine or high >= slowLine or reclaimLongRecent)
+trendResumptionLongSpreadOK = linesExpanding or lineSpreadSlopeATR >= -spreadSlopeThresh * 1.5
+trendResumptionShortSpreadOK = linesExpanding or lineSpreadSlopeATR >= -spreadSlopeThresh * 1.5
+trendResumptionLongRaw = directionalLongBias and pullbackResolvedLong and (longBodyStrong or displacementBull or bosUp) and not braidedLines and trendResumptionLongSpreadOK
+trendResumptionShortRaw = directionalShortBias and pullbackResolvedShort and (shortBodyStrong or displacementBear or bosDn) and not braidedLines and trendResumptionShortSpreadOK
+trendResumptionLongEvent = trendResumptionLongRaw and not trendResumptionLongRaw[1] and not reclaimLongEvent and not continuationLongEvent
+trendResumptionShortEvent = trendResumptionShortRaw and not trendResumptionShortRaw[1] and not reclaimShortEvent and not continuationShortEvent
+barsSinceTrendResumptionLongEvent = ta.barssince(trendResumptionLongEvent)
+barsSinceTrendResumptionShortEvent = ta.barssince(trendResumptionShortEvent)
+trendResumptionLongRecent = not na(barsSinceTrendResumptionLongEvent) and barsSinceTrendResumptionLongEvent <= eventMemoryBars
+trendResumptionShortRecent = not na(barsSinceTrendResumptionShortEvent) and barsSinceTrendResumptionShortEvent <= eventMemoryBars
+
+loseLongControl = (trendRideLong[1] or reclaimLongRecent[1] or continuationLongRecent[1]) and (close < trendEMA or bearStack or fastCrossBelowSlow or slowLineLossAcceptedLong)
+loseShortControl = (trendRideShort[1] or reclaimShortRecent[1] or continuationShortRecent[1]) and (close > trendEMA or bullStack or fastCrossAboveSlow or slowLineRecoveryAcceptedShort)
+
+//====================================================
+// W / M PATTERN ENGINE
+//====================================================
+wBottomReady = (
+    not na(lastSwingLow) and
+    not na(prevSwingLow) and
+    lastSwingLow > prevSwingLow and
+    inBuyerArea and
+    close > fastLine
+)
+
+mTopReady = (
+    not na(lastSwingHigh) and
+    not na(prevSwingHigh) and
+    lastSwingHigh < prevSwingHigh and
+    inSellerArea and
+    close < fastLine
+)
+
+wBottomConfirm = wBottomReady and (
+    bosUpRetestHold or
+    (bosUp and reclaimLongRecent) or
+    (reclaimLongRecent and displacementBull and close > slowLine)
+)
+mTopConfirm = mTopReady and (
+    bosDnRetestHold or
+    (bosDn and reclaimShortRecent) or
+    (reclaimShortRecent and displacementBear and close < slowLine)
+)
+
+//====================================================
+// SETUP / TRIGGER / CONFIRM / INVALIDATE
+//====================================================
+buyBottomRaw = inBuyerArea and (sweepBelowPrevLow or exhaustionBottom or trapBottomRaw)
+barsSinceBuyBottomRaw = ta.barssince(buyBottomRaw)
+buyBottomTrigger = not na(barsSinceBuyBottomRaw) and barsSinceBuyBottomRaw <= reclaimBars and (reclaimLongEvent or reclaimFastLongEvent or reclaimSlowLongEvent)
+buyBottomConfirm = buyBottomTrigger and (bosUp or bosUpRetestHold or wBottomConfirm or displacementBull)
+buyBottomInvalid = close < extremeBuyBot or trapBottomFailed or bosUpRetestFail or loseLongControl
+
+trapTopModuleRaw = trapTopRaw
+trapTopModuleTrigger = trapTopTrigger
+trapTopModuleConfirm = trapTopConfirm or mTopConfirm
+trapTopModuleInvalid = close > extremeSellTop or trapTopFailed or bosDnRetestFail or loseShortControl
+
+trapBottomModuleRaw = trapBottomRaw
+trapBottomModuleTrigger = trapBottomTrigger
+trapBottomModuleConfirm = trapBottomConfirm
+trapBottomModuleInvalid = close < extremeBuyBot or trapBottomFailed or bosUpRetestFail or loseLongControl
+
+setupLong = goldenOpportunityLong or buyBottomRaw or trapBottomModuleRaw or bullishDivergence or travelWithLinesLongState or failedBearReclaimLongState
+triggerLong = reclaimLongEvent or continuationLongEvent or buyBottomTrigger or trapBottomModuleTrigger
+triggerLong := triggerLong or trendResumptionLongEvent
+confirmLong = buyBottomConfirm or trapBottomModuleConfirm or wBottomConfirm or bosUp or bosUpRetestHold or blastUp or strongBullState or trendRideLong
+
+setupShort = goldenOpportunityShort or trapTopModuleRaw or bearishDivergence or travelWithLinesShortState or failedBullReclaimShortState
+triggerShort = reclaimShortEvent or continuationShortEvent or trapTopModuleTrigger
+triggerShort := triggerShort or trendResumptionShortEvent
+confirmShort = trapTopModuleConfirm or mTopConfirm or bosDn or bosDnRetestHold or blastDn or strongBearState or trendRideShort
+
+oppositeBearIntact = bearStack and close < slowLine and close < trendEMA and not reclaimLongRecent
+oppositeBullIntact = bullStack and close > slowLine and close > trendEMA and not reclaimShortRecent
+
+stackRepairLong = close > slowLine and fastUp and (fastCrossAboveSlow or not bearStack or close > trendEMA)
+stackRepairShort = close < slowLine and fastDn and (fastCrossBelowSlow or not bullStack or close < trendEMA)
+
+reversalLongAuthorized = (
+    inBuyerArea and
+    reclaimLongRecent and
+    (bosUpRetestHold or bosUp) and
+    (wBottomConfirm or trapBottomConfirm or bullishDivergence) and
+    stackRepairLong
+)
+
+reversalShortAuthorized = (
+    inSellerArea and
+    reclaimShortRecent and
+    (bosDnRetestHold or bosDn) and
+    (mTopConfirm or trapTopConfirm or bearishDivergence) and
+    stackRepairShort
+)
+
+validLongPre = setupLong and triggerLong and confirmLong and htfLongAligned and not braidedLines and (not oppositeBearIntact or reversalLongAuthorized)
+validShortPre = setupShort and triggerShort and confirmShort and htfShortAligned and not braidedLines and (not oppositeBullIntact or reversalShortAuthorized)
+
+rawInvalidLong = buyBottomInvalid or trapBottomModuleInvalid
+rawInvalidShort = trapTopModuleInvalid
+
+validLong = validLongPre and not rawInvalidLong
+validShort = validShortPre and not rawInvalidShort
+
+string longInvalidReason = "None"
+float longInvalidPrice = na
+if close < extremeBuyBot
+    longInvalidReason := "Lost Extreme Buy"
+    longInvalidPrice := extremeBuyBot
+else if bosUpRetestFail
+    longInvalidReason := "BOS Up Retest Failed"
+    longInvalidPrice := bosUpLevel
+else if trapBottomFailed
+    longInvalidReason := "Trap Bottom Failed"
+    longInvalidPrice := low[1]
+else if loseLongControl
+    longInvalidReason := "Lost Fast/Slow Reclaim"
+    longInvalidPrice := lineCluster
+
+string shortInvalidReason = "None"
+float shortInvalidPrice = na
+if close > extremeSellTop
+    shortInvalidReason := "Lost Extreme Sell"
+    shortInvalidPrice := extremeSellTop
+else if bosDnRetestFail
+    shortInvalidReason := "BOS Down Retest Failed"
+    shortInvalidPrice := bosDnLevel
+else if trapTopFailed
+    shortInvalidReason := "Trap Top Failed"
+    shortInvalidPrice := high[1]
+else if loseShortControl
+    shortInvalidReason := "Lost Fast/Slow Reclaim"
+    shortInvalidPrice := lineCluster
+
+continuationLong = (trendRideLong or strongBullState) and (reclaimLongEvent or continuationLongEvent)
+continuationLong := continuationLong or trendResumptionLongEvent
+reversalLong = reversalLongAuthorized
+
+continuationShort = (trendRideShort or strongBearState) and (reclaimShortEvent or continuationShortEvent)
+continuationShort := continuationShort or trendResumptionShortEvent
+reversalShort = reversalShortAuthorized
+
+//====================================================
+// SCORING ENGINE
+//====================================================
+weightTotal = math.max(weightTrend + weightValue + weightStructure + weightCompression + weightHTF, 1)
+trendW = weightTrend / weightTotal
+valueW = weightValue / weightTotal
+structureW = weightStructure / weightTotal
+compressionW = weightCompression / weightTotal
+htfW = weightHTF / weightTotal
+
+trendBiasBoost = isRideTfBucket ? 1.15 : isMidTfBucket ? 1.08 : 1.0
+setupWeightBoost = isLowTfBucket ? 1.12 : isMidTfBucket ? 1.0 : 0.95
+biasMix = isRideTfBucket ? 0.65 : isMidTfBucket ? 0.56 : 0.42
+countertrendPenalty = isRideTfBucket ? 24.0 : isMidTfBucket ? 14.0 : 6.0
+reentryCooldownBars = isLowTfBucket ? exitCooldownBars + 3 : exitCooldownBars + 1
+
+bullBiasRepair = stackRepairLong and (reclaimLongRecent or bosUp or bosUpRetestHold or close > trendEMA)
+bearBiasRepair = stackRepairShort and (reclaimShortRecent or bosDn or bosDnRetestHold or close < trendEMA)
+primaryBullEvidenceBase = bullStack and (close > slowLine or close > trendEMA) and (htfBull or not useHTF or trendRideLong or strongBullState)
+primaryBearEvidenceBase = bearStack and (close < slowLine or close < trendEMA) and (htfBear or not useHTF or trendRideShort or strongBearState)
+lowTfBullBiasReady = close > slowLine and close > trendEMA and bullStack and reclaimLongRecent and (bosUp or bosUpRetestHold or strongBullState)
+lowTfBearBiasReady = close < slowLine and close < trendEMA and bearStack and reclaimShortRecent and (bosDn or bosDnRetestHold or strongBearState)
+primaryBullEvidence = isLowTfBucket ? (lowTfBullBiasReady and not htfBear) : primaryBullEvidenceBase
+primaryBearEvidence = isLowTfBucket ? (primaryBearEvidenceBase or (htfBear and close < trendEMA) or bearStack or lowTfBearBiasReady) : primaryBearEvidenceBase
+flipToBullAuthorized = isLowTfBucket ? (reversalLongAuthorized or (lowTfBullBiasReady and not htfBear and not bearStack)) : bullBiasRepair and (htfBull or bullStack or (close > slowLine and close > trendEMA))
+flipToBearAuthorized = isLowTfBucket ? (reversalShortAuthorized or (lowTfBearBiasReady and not htfBull and not bullStack)) : bearBiasRepair and (htfBear or bearStack or (close < slowLine and close < trendEMA))
+
+var int primaryBiasState = PRIMARY_NEUTRAL
+if barstate.isfirst
+    primaryBiasState := primaryBearEvidence ? PRIMARY_BEAR : primaryBullEvidence ? PRIMARY_BULL : PRIMARY_NEUTRAL
+else if useContinuationBias
+    if primaryBiasState == PRIMARY_BEAR
+        if flipToBullAuthorized
+            primaryBiasState := PRIMARY_BULL
+        else if primaryBearEvidence
+            primaryBiasState := PRIMARY_BEAR
+        else if isLowTfBucket and htfBear
+            primaryBiasState := PRIMARY_BEAR
+        else if not primaryBullEvidence and close > slowLine and close > trendEMA and not htfBear
+            primaryBiasState := PRIMARY_NEUTRAL
+    else if primaryBiasState == PRIMARY_BULL
+        if flipToBearAuthorized
+            primaryBiasState := PRIMARY_BEAR
+        else if primaryBullEvidence
+            primaryBiasState := PRIMARY_BULL
+        else if isLowTfBucket and htfBull
+            primaryBiasState := PRIMARY_BULL
+        else if isLowTfBucket and htfBear and not flipToBullAuthorized
+            primaryBiasState := PRIMARY_NEUTRAL
+        else if not primaryBearEvidence and close < slowLine and close < trendEMA and not htfBull
+            primaryBiasState := PRIMARY_NEUTRAL
+    else
+        primaryBiasState := primaryBearEvidence ? PRIMARY_BEAR : primaryBullEvidence ? PRIMARY_BULL : PRIMARY_NEUTRAL
+else
+    primaryBiasState := primaryBearEvidence ? PRIMARY_BEAR : primaryBullEvidence ? PRIMARY_BULL : PRIMARY_NEUTRAL
+
+int longTradeArchetype = ARCH_NONE
+int shortTradeArchetype = ARCH_NONE
+
+if reversalLongAuthorized
+    longTradeArchetype := ARCH_REVERSAL
+else if primaryBiasState == PRIMARY_BEAR and (inBuyerArea or reclaimLongState or validLong or bullishDivergence)
+    longTradeArchetype := ARCH_COUNTERTREND_BOUNCE
+else if primaryBiasState == PRIMARY_BULL and (trendRideLong or strongBullState or continuationLongState or continuationLongEvent or trendResumptionLongEvent)
+    longTradeArchetype := ARCH_TREND_RIDE
+
+if reversalShortAuthorized
+    shortTradeArchetype := ARCH_REVERSAL
+else if primaryBiasState == PRIMARY_BULL and (inSellerArea or reclaimShortState or validShort or bearishDivergence)
+    shortTradeArchetype := ARCH_COUNTERTREND_BOUNCE
+else if primaryBiasState == PRIMARY_BEAR and (trendRideShort or strongBearState or continuationShortState or continuationShortEvent or trendResumptionShortEvent)
+    shortTradeArchetype := ARCH_TREND_RIDE
+
+longCountertrendContext = primaryBiasState == PRIMARY_BEAR and not reversalLongAuthorized
+shortCountertrendContext = primaryBiasState == PRIMARY_BULL and not reversalShortAuthorized
+longCountertrendEvidence = inBuyerArea or reclaimFastLongEvent or reclaimLongState or validLong or setupLong or triggerLong or confirmLong or bullishDivergence or failedBearReclaimLongState
+shortCountertrendEvidence = inSellerArea or reclaimFastShortEvent or reclaimShortState or validShort or setupShort or triggerShort or confirmShort or bearishDivergence or failedBullReclaimShortState
+
+if longCountertrendContext and longTradeArchetype == ARCH_NONE and longCountertrendEvidence
+    longTradeArchetype := ARCH_COUNTERTREND_BOUNCE
+else if primaryBiasState == PRIMARY_BULL and longTradeArchetype == ARCH_NONE and (trendRideLong or strongBullState or continuationLongState or continuationLongEvent or trendResumptionLongEvent)
+    longTradeArchetype := ARCH_TREND_RIDE
+
+if shortCountertrendContext and shortTradeArchetype == ARCH_NONE and shortCountertrendEvidence
+    shortTradeArchetype := ARCH_COUNTERTREND_BOUNCE
+else if primaryBiasState == PRIMARY_BEAR and shortTradeArchetype == ARCH_NONE and (trendRideShort or strongBearState or continuationShortState or continuationShortEvent or trendResumptionShortEvent)
+    shortTradeArchetype := ARCH_TREND_RIDE
+
+longTrendComp = strongBullState ? 100.0 : trendRideLong ? 88.0 : priceAboveLines ? 72.0 : (reclaimLongState or continuationLongState or continuationLongEvent or trendResumptionLongEvent or failedBearReclaimLongState) ? 64.0 : bullishDivergence ? 46.0 : 20.0
+shortTrendComp = strongBearState ? 100.0 : trendRideShort ? 88.0 : priceBelowLines ? 72.0 : (reclaimShortState or continuationShortState or continuationShortEvent or trendResumptionShortEvent or failedBullReclaimShortState) ? 64.0 : bearishDivergence ? 46.0 : 20.0
+longCompressionComp = blastUp ? 100.0 : (isCompressed and close > battleTop ? 75.0 : isCompressed ? 50.0 : 20.0)
+shortCompressionComp = blastDn ? 100.0 : (isCompressed and close < battleBot ? 75.0 : isCompressed ? 50.0 : 20.0)
+longHTFComp = not useHTF ? 50.0 : htfBull ? (htfInBuyerArea ? 96.0 : htfInBattle ? 78.0 : 66.0) : 20.0
+shortHTFComp = not useHTF ? 50.0 : htfBear ? (htfInSellerArea ? 96.0 : htfInBattle ? 78.0 : 66.0) : 20.0
+
+longBiasStructureComp = reversalLongAuthorized ? 92.0 : bullBiasRepair ? 74.0 : bosUpRetestHold ? 68.0 : bosUp ? 60.0 : 24.0
+shortBiasStructureComp = reversalShortAuthorized ? 92.0 : bearBiasRepair ? 74.0 : bosDnRetestHold ? 68.0 : bosDn ? 60.0 : 24.0
+
+longBiasTrendComp = primaryBiasState == PRIMARY_BULL ? math.max(longTrendComp, 78.0) : primaryBiasState == PRIMARY_BEAR and not reversalLongAuthorized ? math.min(longTrendComp, 26.0) : longTrendComp
+shortBiasTrendComp = primaryBiasState == PRIMARY_BEAR ? math.max(shortTrendComp, 78.0) : primaryBiasState == PRIMARY_BULL and not reversalShortAuthorized ? math.min(shortTrendComp, 26.0) : shortTrendComp
+
+longSetupLocationComp = inExtremeBuy ? 95.0 : inBuy ? 82.0 : inUndervalue ? 62.0 : inBattle ? 36.0 : 14.0
+shortSetupLocationComp = inExtremeSell ? 95.0 : inSell ? 82.0 : inOvervalue ? 62.0 : inBattle ? 36.0 : 14.0
+
+if useLocationPenaltyModel and primaryBiasState == PRIMARY_BEAR
+    longSetupLocationComp := inExtremeBuy ? 62.0 : inBuy ? 54.0 : inUndervalue ? 46.0 : inBattle ? 30.0 : 14.0
+    shortSetupLocationComp := inExtremeSell ? 92.0 : inSell ? 84.0 : inOvervalue ? 72.0 : inBattle ? 54.0 : inBuy ? 36.0 : 28.0
+
+if useLocationPenaltyModel and primaryBiasState == PRIMARY_BULL
+    shortSetupLocationComp := inExtremeSell ? 62.0 : inSell ? 54.0 : inOvervalue ? 46.0 : inBattle ? 30.0 : 14.0
+    longSetupLocationComp := inExtremeBuy ? 92.0 : inBuy ? 84.0 : inUndervalue ? 72.0 : inBattle ? 54.0 : inSell ? 36.0 : 28.0
+
+longSetupStructureComp = buyBottomConfirm ? 92.0 : wBottomConfirm ? 88.0 : bosUpRetestHold ? 82.0 : bosUp ? 72.0 : trapBottomModuleConfirm ? 68.0 : buyBottomTrigger ? 56.0 : reclaimLongEvent ? 64.0 : continuationLongEvent ? 52.0 : 20.0
+shortSetupStructureComp = trapTopModuleConfirm ? 92.0 : mTopConfirm ? 88.0 : bosDnRetestHold ? 82.0 : bosDn ? 72.0 : trapTopTrigger ? 56.0 : reclaimShortEvent ? 64.0 : continuationShortEvent ? 52.0 : 20.0
+
+biasWeightRaw = trendW * trendBiasBoost + structureW * 0.40 + htfW * trendBiasBoost
+setupWeightRaw = valueW * setupWeightBoost + structureW * 0.60 + compressionW * setupWeightBoost
+
+longBiasScoreRaw = (longBiasTrendComp * (trendW * trendBiasBoost) + longBiasStructureComp * (structureW * 0.40) + longHTFComp * (htfW * trendBiasBoost)) / math.max(biasWeightRaw, 0.0001)
+shortBiasScoreRaw = (shortBiasTrendComp * (trendW * trendBiasBoost) + shortBiasStructureComp * (structureW * 0.40) + shortHTFComp * (htfW * trendBiasBoost)) / math.max(biasWeightRaw, 0.0001)
+longSetupScoreRaw = (longSetupLocationComp * (valueW * setupWeightBoost) + longSetupStructureComp * (structureW * 0.60) + longCompressionComp * (compressionW * setupWeightBoost)) / math.max(setupWeightRaw, 0.0001)
+shortSetupScoreRaw = (shortSetupLocationComp * (valueW * setupWeightBoost) + shortSetupStructureComp * (structureW * 0.60) + shortCompressionComp * (compressionW * setupWeightBoost)) / math.max(setupWeightRaw, 0.0001)
+
+bearishLocationTrap = (isMidTfBucket or isRideTfBucket) and primaryBiasState == PRIMARY_BEAR and htfBear and bearStack and close <= slowLine and inBuyerArea and not reversalLongAuthorized
+bullishLocationTrap = (isMidTfBucket or isRideTfBucket) and primaryBiasState == PRIMARY_BULL and htfBull and bullStack and close >= slowLine and inSellerArea and not reversalShortAuthorized
+
+if oppositeBearIntact and not reversalLongAuthorized
+    longBiasScoreRaw := math.min(longBiasScoreRaw, 32.0)
+    longSetupScoreRaw := math.min(longSetupScoreRaw, isLowTfBucket ? 54.0 : 42.0)
+
+if oppositeBullIntact and not reversalShortAuthorized
+    shortBiasScoreRaw := math.min(shortBiasScoreRaw, 32.0)
+    shortSetupScoreRaw := math.min(shortSetupScoreRaw, isLowTfBucket ? 54.0 : 42.0)
+
+if bearishLocationTrap
+    longSetupScoreRaw := math.max(longSetupScoreRaw - countertrendPenalty, 0.0)
+    shortBiasScoreRaw := math.min(shortBiasScoreRaw + 6.0, 100.0)
+
+if bullishLocationTrap
+    shortSetupScoreRaw := math.max(shortSetupScoreRaw - countertrendPenalty, 0.0)
+    longBiasScoreRaw := math.min(longBiasScoreRaw + 6.0, 100.0)
+
+longBiasScore = int(math.round(math.min(math.max(longBiasScoreRaw, 0.0), 100.0)))
+shortBiasScore = int(math.round(math.min(math.max(shortBiasScoreRaw, 0.0), 100.0)))
+longSetupScore = int(math.round(math.min(math.max(longSetupScoreRaw, 0.0), 100.0)))
+shortSetupScore = int(math.round(math.min(math.max(shortSetupScoreRaw, 0.0), 100.0)))
+
+longScoreRaw = longBiasScoreRaw * biasMix + longSetupScoreRaw * (1.0 - biasMix)
+shortScoreRaw = shortBiasScoreRaw * biasMix + shortSetupScoreRaw * (1.0 - biasMix)
+
+longScore = int(math.round(math.min(math.max(longScoreRaw, 0.0), 100.0)))
+shortScore = int(math.round(math.min(math.max(shortScoreRaw, 0.0), 100.0)))
+longScoreEdge = longScore - shortScore
+shortScoreEdge = shortScore - longScore
+longExecutionScoreOk = not useScoreExecutionGate or (longScore >= minExecutionScore and longScoreEdge >= minExecutionEdge)
+shortExecutionScoreOk = not useScoreExecutionGate or (shortScore >= minExecutionScore and shortScoreEdge >= minExecutionEdge)
+
+setupLongEvent = setupLong and not setupLong[1]
+triggerLongEvent = triggerLong and not triggerLong[1]
+confirmLongEvent = confirmLong and not confirmLong[1]
+setupShortEvent = setupShort and not setupShort[1]
+triggerShortEvent = triggerShort and not triggerShort[1]
+confirmShortEvent = confirmShort and not confirmShort[1]
+validLongEvent = validLong and not validLong[1]
+validShortEvent = validShort and not validShort[1]
+reversalLongEvent = reversalLongAuthorized and not reversalLongAuthorized[1]
+reversalShortEvent = reversalShortAuthorized and not reversalShortAuthorized[1]
+
+longTouchOK = bullTouchCount <= maxContinuationTouches or not bullStack
+shortTouchOK = bearTouchCount <= maxContinuationTouches or not bearStack
+longContinuationFailLevel = slowLine
+shortContinuationFailLevel = slowLine
+longReversalFailLevel = math.max(extremeBuyBot, nz(bosUpLevel, extremeBuyBot))
+shortReversalFailLevel = math.min(extremeSellTop, nz(bosDnLevel, extremeSellTop))
+longContinuationRoomATR = atr > 0 ? (close - longContinuationFailLevel) / atr : 0.0
+shortContinuationRoomATR = atr > 0 ? (shortContinuationFailLevel - close) / atr : 0.0
+longReversalRoomATR = atr > 0 ? (close - longReversalFailLevel) / atr : 0.0
+shortReversalRoomATR = atr > 0 ? (shortReversalFailLevel - close) / atr : 0.0
+longContinuationRoomOK = longContinuationRoomATR >= 0.20
+shortContinuationRoomOK = shortContinuationRoomATR >= 0.20
+longReversalRoomOK = longReversalRoomATR >= 0.35
+shortReversalRoomOK = shortReversalRoomATR >= 0.35
+
+htfLongScalpAligned = htfLongAligned
+htfShortScalpAligned = htfShortAligned
+
+var bool inLongCampaign = false
+var bool inShortCampaign = false
+var int longEntryBar = na
+var int shortEntryBar = na
+var float longEntryFailLevel = na
+var float shortEntryFailLevel = na
+var int lastLongExitBar = na
+var int lastShortExitBar = na
+var int campaignSide = CAMPAIGN_NONE
+var int campaignType = ARCH_NONE
+var int campaignStartBar = na
+var bool campaignRepairSeen = false
+var bool campaignInvalidated = false
+var int lastCutSide = CAMPAIGN_NONE
+var int lastCutSideBar = na
+var int bounceAttemptCount = 0
+
+freshLongRepairSequence = reclaimLongEvent or bosUpRetestHold or wBottomConfirm or (not na(lastSwingLow) and not na(prevSwingLow) and lastSwingLow > prevSwingLow and close > fastLine)
+freshShortRepairSequence = reclaimShortEvent or bosDnRetestHold or mTopConfirm or (not na(lastSwingHigh) and not na(prevSwingHigh) and lastSwingHigh < prevSwingHigh and close < fastLine)
+
+longReentryCooldownActive = useReentryCooldown and primaryBiasState == PRIMARY_BEAR and lastCutSide == CAMPAIGN_LONG and not na(lastCutSideBar) and bar_index - lastCutSideBar <= reentryCooldownBars and not freshLongRepairSequence
+shortReentryCooldownActive = useReentryCooldown and primaryBiasState == PRIMARY_BULL and lastCutSide == CAMPAIGN_SHORT and not na(lastCutSideBar) and bar_index - lastCutSideBar <= reentryCooldownBars and not freshShortRepairSequence
+
+dominantBearCampaign = primaryBiasState == PRIMARY_BEAR and bearStack and htfBear and close < slowLine and not reversalLongAuthorized
+dominantBullCampaign = primaryBiasState == PRIMARY_BULL and bullStack and htfBull and close > slowLine and not reversalShortAuthorized
+
+longVeto = rawInvalidLong or braidedLines or loseLongControl or (oppositeBearIntact and not reversalLongAuthorized) or (bearishLocationTrap and not isLowTfBucket) or longReentryCooldownActive
+shortVeto = rawInvalidShort or braidedLines or loseShortControl or (oppositeBullIntact and not reversalShortAuthorized) or (bullishLocationTrap and not isLowTfBucket) or shortReentryCooldownActive
+
+barsSinceFastReclaimLong = ta.barssince(reclaimFastLongEvent)
+barsSinceFastReclaimShort = ta.barssince(reclaimFastShortEvent)
+longSlowGrace = close > slowLine or (not na(barsSinceFastReclaimLong) and barsSinceFastReclaimLong <= 1)
+shortSlowGrace = close < slowLine or (not na(barsSinceFastReclaimShort) and barsSinceFastReclaimShort <= 1)
+freshFastLongReclaim = not na(barsSinceFastReclaimLong) and barsSinceFastReclaimLong <= (isLowTfBucket ? 1 : 2)
+freshFastShortReclaim = not na(barsSinceFastReclaimShort) and barsSinceFastReclaimShort <= (isLowTfBucket ? 1 : 2)
+lowTfLongBounceOK = isLowTfBucket and freshFastLongReclaim and (longBodyStrong or displacementBull) and (not dominantBearCampaign or reversalLongAuthorized or bullBiasRepair) and (close > slowLine or close[1] <= slowLine[1])
+lowTfShortBounceOK = isLowTfBucket and freshFastShortReclaim and (shortBodyStrong or displacementBear) and (not dominantBullCampaign or reversalShortAuthorized or bearBiasRepair) and (close < slowLine or close[1] >= slowLine[1])
+
+buyEarly = not inLongCampaign and not longVeto and not rawInvalidLong and not braidedLines and htfLongScalpAligned and longContinuationRoomOK and (
+    lowTfLongBounceOK or
+    (not isLowTfBucket and not dominantBearCampaign and reclaimFastLongEvent and fastUp and close > trendEMA) or
+    (not isLowTfBucket and reclaimLongEvent and displacementBull and (primaryBiasState != PRIMARY_BEAR or reversalLongAuthorized))
+)
+sellEarly = not inShortCampaign and not shortVeto and not rawInvalidShort and not braidedLines and htfShortScalpAligned and shortContinuationRoomOK and (
+    lowTfShortBounceOK or
+    (not isLowTfBucket and not dominantBullCampaign and reclaimFastShortEvent and fastDn and close < trendEMA) or
+    (not isLowTfBucket and reclaimShortEvent and displacementBear and (primaryBiasState != PRIMARY_BULL or reversalShortAuthorized))
+)
+
+thesisMemoryBars = math.max(math.max(reclaimBars, eventMemoryBars), retestBars)
+recentLongCampaign = inLongCampaign or (not na(longEntryBar) and bar_index - longEntryBar <= thesisMemoryBars)
+recentShortCampaign = inShortCampaign or (not na(shortEntryBar) and bar_index - shortEntryBar <= thesisMemoryBars)
+
+bounceFailureMemoryBars = math.max(thesisMemoryBars, math.max(retestBars, eventMemoryBars) * 2)
+barsSinceReclaimLongEventForBounce = ta.barssince(reclaimLongEvent)
+barsSinceTrendResumptionLongEventForBounce = ta.barssince(trendResumptionLongEvent)
+barsSinceReclaimShortEventForBounce = ta.barssince(reclaimShortEvent)
+barsSinceTrendResumptionShortEventForBounce = ta.barssince(trendResumptionShortEvent)
+
+recentLongBounceAttempt = (not na(lastLongExitBar) and bar_index - lastLongExitBar <= bounceFailureMemoryBars) or (not na(barsSinceReclaimLongEventForBounce) and barsSinceReclaimLongEventForBounce <= bounceFailureMemoryBars) or (not na(barsSinceTrendResumptionLongEventForBounce) and barsSinceTrendResumptionLongEventForBounce <= bounceFailureMemoryBars) or inLongCampaign
+recentShortBounceAttempt = (not na(lastShortExitBar) and bar_index - lastShortExitBar <= bounceFailureMemoryBars) or (not na(barsSinceReclaimShortEventForBounce) and barsSinceReclaimShortEventForBounce <= bounceFailureMemoryBars) or (not na(barsSinceTrendResumptionShortEventForBounce) and barsSinceTrendResumptionShortEventForBounce <= bounceFailureMemoryBars) or inShortCampaign
+
+bearTrendContextStrongEnough = (primaryBiasState == PRIMARY_BEAR or (htfBear and bearStack and directionalShortBias)) and not reversalLongAuthorized and not bullishDivergence
+bullTrendContextStrongEnough = (primaryBiasState == PRIMARY_BULL or (htfBull and bullStack and directionalLongBias)) and not reversalShortAuthorized and not bearishDivergence
+
+priceBackUnderFavoredShortStructure = close < fastLine and (close < slowLine or shortSlowGrace)
+priceBackAboveFavoredLongStructure = close > fastLine and (close > slowLine or longSlowGrace)
+
+longBounceActuallyFailed = failedBullReclaimShortState or bosUpRetestFail or ((not na(lastLongExitBar) and bar_index - lastLongExitBar <= bounceFailureMemoryBars) and close < fastLine)
+shortBounceActuallyFailed = failedBearReclaimLongState or bosDnRetestFail or ((not na(lastShortExitBar) and bar_index - lastShortExitBar <= bounceFailureMemoryBars) and close > fastLine)
+
+bounceFailureContinuationShort = bearTrendContextStrongEnough and recentLongBounceAttempt and longBounceActuallyFailed and priceBackUnderFavoredShortStructure
+bounceFailureContinuationLong = bullTrendContextStrongEnough and recentShortBounceAttempt and shortBounceActuallyFailed and priceBackAboveFavoredLongStructure
+
+bounceFailureContinuationShortEvent = bounceFailureContinuationShort and not bounceFailureContinuationShort[1]
+bounceFailureContinuationLongEvent = bounceFailureContinuationLong and not bounceFailureContinuationLong[1]
+
+shortContinuationEntry = bounceFailureContinuationShort and confirmShort and directionalShortBias and shortContinuationRoomOK and not shortVeto and not braidedLines
+longContinuationEntry = bounceFailureContinuationLong and confirmLong and directionalLongBias and longContinuationRoomOK and not longVeto and not braidedLines
+
+shortContinuationEntryEvent = shortContinuationEntry and not shortContinuationEntry[1]
+longContinuationEntryEvent = longContinuationEntry and not longContinuationEntry[1]
+
+validLongContinuation = (continuationLongEvent or trendResumptionLongEvent or bounceFailureContinuationLongEvent) and confirmLong and htfLongAligned and not braidedLines and not rawInvalidLong and bullTrendContextStrongEnough and bullStack and (not oppositeBearIntact or reversalLongAuthorized)
+validShortContinuation = (continuationShortEvent or trendResumptionShortEvent or bounceFailureContinuationShortEvent) and confirmShort and htfShortAligned and not braidedLines and not rawInvalidShort and bearTrendContextStrongEnough and bearStack and (not oppositeBullIntact or reversalShortAuthorized)
+
+suppressScalpLong = bounceFailureContinuationShort or (bounceFailureContinuationShortEvent and bearStack)
+suppressScalpShort = bounceFailureContinuationLong or (bounceFailureContinuationLongEvent and bullStack)
+
+buyReclaim = validLong and reclaimLongEvent and longTouchOK and longContinuationRoomOK and not longVeto and (not dominantBearCampaign or isLowTfBucket or reversalLongAuthorized)
+buyTravel = (validLong or validLongContinuation) and (continuationLongEvent or trendResumptionLongEvent or bounceFailureContinuationLongEvent) and directionalLongBias and longContinuationRoomOK and not longVeto and (longTradeArchetype != ARCH_COUNTERTREND_BOUNCE or isLowTfBucket)
+buyReversal = validLong and reversalLongEvent and not reclaimLongEvent and not continuationLongEvent and longReversalRoomOK and not rawInvalidLong and (not longReentryCooldownActive or freshLongRepairSequence)
+sellReclaim = validShort and reclaimShortEvent and shortTouchOK and shortContinuationRoomOK and not shortVeto and (not dominantBullCampaign or isLowTfBucket or reversalShortAuthorized)
+sellTravel = (validShort or validShortContinuation) and (continuationShortEvent or trendResumptionShortEvent or bounceFailureContinuationShortEvent) and directionalShortBias and shortContinuationRoomOK and not shortVeto and (shortTradeArchetype != ARCH_COUNTERTREND_BOUNCE or isLowTfBucket)
+sellReversal = validShort and reversalShortEvent and not reclaimShortEvent and not continuationShortEvent and shortReversalRoomOK and not rawInvalidShort and (not shortReentryCooldownActive or freshShortRepairSequence)
+
+buySignalBase = buyReclaim or buyTravel or buyReversal or buyEarly
+sellSignalBase = sellReclaim or sellTravel or sellReversal or sellEarly
+
+buyFlip = recentShortCampaign and rawInvalidShort and setupLong and confirmLong and htfLongScalpAligned and directionalLongBias and close > fastLine and longSlowGrace and not rawInvalidLong and not braidedLines and longContinuationRoomOK and (reclaimLongEvent or trendResumptionLongEvent or displacementBull or bosUp or longBodyStrong)
+sellFlip = recentLongCampaign and rawInvalidLong and setupShort and confirmShort and htfShortScalpAligned and directionalShortBias and close < fastLine and shortSlowGrace and not rawInvalidShort and not braidedLines and shortContinuationRoomOK and (reclaimShortEvent or trendResumptionShortEvent or displacementBear or bosDn or shortBodyStrong)
+
+buySignal = (buySignalBase or buyFlip) and not suppressScalpLong and longExecutionScoreOk
+sellSignal = (sellSignalBase or sellFlip) and not suppressScalpShort and shortExecutionScoreOk
+
+longArmedState = not longVeto and not suppressScalpLong and ((reclaimLongState and longContinuationRoomOK) or (continuationLongState and longContinuationRoomOK and (longTradeArchetype != ARCH_COUNTERTREND_BOUNCE or isLowTfBucket)) or failedBearReclaimLongState or (reversalLongAuthorized and longReversalRoomOK))
+shortArmedState = not shortVeto and not suppressScalpShort and ((reclaimShortState and shortContinuationRoomOK) or (continuationShortState and shortContinuationRoomOK and (shortTradeArchetype != ARCH_COUNTERTREND_BOUNCE or isLowTfBucket)) or failedBullReclaimShortState or (reversalShortAuthorized and shortReversalRoomOK))
+longArmedEvent = longArmedState and not longArmedState[1] and not buySignal
+shortArmedEvent = shortArmedState and not shortArmedState[1] and not sellSignal
+
+var string lastInvalidText = "None"
+var float lastInvalidPrice = na
+var int lastInvalidBar = na
+
+longSoftExit = inLongCampaign and (
+    reclaimShortEvent or
+    (close < fastLine and shortBodyStrong) or
+    displacementBear or
+    fastCrossBelowSlow
+)
+longHardExit = inLongCampaign and (
+    close < slowLine or
+    close < trendEMA or
+    bearStack or
+    rawInvalidLong or
+    (not na(longEntryFailLevel) and close < longEntryFailLevel)
+)
+shortSoftExit = inShortCampaign and (
+    reclaimLongEvent or
+    (close > fastLine and longBodyStrong) or
+    displacementBull or
+    fastCrossAboveSlow
+)
+shortHardExit = inShortCampaign and (
+    close > slowLine or
+    close > trendEMA or
+    bullStack or
+    rawInvalidShort or
+    (not na(shortEntryFailLevel) and close > shortEntryFailLevel)
+)
+
+longExitSignalRaw = longSoftExit or longHardExit
+shortExitSignalRaw = shortSoftExit or shortHardExit
+longExitReady = na(lastLongExitBar) or bar_index - lastLongExitBar > exitCooldownBars
+shortExitReady = na(lastShortExitBar) or bar_index - lastShortExitBar > exitCooldownBars
+longInvalidDisplay = longExitSignalRaw and not sellSignal and longExitReady
+shortInvalidDisplay = shortExitSignalRaw and not buySignal and shortExitReady
+
+longInvalidEvent = longInvalidDisplay and not longInvalidDisplay[1]
+shortInvalidEvent = shortInvalidDisplay and not shortInvalidDisplay[1]
+
+if longInvalidEvent
+    lastInvalidText := "CUT LONG: " + longInvalidReason
+    lastInvalidPrice := longInvalidPrice
+    lastInvalidBar := bar_index
+if shortInvalidEvent
+    lastInvalidText := "COVER SHORT: " + shortInvalidReason
+    lastInvalidPrice := shortInvalidPrice
+    lastInvalidBar := bar_index
+
+invalidationAge = not na(lastInvalidBar) ? bar_index - lastInvalidBar : na
+invalidationState =
+     longInvalidDisplay ? ("NOW CUT LONG: " + longInvalidReason) :
+     shortInvalidDisplay ? ("NOW COVER SHORT: " + shortInvalidReason) :
+     (not na(invalidationAge) and invalidationAge <= 20) ? ("RECENT " + lastInvalidText + " (" + str.tostring(invalidationAge) + "b)") :
+     "None"
+
+newBuyEntry = buySignal and not inLongCampaign
+newSellEntry = sellSignal and not inShortCampaign
+
+if newBuyEntry
+    inLongCampaign := true
+    inShortCampaign := false
+    longEntryBar := bar_index
+    shortEntryBar := na
+    longEntryFailLevel := math.min(fastLine, slowLine)
+    shortEntryFailLevel := na
+    campaignSide := CAMPAIGN_LONG
+    campaignType := longTradeArchetype
+    campaignStartBar := bar_index
+    campaignRepairSeen := bullBiasRepair or longTradeArchetype == ARCH_REVERSAL
+    campaignInvalidated := false
+    bounceAttemptCount := primaryBiasState == PRIMARY_BEAR ? bounceAttemptCount + 1 : 0
+if newSellEntry
+    inShortCampaign := true
+    inLongCampaign := false
+    shortEntryBar := bar_index
+    longEntryBar := na
+    shortEntryFailLevel := math.max(fastLine, slowLine)
+    longEntryFailLevel := na
+    campaignSide := CAMPAIGN_SHORT
+    campaignType := shortTradeArchetype
+    campaignStartBar := bar_index
+    campaignRepairSeen := bearBiasRepair or shortTradeArchetype == ARCH_REVERSAL
+    campaignInvalidated := false
+    bounceAttemptCount := primaryBiasState == PRIMARY_BULL ? bounceAttemptCount + 1 : 0
+if longExitSignalRaw and not newSellEntry
+    inLongCampaign := false
+    longEntryBar := na
+    longEntryFailLevel := na
+    lastLongExitBar := bar_index
+    campaignInvalidated := true
+    lastCutSide := CAMPAIGN_LONG
+    lastCutSideBar := bar_index
+if shortExitSignalRaw and not newBuyEntry
+    inShortCampaign := false
+    shortEntryBar := na
+    shortEntryFailLevel := na
+    lastShortExitBar := bar_index
+    campaignInvalidated := true
+    lastCutSide := CAMPAIGN_SHORT
+    lastCutSideBar := bar_index
+
+if campaignSide == CAMPAIGN_LONG and (bullBiasRepair or reversalLongAuthorized)
+    campaignRepairSeen := true
+if campaignSide == CAMPAIGN_SHORT and (bearBiasRepair or reversalShortAuthorized)
+    campaignRepairSeen := true
+if not inLongCampaign and not inShortCampaign and campaignInvalidated and not longInvalidDisplay and not shortInvalidDisplay and (not na(lastCutSideBar) and bar_index - lastCutSideBar > reentryCooldownBars)
+    campaignSide := CAMPAIGN_NONE
+    campaignType := ARCH_NONE
+    campaignStartBar := na
+    campaignRepairSeen := false
+
+gradeFromScore(_score) =>
+    string grade = "None"
+    if _score >= 75
+        grade := "Confirmed"
+    else if _score >= 55
+        grade := "Early"
+    else if _score >= 35
+        grade := "Watch"
+    grade
+
+longGrade = gradeFromScore(longScore)
+shortGrade = gradeFromScore(shortScore)
+
+//====================================================
+// BIAS / STATE TEXT
+//====================================================
+htfLocationState =
+     htfInExtremeSell ? "HTF Extreme Sell" :
+     htfInSell ? "HTF Sell" :
+     htfInBattle ? "HTF Battleground" :
+     htfInBuy ? "HTF Buy" :
+     htfInExtremeBuy ? "HTF Extreme Buy" :
+     "HTF Between"
+
+var string lastLineEventText = "None"
+var int lastLineEventBar = na
+if buyFlip
+    lastLineEventText := "Bull Flip Trigger"
+    lastLineEventBar := bar_index
+else if sellFlip
+    lastLineEventText := "Bear Flip Trigger"
+    lastLineEventBar := bar_index
+else if continuationLongEvent
+    lastLineEventText := "ML Long Trigger"
+    lastLineEventBar := bar_index
+else if continuationShortEvent
+    lastLineEventText := "ML Short Trigger"
+    lastLineEventBar := bar_index
+else if trendResumptionLongEvent
+    lastLineEventText := "Bull Re-entry Trigger"
+    lastLineEventBar := bar_index
+else if trendResumptionShortEvent
+    lastLineEventText := "Bear Re-entry Trigger"
+    lastLineEventBar := bar_index
+else if reclaimFastLongEvent
+    lastLineEventText := "Reclaim Fast Up"
+    lastLineEventBar := bar_index
+else if reclaimSlowLongEvent
+    lastLineEventText := "Reclaim Slow Up"
+    lastLineEventBar := bar_index
+else if reclaimFastShortEvent
+    lastLineEventText := "Reclaim Fast Down"
+    lastLineEventBar := bar_index
+else if reclaimSlowShortEvent
+    lastLineEventText := "Reclaim Slow Down"
+    lastLineEventBar := bar_index
+else if loseFastLongEvent
+    lastLineEventText := "Lost Fast Line"
+    lastLineEventBar := bar_index
+else if loseSlowLongEvent
+    lastLineEventText := "Lost Slow Line"
+    lastLineEventBar := bar_index
+else if fastCrossAboveSlow
+    lastLineEventText := "Fast Crossed Above Slow"
+    lastLineEventBar := bar_index
+else if fastCrossBelowSlow
+    lastLineEventText := "Fast Crossed Below Slow"
+    lastLineEventBar := bar_index
+
+lineEventAge = not na(lastLineEventBar) ? bar_index - lastLineEventBar : na
+lineEventState = not na(lineEventAge) and lineEventAge <= 20 ? (lastLineEventText + " (" + str.tostring(lineEventAge) + "b)") : "None"
+
+spreadState = linesExpanding ? "Spread Expanding" : linesContracting ? "Spread Contracting" : "Spread Flat"
+lineStructureState = bullStack ? "Bull Stack" : bearStack ? "Bear Stack" : "Mixed Stack"
+lineTravelState =
+     buyFlip ? "Bull Flip Triggered" :
+     sellFlip ? "Bear Flip Triggered" :
+     longContinuationEntryEvent ? "Long Continuation Triggered" :
+     shortContinuationEntryEvent ? "Short Continuation Triggered" :
+     continuationLongEvent ? "Travel Long Triggered" :
+     continuationShortEvent ? "Travel Short Triggered" :
+     trendResumptionLongEvent ? "Bull Re-entry Triggered" :
+     trendResumptionShortEvent ? "Bear Re-entry Triggered" :
+     failedBearReclaimLongState ? "Bull Re-entry Armed" :
+     failedBullReclaimShortState ? "Bear Re-entry Armed" :
+     continuationLongState ? "Travel Long Armed" :
+     continuationShortState ? "Travel Short Armed" :
+     trendRideLong and linesContracting ? "Bull Ride Weakening" :
+     trendRideShort and linesContracting ? "Bear Ride Weakening" :
+     bullishDivergence ? "Bull Divergence" :
+     bearishDivergence ? "Bear Divergence" :
+     braidedLines ? "Braided" :
+     "No Travel"
+activeTouchCount = bullStack ? bullTouchCount : bearStack ? bearTouchCount : 0
+touchState = "T:" + str.tostring(activeTouchCount) + (activeTouchCount > maxContinuationTouches ? " (Stale)" : "")
+movingLineState = lineStructureState + ", " + spreadState
+
+primaryBiasText = primaryBiasState == PRIMARY_BEAR ? "PRIMARY_BEAR" : primaryBiasState == PRIMARY_BULL ? "PRIMARY_BULL" : "PRIMARY_NEUTRAL"
+countertrendAllowed = isLowTfBucket or (isMidTfBucket and (primaryBiasState == PRIMARY_BEAR or primaryBiasState == PRIMARY_BULL))
+continuationAllowed = bounceFailureContinuationShort or bounceFailureContinuationLong or (primaryBiasState == PRIMARY_BEAR ? (not isLowTfBucket or shortTradeArchetype == ARCH_TREND_RIDE) : primaryBiasState == PRIMARY_BULL ? (not isLowTfBucket or longTradeArchetype == ARCH_TREND_RIDE) : false)
+
+bearRideIntact = useRideStateSignals and primaryBiasState == PRIMARY_BEAR and (strongBearState or trendRideShort or inShortCampaign or campaignSide == CAMPAIGN_SHORT) and htfBear and bearStack and close < fastLine and close < slowLine and not reversalLongAuthorized and not bullBiasRepair and not bullishDivergence
+bullRideIntact = useRideStateSignals and primaryBiasState == PRIMARY_BULL and (strongBullState or trendRideLong or inLongCampaign or campaignSide == CAMPAIGN_LONG) and htfBull and bullStack and close > fastLine and close > slowLine and not reversalShortAuthorized and not bearBiasRepair and not bearishDivergence
+weakBearBounce = primaryBiasState == PRIMARY_BEAR and htfBear and bearStack and inBuyerArea and close < slowLine and not displacementBull and not reversalLongAuthorized
+weakBullBounce = primaryBiasState == PRIMARY_BULL and htfBull and bullStack and inSellerArea and close > slowLine and not displacementBear and not reversalShortAuthorized
+
+holdShortState = inShortCampaign and (bearRideIntact or weakBearBounce) and not shortInvalidDisplay
+holdLongState = inLongCampaign and (bullRideIntact or weakBullBounce) and not longInvalidDisplay
+bearContWatch = not sellSignal and not shortInvalidDisplay and ((((isMidTfBucket or isRideTfBucket) and (weakBearBounce or bearRideIntact))) or bounceFailureContinuationShort)
+bullContWatch = not buySignal and not longInvalidDisplay and ((((isMidTfBucket or isRideTfBucket) and (weakBullBounce or bullRideIntact))) or bounceFailureContinuationLong)
+
+longArchetypeText = longTradeArchetype == ARCH_TREND_RIDE ? "TREND_RIDE" : longTradeArchetype == ARCH_COUNTERTREND_BOUNCE ? "COUNTERTREND_BOUNCE" : longTradeArchetype == ARCH_REVERSAL ? "REVERSAL" : "NONE"
+shortArchetypeText = shortTradeArchetype == ARCH_TREND_RIDE ? "TREND_RIDE" : shortTradeArchetype == ARCH_COUNTERTREND_BOUNCE ? "COUNTERTREND_BOUNCE" : shortTradeArchetype == ARCH_REVERSAL ? "REVERSAL" : "NONE"
+tradeArchetypeState =
+     inLongCampaign ? longArchetypeText :
+     inShortCampaign ? shortArchetypeText :
+     buySignal or longArmedState ? longArchetypeText :
+     sellSignal or shortArmedState ? shortArchetypeText :
+     shortContinuationEntry or bounceFailureContinuationShort ? "TREND_RIDE" :
+     longContinuationEntry or bounceFailureContinuationLong ? "TREND_RIDE" :
+     bearRideIntact or bullRideIntact ? "TREND_RIDE" :
+     weakBearBounce or weakBullBounce ? "COUNTERTREND_BOUNCE" :
+     "NONE"
+
+campaignTypeText = campaignType == ARCH_TREND_RIDE ? "RIDE" : campaignType == ARCH_COUNTERTREND_BOUNCE ? "CT_BOUNCE" : campaignType == ARCH_REVERSAL ? "REVERSAL" : "NONE"
+campaignAge = not na(campaignStartBar) ? bar_index - campaignStartBar : na
+campaignSuffix = (campaignRepairSeen ? " / REPAIR" : "") + (campaignInvalidated ? " / INVALID" : "") + (not na(campaignAge) ? " / " + str.tostring(campaignAge) + "b" : "")
+campaignState =
+     campaignSide == CAMPAIGN_SHORT and holdShortState ? "SHORT HOLD / " + campaignTypeText + campaignSuffix :
+     campaignSide == CAMPAIGN_LONG and holdLongState ? "LONG HOLD / " + campaignTypeText + campaignSuffix :
+     campaignSide == CAMPAIGN_SHORT ? "SHORT CAMPAIGN / " + campaignTypeText + campaignSuffix :
+     campaignSide == CAMPAIGN_LONG ? "LONG CAMPAIGN / " + campaignTypeText + campaignSuffix :
+     shortContinuationEntry ? "SHORT RIDE" :
+     longContinuationEntry ? "LONG RIDE" :
+     bounceFailureContinuationShort ? "BEAR MAP / NO ENTRY" :
+     bounceFailureContinuationLong ? "BULL MAP / NO ENTRY" :
+     bearRideIntact ? "RIDE INTACT / NO ENTRY" :
+     bullRideIntact ? "RIDE INTACT / NO ENTRY" :
+     bearContWatch ? "BEAR MAP / NO CAMPAIGN" :
+     bullContWatch ? "BULL MAP / NO CAMPAIGN" :
+     "NONE"
+
+marketState =
+     primaryBiasState == PRIMARY_BEAR and bearRideIntact ? "Bear Ride Active" :
+     primaryBiasState == PRIMARY_BULL and bullRideIntact ? "Bull Ride Active" :
+     strongBullState ? "Bull Ride Strong" :
+     strongBearState ? "Bear Ride Strong" :
+     trendRideLong and linesContracting ? "Bull Ride Weakening" :
+     trendRideShort and linesContracting ? "Bear Ride Weakening" :
+     bullStack and isCompressed ? "Late Trend Compression (Bull)" :
+     bearStack and isCompressed ? "Late Trend Compression (Bear)" :
+     bullStack and close < fastLine and close > trendEMA ? "Pullback In Bull Trend" :
+     bearStack and close > fastLine and close < trendEMA ? "Pullback In Bear Trend" :
+     bullStack and not linesExpanding ? "Bull Stack, Momentum Fading" :
+     bearStack and not linesExpanding ? "Bear Stack, Momentum Fading" :
+     bullishDivergence ? "Bullish Line Divergence" :
+     bearishDivergence ? "Bearish Line Divergence" :
+     braidedLines ? "Braided / No-Trade" :
+     blastUp ? "Expansion Up" :
+     blastDn ? "Expansion Down" :
+     isCompressed ? "Compression" :
+     "Transition / No Edge"
+
+locationState =
+     inExtremeSell ? "Extreme Sell" :
+     inSell ? "Sell" :
+     inBattle ? "Battleground" :
+     inBuy ? "Buy" :
+     inExtremeBuy ? "Extreme Buy" :
+     "Between"
+
+setupType =
+     buySignal or longArmedState ? longArchetypeText :
+     sellSignal or shortArmedState ? shortArchetypeText :
+     bounceFailureContinuationShort ? "Continuation Short" :
+     bounceFailureContinuationLong ? "Continuation Long" :
+     continuationLong ? "Continuation Long" :
+     reversalLong ? "Reversal Long" :
+     continuationShort ? "Continuation Short" :
+     reversalShort ? "Reversal Short" :
+     "None"
+
+earlyLongBias = not suppressScalpLong and not buySignal and not sellSignal and not inLongCampaign and not longVeto and htfLongScalpAligned and ((primaryBiasState == PRIMARY_BULL and directionalLongBias) or (isLowTfBucket and longTradeArchetype == ARCH_COUNTERTREND_BOUNCE and (failedBearReclaimLongState or freshFastLongReclaim)))
+earlyShortBias = not suppressScalpShort and not buySignal and not sellSignal and not inShortCampaign and not shortVeto and htfShortScalpAligned and ((primaryBiasState == PRIMARY_BEAR and directionalShortBias) or (isLowTfBucket and shortTradeArchetype == ARCH_COUNTERTREND_BOUNCE and (failedBullReclaimShortState or freshFastShortReclaim)))
+
+countertrendLongLabel = isLowTfBucket and buyEarly ? "SCALP LONG" : "CT LONG"
+countertrendShortLabel = isLowTfBucket and sellEarly ? "SCALP SHORT" : "CT SHORT"
+rideLongLabel = isLowTfBucket ? "LONG RIDE" : "BUY RIDE"
+rideShortLabel = isLowTfBucket ? "SHORT RIDE" : "SELL RIDE"
+continuationLongEntryLabel = isLowTfBucket ? "LONG CONT" : "BUY RIDE"
+continuationShortEntryLabel = isLowTfBucket ? "SHORT CONT" : "SELL RIDE"
+forceCountertrendLongLabel = (buySignal or longArmedState or earlyLongBias) and primaryBiasState == PRIMARY_BEAR and not reversalLongAuthorized and not suppressScalpLong
+forceCountertrendShortLabel = (sellSignal or shortArmedState or earlyShortBias) and primaryBiasState == PRIMARY_BULL and not reversalShortAuthorized and not suppressScalpShort
+executionLongLabel = longContinuationEntryEvent ? continuationLongEntryLabel : buyFlip ? "BUY FLIP" : (longTradeArchetype == ARCH_COUNTERTREND_BOUNCE or (forceCountertrendLongLabel and useCountertrendLabels)) ? countertrendLongLabel : longTradeArchetype == ARCH_REVERSAL ? "REVERSAL LONG" : longTradeArchetype == ARCH_TREND_RIDE ? rideLongLabel : "BUY"
+executionShortLabel = shortContinuationEntryEvent ? continuationShortEntryLabel : sellFlip ? "SELL FLIP" : (shortTradeArchetype == ARCH_COUNTERTREND_BOUNCE or (forceCountertrendShortLabel and useCountertrendLabels)) ? countertrendShortLabel : shortTradeArchetype == ARCH_REVERSAL ? "REVERSAL SHORT" : shortTradeArchetype == ARCH_TREND_RIDE ? rideShortLabel : "SELL"
+longWatchLabel = (longTradeArchetype == ARCH_COUNTERTREND_BOUNCE or forceCountertrendLongLabel) ? "CT LONG WATCH" : longTradeArchetype == ARCH_TREND_RIDE ? "LONG RIDE WATCH" : "LONG WATCH"
+shortWatchLabel = (shortTradeArchetype == ARCH_COUNTERTREND_BOUNCE or forceCountertrendShortLabel) ? "CT SHORT WATCH" : shortTradeArchetype == ARCH_TREND_RIDE ? "SHORT RIDE WATCH" : "SHORT WATCH"
+
+actionBias =
+     longInvalidDisplay ? "CUT LONG" :
+     shortInvalidDisplay ? "COVER SHORT" :
+     shortContinuationEntryEvent ? continuationShortEntryLabel :
+     longContinuationEntryEvent ? continuationLongEntryLabel :
+     campaignSide == CAMPAIGN_SHORT and holdShortState ? "HOLD SHORT" :
+     campaignSide == CAMPAIGN_LONG and holdLongState ? "HOLD LONG" :
+     bearContWatch ? "BEAR CONT WATCH" :
+     bullContWatch ? "BULL CONT WATCH" :
+     primaryBiasState == PRIMARY_BEAR and campaignSide == CAMPAIGN_SHORT ? "SHORT CAMPAIGN" :
+     primaryBiasState == PRIMARY_BULL and campaignSide == CAMPAIGN_LONG ? "LONG CAMPAIGN" :
+     buySignal ? executionLongLabel :
+     sellSignal ? executionShortLabel :
+     longArmedState ? longWatchLabel :
+     shortArmedState ? shortWatchLabel :
+     earlyLongBias ? longWatchLabel :
+     earlyShortBias ? shortWatchLabel :
+     primaryBiasState == PRIMARY_BEAR ? "BEARISH CAMPAIGN" :
+     primaryBiasState == PRIMARY_BULL ? "BULLISH CAMPAIGN" :
+     "NEUTRAL"
+
+locationEffectState =
+     primaryBiasState == PRIMARY_BEAR and inBuyerArea ? "Buyer zone slows shorts, does not repair bear bias" :
+     primaryBiasState == PRIMARY_BULL and inSellerArea ? "Seller zone slows longs, does not repair bull bias" :
+     primaryBiasState == PRIMARY_BEAR and inSellerArea ? "Location supports bear continuation" :
+     primaryBiasState == PRIMARY_BULL and inBuyerArea ? "Location supports bull continuation" :
+     "Location neutral"
+
+continuationAllowedState =
+     bounceFailureContinuationShort ? "BEAR MAP VALID" :
+     bounceFailureContinuationLong ? "BULL MAP VALID" :
+     primaryBiasState == PRIMARY_BEAR and continuationAllowed ? "SHORT CONTINUATION" :
+     primaryBiasState == PRIMARY_BULL and continuationAllowed ? "LONG CONTINUATION" :
+     "NONE"
+
+countertrendAllowedState =
+     countertrendAllowed ? (primaryBiasState == PRIMARY_BEAR ? "LONG CT OK" : primaryBiasState == PRIMARY_BULL ? "SHORT CT OK" : "TACTICAL CT OK") :
+     "NO CT"
+
+waitReason =
+     bounceFailureContinuationShort and not shortContinuationEntry ? "Waiting for short continuation trigger" :
+     bounceFailureContinuationLong and not longContinuationEntry ? "Waiting for long continuation trigger" :
+     braidedLines ? "Braided / no-trade" :
+     longReentryCooldownActive ? "Long re-entry cooldown" :
+     shortReentryCooldownActive ? "Short re-entry cooldown" :
+     useScoreExecutionGate and longScore > shortScore and not longExecutionScoreOk ? "Long score below execution gate" :
+     useScoreExecutionGate and shortScore > longScore and not shortExecutionScoreOk ? "Short score below execution gate" :
+     primaryBiasState == PRIMARY_BEAR and bearishLocationTrap ? "Bear bias intact, bounce not repaired" :
+     primaryBiasState == PRIMARY_BULL and bullishLocationTrap ? "Bull bias intact, bounce not repaired" :
+     rawInvalidLong and not rawInvalidShort ? "Long invalidated" :
+     rawInvalidShort and not rawInvalidLong ? "Short invalidated" :
+     primaryBiasState == PRIMARY_BEAR and weakBearBounce ? "Waiting for bear continuation" :
+     primaryBiasState == PRIMARY_BULL and weakBullBounce ? "Waiting for bull continuation" :
+     "No fresh edge"
+
+signalState =
+     longInvalidDisplay ? "CUT LONG" :
+     shortInvalidDisplay ? "COVER SHORT" :
+     shortContinuationEntryEvent ? continuationShortEntryLabel :
+     longContinuationEntryEvent ? continuationLongEntryLabel :
+     buyFlip ? "BUY FLIP" :
+     sellFlip ? "SELL FLIP" :
+     buySignal ? executionLongLabel :
+     sellSignal ? executionShortLabel :
+     holdShortState ? "HOLD SHORT" :
+     holdLongState ? "HOLD LONG" :
+     bearContWatch ? "BEAR CONT WATCH" :
+     bullContWatch ? "BULL CONT WATCH" :
+     longArmedState or earlyLongBias ? longWatchLabel :
+     shortArmedState or earlyShortBias ? shortWatchLabel :
+     "WAIT"
+
+//====================================================
+// PLOTS
+//====================================================
+movingLinePlotStyle = linePlotStyle == "Stepped" ? plot.style_stepline : plot.style_line
+showSignalCore = showSignals and isDetailed
+showSignalExtras = showSignals and isDetailed
+showAdvancedCore = showAdvanced and isDetailed
+showAdvancedExtras = showAdvanced and isDetailed
+showInstitutionalCore = showInstitutional and isDetailed
+
+plot(showFastSlow ? fastLine : na, "Fast Line", color=color.new(color.aqua, 0), linewidth=2, style=movingLinePlotStyle)
+plot(showFastSlow ? slowLine : na, "Slow Line", color=color.new(color.silver, 10), linewidth=2, style=movingLinePlotStyle)
+plot(showTrendEMA ? trendEMA : na, "Trend EMA", color=color.orange, linewidth=2, style=movingLinePlotStyle)
+plot(eq, "Equilibrium", color=color.new(color.yellow, 0), linewidth=2)
+plot(showAdvancedExtras ? htfEq : na, "HTF Equilibrium", color=color.new(color.orange, 35), linewidth=1, style=plot.style_linebr)
+plot(showAdvancedExtras ? htfBattleTop : na, "HTF Battle Top", color=color.new(color.red, 70), linewidth=1, style=plot.style_linebr)
+plot(showAdvancedExtras ? htfBattleBot : na, "HTF Battle Bot", color=color.new(color.blue, 70), linewidth=1, style=plot.style_linebr)
+
+// Optional zone center guides
+plot(showAdvancedExtras ? sellerMid : na, "Seller Mid", color=color.new(color.red, 50), linewidth=1, style=plot.style_linebr)
+plot(showAdvancedExtras ? buyerMid : na, "Buyer Mid", color=color.new(color.blue, 50), linewidth=1, style=plot.style_linebr)
+
+// Background tint
+bgcolor(
+    showBgTint
+    ? validLong ? color.new(color.green, 91)
+    : validShort ? color.new(color.red, 91)
+    : longInvalidEvent or shortInvalidEvent ? color.new(color.orange, 90)
+    : isDetailed and blastUp ? color.new(color.lime, 92)
+    : isDetailed and blastDn ? color.new(color.maroon, 92)
+    : isDetailed and isCompressed ? color.new(color.purple, 93)
+    : isDetailed and unfairUp ? color.new(color.fuchsia, 94)
+    : isDetailed and unfairDn ? color.new(color.navy, 94)
+    : isDetailed and inBattle ? color.new(color.gray, 95)
+    : na
+    : na
+)
+
+//====================================================
+// SIGNAL MARKERS
+//====================================================
+plotshape(showSignalExtras and goldenOpportunityLong, title="Golden Long Setup", style=shape.circle, location=location.belowbar, color=color.new(color.lime, 0), size=size.tiny, text="GB")
+plotshape(showSignalExtras and goldenOpportunityShort, title="Golden Short Setup", style=shape.circle, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny, text="GS")
+
+plotshape(showSignalCore and reclaimLongEvent, title="Long Reclaim", style=shape.flag, location=location.belowbar, color=color.new(color.green, 0), size=size.small, text="RC")
+plotshape(showSignalCore and reclaimShortEvent, title="Short Reclaim", style=shape.flag, location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="RC")
+plotshape(showSignalCore and continuationLongEvent, title="Travel Long Trigger", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="ML")
+plotshape(showSignalCore and continuationShortEvent, title="Travel Short Trigger", style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.small, text="ML")
+
+plotshape(showSignalExtras and buyBottomRaw, title="Buy Bottom Raw", style=shape.circle, location=location.belowbar, color=color.new(color.teal, 0), size=size.tiny, text="BB")
+plotshape(showSignalExtras and buyBottomTrigger, title="Buy Bottom Trigger", style=shape.flag, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny, text="BT")
+plotshape(showSignalExtras and buyBottomConfirm, title="Buy Bottom Confirm", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny, text="BC")
+
+plotshape(showSignalExtras and trapTopRaw, title="Trap Top Raw", style=shape.circle, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny, text="TT")
+plotshape(showSignalExtras and trapBottomRaw, title="Trap Bottom Raw", style=shape.circle, location=location.belowbar, color=color.new(color.blue, 0), size=size.tiny, text="TB")
+
+plotshape(showSignalExtras and trapTopTrigger, title="Trap Top Trigger", style=shape.flag, location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="TTT")
+plotshape(showSignalExtras and trapBottomTrigger, title="Trap Bottom Trigger", style=shape.flag, location=location.belowbar, color=color.new(color.blue, 0), size=size.small, text="TBT")
+plotshape(showSignalExtras and trapTopConfirm, title="Trap Top Confirm", style=shape.flag, location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="TTC")
+plotshape(showSignalExtras and trapBottomConfirm, title="Trap Bottom Confirm", style=shape.flag, location=location.belowbar, color=color.new(color.blue, 0), size=size.small, text="TBC")
+
+plotshape(showAdvancedExtras and wBottomConfirm, title="W Bottom Confirm", style=shape.triangleup, location=location.belowbar, color=color.new(color.teal, 0), size=size.small, text="W")
+plotshape(showAdvancedExtras and mTopConfirm, title="M Top Confirm", style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.small, text="M")
+
+plotshape(showAdvancedCore and bosUp, title="BOS Up", style=shape.triangleup, location=location.belowbar, color=color.new(color.blue, 0), size=size.tiny, text="BOS↑")
+plotshape(showAdvancedCore and bosDn, title="BOS Down", style=shape.triangledown, location=location.abovebar, color=color.new(color.blue, 0), size=size.tiny, text="BOS↓")
+
+plotshape(showAdvancedExtras and bosUpRetestHold, title="BOS Retest Hold Up", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny, text="BRH")
+plotshape(showAdvancedExtras and bosDnRetestHold, title="BOS Retest Hold Down", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny, text="BRH")
+plotshape(showAdvancedExtras and bosUpRetestFail, title="BOS Retest Fail Up", style=shape.labeldown, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny, text="BRF")
+plotshape(showAdvancedExtras and bosDnRetestFail, title="BOS Retest Fail Down", style=shape.labelup, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny, text="BRF")
+
+plotshape(showAdvancedExtras and trapTopFailed, title="Trap Top Failed", style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny, text="TTF")
+plotshape(showAdvancedExtras and trapBottomFailed, title="Trap Bottom Failed", style=shape.xcross, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny, text="TBF")
+
+plotshape(showAdvancedExtras and blastUp, title="Compression Blast Up", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="BLAST↑")
+plotshape(showAdvancedExtras and blastDn, title="Compression Blast Down", style=shape.labeldown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.small, text="BLAST↓")
+
+plotshape(showAdvancedExtras and unfairUp, title="Unfair Up", style=shape.diamond, location=location.abovebar, color=color.new(color.fuchsia, 0), size=size.tiny, text="UV")
+plotshape(showAdvancedExtras and unfairDn, title="Unfair Down", style=shape.diamond, location=location.belowbar, color=color.new(color.navy, 0), size=size.tiny, text="UV")
+plotshape(showAdvancedExtras and braidedLines, title="Braided Lines", style=shape.square, location=location.top, color=color.new(color.yellow, 0), size=size.tiny, text="BRD")
+
+plotshape(showAdvancedCore and displacementBull, title="Displacement Bull", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 30), size=size.tiny, text="DSP")
+plotshape(showAdvancedCore and displacementBear, title="Displacement Bear", style=shape.labeldown, location=location.abovebar, color=color.new(color.maroon, 30), size=size.tiny, text="DSP")
+
+plotshape(showInstitutionalCore and institutionalBuyActivity, title="Institutional Buy Activity", style=shape.labelup, location=location.belowbar, color=color.new(color.teal, 0), size=size.tiny, text="IB")
+plotshape(showInstitutionalCore and institutionalSellActivity, title="Institutional Sell Activity", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny, text="IS")
+
+//====================================================
+// EXECUTION LABELS
+//====================================================
+showExecutionLabels = showSignals and not isDetailed
+if showExecutionLabels
+    string buyText = isExecutionMinimal ? (executionLongLabel == "LONG CONT" ? "LCT" : executionLongLabel == "SCALP LONG" ? "SCL" : executionLongLabel == "CT LONG" ? "CTL" : executionLongLabel == "BUY FLIP" ? "BFL" : executionLongLabel == "BUY RIDE" or executionLongLabel == "LONG RIDE" ? "BRD" : executionLongLabel == "REVERSAL LONG" ? "RVL" : "BUY") : executionLongLabel
+    string sellText = isExecutionMinimal ? (executionShortLabel == "SHORT CONT" ? "SCT" : executionShortLabel == "SELL RIDE" or executionShortLabel == "SHORT RIDE" ? "SRD" : executionShortLabel == "CT SHORT" ? "CTS" : executionShortLabel == "SCALP SHORT" ? "SCS" : executionShortLabel == "SELL FLIP" ? "SFL" : executionShortLabel == "REVERSAL SHORT" ? "RVS" : "SELL") : executionShortLabel
+    if buySignal
+        label.new(bar_index, low - atr * 0.20, buyText, style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.white, size=size.small)
+    if sellSignal
+        label.new(bar_index, high + atr * 0.20, sellText, style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+    if isExecutionMinimal and longArmedEvent
+        label.new(bar_index, low - atr * 0.10, "ARM", style=label.style_label_up, color=color.new(color.blue, 15), textcolor=color.white, size=size.tiny)
+    if isExecutionMinimal and shortArmedEvent
+        label.new(bar_index, high + atr * 0.10, "ARM", style=label.style_label_down, color=color.new(color.orange, 15), textcolor=color.white, size=size.tiny)
+    if longInvalidEvent
+        label.new(bar_index, high + atr * 0.15, isExecutionMinimal ? "CL" : "CUT LONG", style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.white, size=size.tiny)
+    if shortInvalidEvent
+        label.new(bar_index, low - atr * 0.15, isExecutionMinimal ? "CS" : "COVER SHORT", style=label.style_label_up, color=color.new(color.orange, 0), textcolor=color.white, size=size.tiny)
+
+if showSignals and isDetailed
+    if setupLongEvent and not buySignal and not rawInvalidLong
+        label.new(bar_index, low - atr * 0.10, longWatchLabel, style=label.style_label_up, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny)
+    if setupShortEvent and not sellSignal and not rawInvalidShort
+        label.new(bar_index, high + atr * 0.10, shortWatchLabel, style=label.style_label_down, color=color.new(color.maroon, 25), textcolor=color.white, size=size.tiny)
+
+//====================================================
+// ZONE LABELS + STATE PANEL
+//====================================================
+var label lblExtremeSell = na
+var label lblSell = na
+var label lblBattle = na
+var label lblBuy = na
+var label lblExtremeBuy = na
+var table stateTbl = table.new(position.bottom_right, 1, 23, bgcolor=color.new(color.black, 8), frame_color=color.new(color.white, 80), frame_width=1, border_color=color.new(color.white, 90), border_width=1)
+
+if barstate.islast
+    table.set_position(stateTbl, panelAnchor)
+    if not na(lblExtremeSell)
+        label.delete(lblExtremeSell)
+    if not na(lblSell)
+        label.delete(lblSell)
+    if not na(lblBattle)
+        label.delete(lblBattle)
+    if not na(lblBuy)
+        label.delete(lblBuy)
+    if not na(lblExtremeBuy)
+        label.delete(lblExtremeBuy)
+
+    if showMapLabels and isDetailed
+        lblExtremeSell := label.new(bar_index + extendBars, (extremeSellTop + extremeSellBot) / 2.0, "EXT SELL", style=label.style_label_left, color=color.new(color.red, 25), textcolor=color.white, size=size.small)
+        lblSell := label.new(bar_index + extendBars, (sellTop + sellBot) / 2.0, "SELL", style=label.style_label_left, color=color.new(color.orange, 25), textcolor=color.white, size=size.small)
+        lblBattle := label.new(bar_index + extendBars, (battleTop + battleBot) / 2.0, "BATTLEGROUND", style=label.style_label_left, color=color.new(color.gray, 35), textcolor=color.white, size=size.small)
+        lblBuy := label.new(bar_index + extendBars, (buyTop + buyBot) / 2.0, "BUY", style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.small)
+        lblExtremeBuy := label.new(bar_index + extendBars, (extremeBuyTop + extremeBuyBot) / 2.0, "EXT BUY", style=label.style_label_left, color=color.new(color.blue, 25), textcolor=color.white, size=size.small)
+
+    if showPanel
+        htfBiasPanelText = useHTF ? (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL") : "OFF"
+        waitPanelText = signalState == "WAIT" ? waitReason : "Active signal/state"
+        if isCompactPanel
+            table.cell(stateTbl, 0, 0, "READING MAP", text_color=color.white, text_size=panelTextSize, text_halign=text.align_center, bgcolor=color.new(color.gray, 75))
+            table.cell(stateTbl, 0, 1, "Regime: " + marketState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 2, "Location: " + locationState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 3, "HTF Location: " + htfLocationState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 4, "TF Bucket: " + tfBucket, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 5, "Primary Bias: " + primaryBiasText, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 6, "Archetype: " + tradeArchetypeState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 7, "Campaign: " + campaignState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 8, "Setup: " + setupType, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 9, "Lines: " + movingLineState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 10, "Travel: " + lineTravelState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 11, "Event: " + lineEventState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 12, "HTF Bias: " + htfBiasPanelText, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 13, "L/S Score: " + str.tostring(longScore) + " / " + str.tostring(shortScore), text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 14, "Why Wait: " + waitPanelText, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 15, "Invalid: " + invalidationState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 16, "Signal: " + signalState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            for row = 17 to 22
+                table.cell(stateTbl, 0, row, "", text_color=color.white, bgcolor=color.new(color.black, 100))
+        else
+            table.cell(stateTbl, 0, 0, "READING MAP", text_color=color.white, text_size=panelTextSize, text_halign=text.align_center, bgcolor=color.new(color.gray, 75))
+            table.cell(stateTbl, 0, 1, "Regime: " + marketState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 2, "Location: " + locationState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 3, "HTF Location: " + htfLocationState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 4, "TF Bucket: " + tfBucket, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 5, "Primary Bias: " + primaryBiasText, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 6, "Trade Archetype: " + tradeArchetypeState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 7, "Campaign State: " + campaignState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 8, "Countertrend Allowed: " + countertrendAllowedState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 9, "Continuation Allowed: " + continuationAllowedState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 10, "Location Effect: " + locationEffectState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 11, "Why WAIT: " + waitPanelText, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 12, "Setup Type: " + setupType, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 13, "Line State: " + movingLineState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 14, "Travel State: " + lineTravelState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 15, "Latest Event: " + lineEventState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 16, "Touch Count: " + touchState + " | Bounce Attempts: " + str.tostring(bounceAttemptCount), text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 17, "HTF Bias: " + htfBiasPanelText, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 18, "Action Bias: " + actionBias, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 19, "Long Score: " + str.tostring(longScore) + " (" + longGrade + ") | Bias " + str.tostring(longBiasScore) + " / Setup " + str.tostring(longSetupScore), text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 20, "Short Score: " + str.tostring(shortScore) + " (" + shortGrade + ") | Bias " + str.tostring(shortBiasScore) + " / Setup " + str.tostring(shortSetupScore), text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 21, "Invalidation: " + invalidationState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 22, "Signal: " + signalState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+    else
+        for row = 0 to 22
+            table.cell(stateTbl, 0, row, "", text_color=color.white, bgcolor=color.new(color.black, 100))
+
+//====================================================
+// ALERTS
+//====================================================
+alertcondition(setupLongEvent, title="Setup Long", message="GTI Map v4: Long setup detected.")
+alertcondition(setupShortEvent, title="Setup Short", message="GTI Map v4: Short setup detected.")
+
+alertcondition(triggerLongEvent, title="Trigger Long", message="GTI Map v4: Long trigger fired.")
+alertcondition(triggerShortEvent, title="Trigger Short", message="GTI Map v4: Short trigger fired.")
+alertcondition(continuationLongEvent, title="Travel Long Trigger", message="GTI Map v4: Moving-line travel long trigger fired.")
+alertcondition(continuationShortEvent, title="Travel Short Trigger", message="GTI Map v4: Moving-line travel short trigger fired.")
+alertcondition(confirmLongEvent, title="Confirm Long", message="GTI Map v4: Long confirmation detected.")
+alertcondition(confirmShortEvent, title="Confirm Short", message="GTI Map v4: Short confirmation detected.")
+
+alertcondition(validLongEvent, title="Valid Long", message="GTI Map v4: Long setup + trigger + confirmation aligned.")
+alertcondition(validShortEvent, title="Valid Short", message="GTI Map v4: Short setup + trigger + confirmation aligned.")
+
+alertcondition(longInvalidEvent, title="Cut Long", message="GTI Map v4: Exit long campaign.")
+alertcondition(shortInvalidEvent, title="Cover Short", message="GTI Map v4: Exit short campaign.")
+
+alertcondition(bosUpRetestFail, title="BOS Up Retest Fail", message="GTI Map v4: BOS up retest failed.")
+alertcondition(bosDnRetestFail, title="BOS Down Retest Fail", message="GTI Map v4: BOS down retest failed.")
+alertcondition(trapTopFailed, title="Trap Top Failed", message="GTI Map v4: Trap top failed.")
+alertcondition(trapBottomFailed, title="Trap Bottom Failed", message="GTI Map v4: Trap bottom failed.")
+
+alertcondition(blastUp or blastDn, title="Compression Blast", message="GTI Map v4: Compression expansion detected (up/down).")
+alertcondition(unfairUp or unfairDn, title="Unfair Value", message="GTI Map v4: Unfair value condition detected (up/down). Avoid chasing.")
+
+alertcondition(trapTopConfirm or trapBottomConfirm, title="Trap Confirm", message="GTI Map v4: Trap confirmed (top/bottom).")

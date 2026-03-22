@@ -1,0 +1,892 @@
+//@version=6
+strategy("SMC Framework Pro Strategy [v2.0]",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     process_orders_on_close=false,
+     calc_on_every_tick=false,
+     slippage=2,
+     max_lines_count=200,
+     max_labels_count=200,
+     max_boxes_count=100)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §1 INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Structure ──────────────────────────────────────────────────────────────
+i_swingLen   = input.int(3,    "Pivot Lookback",           minval=2,  group="Structure")
+i_arrayCap   = input.int(10,   "Max Liquidity Levels",     minval=3,  maxval=20, group="Structure")
+i_wickThresh = input.float(0.45, "Min Wick Ratio (Sweep)", minval=0.10, maxval=0.95, step=0.05, group="Structure")
+i_bodyThresh = input.float(0.65, "Min Body Ratio (FVG)",   minval=0.10, maxval=0.95, step=0.05, group="Structure")
+i_volThresh  = input.float(1.10, "FVG Candle Size (x ATR)", minval=0.50, step=0.10, group="Structure")
+i_expiryBars = input.int(6,    "Setup Expiry (Bars)",      minval=2, group="Structure")
+i_atrLen     = input.int(14,   "ATR Length",               minval=5, group="Structure")
+i_fvgMaxBars = input.int(5,    "FVG Max Bars After Sweep (5 = scalping default, 0 = use expiry)", minval=0, maxval=20, group="Structure")
+
+// ── HTF Bias ───────────────────────────────────────────────────────────────
+i_htfPeriod   = input.timeframe("60", "HTF Timeframe",     group="HTF Bias")
+i_htfSwingLen = input.int(10,   "HTF Swing Lookback",      minval=3, group="HTF Bias")
+i_htfEmaLen   = input.int(50,   "HTF EMA Length",          minval=10, group="HTF Bias")
+
+// ── Risk ───────────────────────────────────────────────────────────────────
+i_rrRatio      = input.float(2.5, "Final Target (R)",      minval=1.0, step=0.5, group="Risk")
+i_slBuffer     = input.float(0.5, "SL ATR Buffer",         minval=0.0, step=0.1, group="Risk")
+i_partialRR    = input.float(1.0, "Partial RR",            minval=0.5, step=0.25, group="Risk")
+i_partialPct   = input.float(50.0, "Partial Exit %",       minval=1.0, maxval=99.0, step=1.0, group="Risk")
+
+// ── Oscillators ────────────────────────────────────────────────────────────
+i_wtChLen    = input.int(9,    "WT Channel Length",        minval=3, group="Oscillators")
+i_wtAvgLen   = input.int(12,   "WT Average Length",        minval=3, group="Oscillators")
+i_wtOBLevel  = input.int(53,   "WT Overbought Level",                    group="Oscillators")
+i_wtOSLevel  = input.int(-53,  "WT Oversold Level",                      group="Oscillators")
+i_rsiLen     = input.int(14,   "RSI Length",               minval=2, group="Oscillators")
+i_fastMALen  = input.int(8,    "Fast EMA Length",          minval=2, group="Oscillators")
+i_slowMALen  = input.int(21,   "Slow EMA Length",          minval=3, group="Oscillators")
+i_maRankLen  = input.int(50,   "MA Spread Rank Period",    minval=20, group="Oscillators")
+
+// ── Day Type ───────────────────────────────────────────────────────────────
+i_dayTypeLen = input.int(20,   "Day Type Lookback",        minval=10, group="Day Type")
+i_trendConst = input.float(0.70, "Trend VWAP Consistency", minval=0.50, maxval=0.95, step=0.05, group="Day Type")
+i_rangeConst = input.float(0.35, "Range VWAP Band",        minval=0.10, maxval=0.49, step=0.05, group="Day Type")
+i_atrExpand  = input.float(1.05, "ATR Expansion Mult",     minval=1.00, step=0.01, group="Day Type")
+
+// ── Session / Execution ────────────────────────────────────────────────────
+i_blockOptionCharts = input.bool(true, "Block Option Premium Charts", group="Session / Execution")
+i_vwapSession       = input.session("0915-1515", "VWAP Session (IST)", group="Session / Execution")
+i_morningSession    = input.session("0930-1130", "Morning Session (IST)", group="Session / Execution")
+i_afternoonSession  = input.session("1330-1500", "Afternoon Session (IST)", group="Session / Execution")
+i_forceEodExit      = input.bool(true, "Force EOD Exit", group="Session / Execution")
+i_eodExitHour       = input.int(15, "EOD Exit Hour (IST)", minval=0, maxval=23, group="Session / Execution")
+i_eodExitMinute     = input.int(15, "EOD Exit Minute (IST)", minval=0, maxval=59, group="Session / Execution")
+
+// ── Emission / Display ─────────────────────────────────────────────────────
+i_minScore       = input.int(6,  "Min Score to Emit Signal", minval=1, maxval=10, group="Display")
+i_showLiq        = input.bool(true,  "Show Liquidity Levels", group="Display")
+i_showMSS        = input.bool(true,  "Show MSS Levels",       group="Display")
+i_showTradeLvls  = input.bool(true,  "Show Trade SL/TP",      group="Display")
+i_showFVG        = input.bool(true,  "Show FVG Boxes",        group="Display")
+i_showLabels     = input.bool(true,  "Show Event Labels",     group="Display")
+i_showTable      = input.bool(true,  "Show Dashboard",        group="Display")
+i_tablePos       = input.string("Top Right", "Dashboard Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group="Display")
+i_sendDynamicAlerts = input.bool(true, "Send dynamic alert() payloads", group="Alerts")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §2 HELPERS & CORE METRICS
+// ═══════════════════════════════════════════════════════════════════════════
+
+safeDiv(n, d) => n / math.max(d, 1e-6)
+
+f_biasStr(isBull, isBear) =>
+    if isBull
+        "BULL"
+    else if isBear
+        "BEAR"
+    else
+        "NEUTRAL"
+
+f_longSetupType(isTrendDay, isPullbackDay, isRangeDay, isBull, isBear, isAboveVwap) =>
+    if (isTrendDay or isPullbackDay) and isBull and isAboveVwap
+        "TCL"
+    else if isRangeDay and not isBear and isAboveVwap
+        "RRL"
+    else
+        ""
+
+f_shortSetupType(isTrendDay, isPullbackDay, isRangeDay, isBull, isBear, isAboveVwap) =>
+    if (isTrendDay or isPullbackDay) and isBear and not isAboveVwap
+        "TCS"
+    else if isRangeDay and not isBull and not isAboveVwap
+        "RRS"
+    else
+        ""
+
+maSlowLenEff = math.max(i_slowMALen, i_fastMALen + 1)
+rangeBandHi  = 1.0 - i_rangeConst
+trendBandLo  = 1.0 - i_trendConst
+
+atr      = ta.atr(i_atrLen)
+atrEma   = ta.ema(atr, 20)
+cRange   = math.max(high - low, 1e-6)
+vwapSessionActive = not na(time(timeframe.period, i_vwapSession, "Asia/Kolkata"))
+newVwapSession = bar_index > 0 and vwapSessionActive and not vwapSessionActive[1]
+
+var float vwapPv = na
+var float vwapVol = na
+var int sessionBarsCount = 0
+
+if newVwapSession
+    vwapPv := hlc3 * volume
+    vwapVol := volume
+    sessionBarsCount := 1
+else if vwapSessionActive
+    vwapPv := nz(vwapPv) + hlc3 * volume
+    vwapVol := nz(vwapVol) + volume
+    sessionBarsCount := nz(sessionBarsCount) + 1
+else
+    vwapPv := na
+    vwapVol := na
+    sessionBarsCount := 0
+
+vwapVal  = not na(vwapVol) and vwapVol > 0 ? vwapPv / vwapVol : na
+symbolMeta = str.upper(syminfo.ticker + " " + syminfo.description)
+isOptionChart = syminfo.type == "option" or str.contains(symbolMeta, "CALL") or str.contains(symbolMeta, "PUT")
+instrumentOk = not (i_blockOptionCharts and isOptionChart)
+inMorningSession = not na(time(timeframe.period, i_morningSession, "Asia/Kolkata"))
+inAfternoonSession = not na(time(timeframe.period, i_afternoonSession, "Asia/Kolkata"))
+sessionAllowed = inMorningSession or inAfternoonSession
+istHour = hour(time, "Asia/Kolkata")
+istMinute = minute(time, "Asia/Kolkata")
+eodExitNow = i_forceEodExit and (istHour > i_eodExitHour or (istHour == i_eodExitHour and istMinute >= i_eodExitMinute))
+entryWindowOpen = instrumentOk and sessionAllowed and not eodExitNow
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §3 HTF BIAS — CLOSED BARS ONLY, NO WOBBLE
+// ═══════════════════════════════════════════════════════════════════════════
+
+htfClose = request.security(syminfo.tickerid, i_htfPeriod, close[1], barmerge.gaps_off, barmerge.lookahead_on)
+htfEma   = request.security(syminfo.tickerid, i_htfPeriod, ta.ema(close, i_htfEmaLen)[1], barmerge.gaps_off, barmerge.lookahead_on)
+htfLastHigh = request.security(syminfo.tickerid, i_htfPeriod, ta.valuewhen(not na(ta.pivothigh(high, i_htfSwingLen, i_htfSwingLen)), ta.pivothigh(high, i_htfSwingLen, i_htfSwingLen), 0)[1], barmerge.gaps_off, barmerge.lookahead_on)
+htfPrevHigh = request.security(syminfo.tickerid, i_htfPeriod, ta.valuewhen(not na(ta.pivothigh(high, i_htfSwingLen, i_htfSwingLen)), ta.pivothigh(high, i_htfSwingLen, i_htfSwingLen), 1)[1], barmerge.gaps_off, barmerge.lookahead_on)
+htfLastLow  = request.security(syminfo.tickerid, i_htfPeriod, ta.valuewhen(not na(ta.pivotlow(low, i_htfSwingLen, i_htfSwingLen)), ta.pivotlow(low, i_htfSwingLen, i_htfSwingLen), 0)[1], barmerge.gaps_off, barmerge.lookahead_on)
+htfPrevLow  = request.security(syminfo.tickerid, i_htfPeriod, ta.valuewhen(not na(ta.pivotlow(low, i_htfSwingLen, i_htfSwingLen)), ta.pivotlow(low, i_htfSwingLen, i_htfSwingLen), 1)[1], barmerge.gaps_off, barmerge.lookahead_on)
+
+htfHigherHigh = not na(htfLastHigh) and not na(htfPrevHigh) and htfLastHigh > htfPrevHigh
+htfHigherLow  = not na(htfLastLow) and not na(htfPrevLow) and htfLastLow > htfPrevLow
+htfLowerHigh  = not na(htfLastHigh) and not na(htfPrevHigh) and htfLastHigh < htfPrevHigh
+htfLowerLow   = not na(htfLastLow) and not na(htfPrevLow) and htfLastLow < htfPrevLow
+
+htfBull = htfHigherHigh and htfHigherLow and htfClose > htfEma
+htfBear = htfLowerHigh and htfLowerLow and htfClose < htfEma
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4 DAY TYPE CLASSIFICATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+dayTypeLenEff = math.min(i_dayTypeLen, sessionBarsCount)
+dayTypeLookback = math.max(dayTypeLenEff, 1)
+vwapAboveSample = close > vwapVal ? 1.0 : 0.0
+vwapAboveCntRaw = math.sum(vwapAboveSample, dayTypeLookback)
+vwapAboveCnt = dayTypeLenEff > 0 ? vwapAboveCntRaw : 0.0
+vwapConsist  = dayTypeLenEff > 0 ? safeDiv(vwapAboveCnt, dayTypeLenEff) : 0.5
+isExpanding  = dayTypeLenEff >= 3 and atr > atrEma * i_atrExpand
+
+dayTrend    = (vwapConsist >= i_trendConst or vwapConsist <= trendBandLo) and isExpanding
+dayRange    = (vwapConsist >= i_rangeConst and vwapConsist <= rangeBandHi) and not isExpanding
+dayPullback = not dayTrend and not dayRange
+
+dayTypeStr = dayTrend ? "TREND" : dayRange ? "RANGE" : "PULLBACK"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §5 OSCILLATORS
+// ═══════════════════════════════════════════════════════════════════════════
+
+wtAP    = hlc3
+wtESA   = ta.ema(wtAP, i_wtChLen)
+wtD     = ta.ema(math.abs(wtAP - wtESA), i_wtChLen)
+wt1     = ta.ema(safeDiv(wtAP - wtESA, 0.015 * wtD), i_wtAvgLen)
+wt2     = ta.sma(wt1, 3)
+
+wtBullTurn = ta.crossover(wt1, wt2) and wt2 < i_wtOSLevel
+wtBearTurn = ta.crossunder(wt1, wt2) and wt2 > i_wtOBLevel
+wtBullMom  = wt1 > wt2 and wt1 > wt1[1]
+wtBearMom  = wt1 < wt2 and wt1 < wt1[1]
+
+rsiVal         = ta.rsi(close, i_rsiLen)
+rsiLongAlign   = rsiVal > rsiVal[2] and rsiVal[2] < 55
+rsiShortAlign  = rsiVal < rsiVal[2] and rsiVal[2] > 45
+
+fastMA       = ta.ema(close, i_fastMALen)
+slowMA       = ta.ema(close, maSlowLenEff)
+maSpread     = safeDiv(fastMA - slowMA, slowMA) * 100.0
+maSpreadRankRaw = ta.percentrank(maSpread, i_maRankLen)
+maSpreadRank = sessionBarsCount >= 5 ? maSpreadRankRaw : 50.0
+maStretchL   = maSpreadRank < 25
+maStretchS   = maSpreadRank > 75
+
+oscRawL = (wtBullTurn or wtBullMom ? 1 : 0) + (rsiLongAlign ? 1 : 0) + (maStretchL ? 1 : 0)
+oscRawS = (wtBearTurn or wtBearMom ? 1 : 0) + (rsiShortAlign ? 1 : 0) + (maStretchS ? 1 : 0)
+oscCapL = math.min(oscRawL, 2)
+oscCapS = math.min(oscRawS, 2)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §6 UNMITIGATED LIQUIDITY POOLS — CAPPED, MITIGATED ON CLOSE-THROUGH
+// ═══════════════════════════════════════════════════════════════════════════
+
+var float[] topLiq = array.new_float()
+var float[] botLiq = array.new_float()
+
+ph = ta.pivothigh(high, i_swingLen, i_swingLen)
+pl = ta.pivotlow(low,  i_swingLen, i_swingLen)
+
+if not na(ph)
+    array.push(topLiq, ph)
+    if array.size(topLiq) > i_arrayCap
+        array.remove(topLiq, 0)
+
+if not na(pl)
+    array.push(botLiq, pl)
+    if array.size(botLiq) > i_arrayCap
+        array.remove(botLiq, 0)
+
+if array.size(topLiq) > 0
+    int i = array.size(topLiq) - 1
+    while i >= 0
+        if close > array.get(topLiq, i)
+            array.remove(topLiq, i)
+        i -= 1
+
+if array.size(botLiq) > 0
+    int i = array.size(botLiq) - 1
+    while i >= 0
+        if close < array.get(botLiq, i)
+            array.remove(botLiq, i)
+        i -= 1
+
+float nearRes = na
+float nearSup = na
+
+if array.size(topLiq) > 0
+    float minDRes = 1e15
+    for i = 0 to array.size(topLiq) - 1
+        lvl = array.get(topLiq, i)
+        dist = lvl - high
+        if dist > 0 and dist < minDRes
+            minDRes := dist
+            nearRes := lvl
+
+if array.size(botLiq) > 0
+    float minDSup = 1e15
+    for i = 0 to array.size(botLiq) - 1
+        lvl = array.get(botLiq, i)
+        dist = low - lvl
+        if dist > 0 and dist < minDSup
+            minDSup := dist
+            nearSup := lvl
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §7 SWEEP DETECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+wickRatioL = safeDiv(math.min(open, close) - low, cRange)
+wickRatioS = safeDiv(high - math.max(open, close), cRange)
+rangeVsAtr = safeDiv(cRange, atr)
+
+isSweepLow = not na(nearSup) and low < nearSup and close > nearSup and wickRatioL >= i_wickThresh and cRange > atr * 0.8
+isSweepHigh = not na(nearRes) and high > nearRes and close < nearRes and wickRatioS >= i_wickThresh and cRange > atr * 0.8
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §8 SETUP STATE MACHINE (FROZEN WHILE ARMED / IN TRADE)
+// ═══════════════════════════════════════════════════════════════════════════
+
+var int   setupState      = 0      // 0 flat, 1 long setup armed, -1 short setup armed
+var int   setupTimer      = 0
+var int   armedBarIndex   = na
+var int   armedTimeMs     = na
+var int   armedFvgWindow  = 0
+var float longMSS         = na
+var float shortMSS        = na
+var float longSL          = na
+var float shortSL         = na
+var float armedSweepLevel = na
+var float armedWickRatio  = na
+var float armedRangeVsAtr = na
+var float armedSweepPenAtr = na
+var float armedScore      = na
+var string armedSetupType = ""
+var string armedDayType   = ""
+var string armedHTF       = ""
+var string armedVWAPSide  = ""
+var string invReason      = ""
+var int   invBarsSurvived = na
+
+isTradeFlat = strategy.position_size == 0
+isArmable   = setupState == 0 and isTradeFlat and entryWindowOpen
+
+rawArmScoreLong() =>
+    mssLvl = ta.highest(high, i_swingLen)[1]
+    slLvl  = low - atr * i_slBuffer
+    mssPt  = (mssLvl - slLvl) > atr * 0.5 ? 1 : 0
+    penAtr = safeDiv(math.abs(nearSup - low), atr)
+    sLocArm = penAtr <= 0.5 ? 2 : 0
+    sLocArm + (htfBull ? 2 : 0) + (close > vwapVal ? 1 : 0) + (wickRatioL > i_wickThresh * 1.3 ? 1 : 0) + mssPt + math.min(oscRawL, 2)
+
+rawArmScoreShort() =>
+    mssLvl = ta.lowest(low, i_swingLen)[1]
+    slLvl  = high + atr * i_slBuffer
+    mssPt  = (slLvl - mssLvl) > atr * 0.5 ? 1 : 0
+    penAtr = safeDiv(math.abs(high - nearRes), atr)
+    sLocArm = penAtr <= 0.5 ? 2 : 0
+    sLocArm + (htfBear ? 2 : 0) + (close < vwapVal ? 1 : 0) + (wickRatioS > i_wickThresh * 1.3 ? 1 : 0) + mssPt + math.min(oscRawS, 2)
+
+longArmType = f_longSetupType(dayTrend, dayPullback, dayRange, htfBull, htfBear, close > vwapVal)
+shortArmType = f_shortSetupType(dayTrend, dayPullback, dayRange, htfBull, htfBear, close > vwapVal)
+
+if isSweepLow and isArmable and barstate.isconfirmed and longArmType != ""
+    setupState      := 1
+    setupTimer      := i_expiryBars
+    armedBarIndex   := bar_index
+    armedTimeMs     := time
+    armedFvgWindow  := i_fvgMaxBars > 0 ? i_fvgMaxBars : i_expiryBars
+    longMSS         := ta.highest(high, i_swingLen)[1]
+    longSL          := low - atr * i_slBuffer
+    shortMSS        := na
+    shortSL         := na
+    armedSweepLevel := nearSup
+    armedWickRatio  := wickRatioL
+    armedRangeVsAtr := rangeVsAtr
+    armedSweepPenAtr := safeDiv(math.abs(nearSup - low), atr)
+    armedSetupType  := longArmType
+    armedDayType    := dayTypeStr
+    armedHTF        := f_biasStr(htfBull, htfBear)
+    armedVWAPSide   := close > vwapVal ? "ABOVE" : "BELOW"
+    armedScore      := rawArmScoreLong()
+    invReason       := ""
+    invBarsSurvived := na
+
+if isSweepHigh and isArmable and barstate.isconfirmed and shortArmType != ""
+    setupState      := -1
+    setupTimer      := i_expiryBars
+    armedBarIndex   := bar_index
+    armedTimeMs     := time
+    armedFvgWindow  := i_fvgMaxBars > 0 ? i_fvgMaxBars : i_expiryBars
+    shortMSS        := ta.lowest(low, i_swingLen)[1]
+    shortSL         := high + atr * i_slBuffer
+    longMSS         := na
+    longSL          := na
+    armedSweepLevel := nearRes
+    armedWickRatio  := wickRatioS
+    armedRangeVsAtr := rangeVsAtr
+    armedSweepPenAtr := safeDiv(math.abs(high - nearRes), atr)
+    armedSetupType  := shortArmType
+    armedDayType    := dayTypeStr
+    armedHTF        := f_biasStr(htfBull, htfBear)
+    armedVWAPSide   := close > vwapVal ? "ABOVE" : "BELOW"
+    armedScore      := rawArmScoreShort()
+    invReason       := ""
+    invBarsSurvived := na
+
+if setupState != 0 and not na(armedBarIndex) and bar_index > armedBarIndex
+    setupTimer := math.max(0, setupTimer - 1)
+
+barsSinceArmed = setupState != 0 and not na(armedBarIndex) ? bar_index - armedBarIndex : na
+fvgWindowLive  = setupState != 0 and not na(barsSinceArmed) ? barsSinceArmed <= armedFvgWindow : false
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §9 INVALIDATION RULES — WITH REASON PLUMBING
+// ═══════════════════════════════════════════════════════════════════════════
+
+string longInvReason = ""
+string shortInvReason = ""
+
+if setupState == 1
+    if not instrumentOk
+        longInvReason := "OPTN_CHART"
+    else if not sessionAllowed or eodExitNow
+        longInvReason := "SESSION"
+    else if setupTimer == 0
+        longInvReason := "TIMER"
+    else if not na(longSL) and close < longSL
+        longInvReason := "SL_BREACH"
+    else if htfBear
+        longInvReason := "HTF_FLIP"
+    else if close < vwapVal * 0.998
+        longInvReason := "VWAP_BREAK"
+    else if isSweepHigh
+        longInvReason := "OPP_SWEEP"
+
+if setupState == -1
+    if not instrumentOk
+        shortInvReason := "OPTN_CHART"
+    else if not sessionAllowed or eodExitNow
+        shortInvReason := "SESSION"
+    else if setupTimer == 0
+        shortInvReason := "TIMER"
+    else if not na(shortSL) and close > shortSL
+        shortInvReason := "SL_BREACH"
+    else if htfBull
+        shortInvReason := "HTF_FLIP"
+    else if close > vwapVal * 1.002
+        shortInvReason := "VWAP_BREAK"
+    else if isSweepLow
+        shortInvReason := "OPP_SWEEP"
+
+longInvalidated  = setupState == 1 and longInvReason != ""
+shortInvalidated = setupState == -1 and shortInvReason != ""
+
+if (longInvalidated or shortInvalidated) and barstate.isconfirmed
+    invReason       := longInvalidated ? longInvReason : shortInvReason
+    invBarsSurvived := not na(armedBarIndex) ? (bar_index - armedBarIndex) : na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §10 FVG / DISPLACEMENT FILTER
+// ═══════════════════════════════════════════════════════════════════════════
+
+barRange1 = math.max(high[1] - low[1], 1e-6)
+fvgBody1  = safeDiv(math.abs(close[1] - open[1]), barRange1)
+
+fvgLong = low > high[2] and fvgBody1 >= i_bodyThresh and barRange1 > atr[1] * i_volThresh and close[1] > high[1] - barRange1 * 0.1
+fvgShort = high < low[2] and fvgBody1 >= i_bodyThresh and barRange1 > atr[1] * i_volThresh and close[1] < low[1] + barRange1 * 0.1
+fvgSizeVsAtr = safeDiv(barRange1, atr[1])
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §11 SETUP TYPE RESOLVER — FROZEN AT ARM TIME
+// ═══════════════════════════════════════════════════════════════════════════
+
+setupType = setupState != 0 ? armedSetupType : ""
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §12 SCORING ENGINE (0–10)
+// ═══════════════════════════════════════════════════════════════════════════
+
+sLoc = not na(armedSweepPenAtr) and armedSweepPenAtr <= 0.5 ? 2 : 0
+
+sL_htf = htfBull ? 2 : 0
+sL_vwp = close > vwapVal ? 1 : 0
+sL_swp = not na(armedWickRatio) and armedWickRatio > i_wickThresh * 1.3 ? 1 : 0
+sL_mss = not na(longMSS) and not na(longSL) and (longMSS - longSL) > atr * 0.5 ? 1 : 0
+sL_fvg = fvgSizeVsAtr > i_volThresh * 1.2 ? 1 : 0
+totalL = sLoc + sL_htf + sL_vwp + sL_swp + sL_mss + sL_fvg + oscCapL
+
+sS_htf = htfBear ? 2 : 0
+sS_vwp = close < vwapVal ? 1 : 0
+sS_swp = not na(armedWickRatio) and armedWickRatio > i_wickThresh * 1.3 ? 1 : 0
+sS_mss = not na(shortMSS) and not na(shortSL) and (shortSL - shortMSS) > atr * 0.5 ? 1 : 0
+sS_fvg = fvgSizeVsAtr > i_volThresh * 1.2 ? 1 : 0
+totalS = sLoc + sS_htf + sS_vwp + sS_swp + sS_mss + sS_fvg + oscCapS
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §13 ENTRY SIGNAL GENERATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+isTCL = setupType == "TCL"
+isTCS = setupType == "TCS"
+isRRL = setupType == "RRL"
+isRRS = setupType == "RRS"
+
+longCoreGate = setupState == 1 and setupType != "" and not na(longMSS) and close > longMSS and fvgLong and setupTimer > 0 and fvgWindowLive and bar_index > nz(armedBarIndex) and (wtBullTurn or wtBullMom)
+shortCoreGate = setupState == -1 and setupType != "" and not na(shortMSS) and close < shortMSS and fvgShort and setupTimer > 0 and fvgWindowLive and bar_index > nz(armedBarIndex) and (wtBearTurn or wtBearMom)
+
+longFamilyGate = isTCL or isRRL
+shortFamilyGate = isTCS or isRRS
+
+longEntrySignal = barstate.isconfirmed and entryWindowOpen and not longInvalidated and longCoreGate and longFamilyGate and totalL >= i_minScore and isTradeFlat
+shortEntrySignal = barstate.isconfirmed and entryWindowOpen and not shortInvalidated and shortCoreGate and shortFamilyGate and totalS >= i_minScore and isTradeFlat
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §14 PENDING ORDER SNAPSHOT / STRATEGY ENTRIES
+// ═══════════════════════════════════════════════════════════════════════════
+
+var int    pendingDir = 0
+var int    pendingBarIndex = na
+var string pendingType = ""
+var string pendingDay  = ""
+var string pendingHTF  = ""
+var float  pendingSL   = na
+var float  pendingSweep = na
+var float  pendingWick = na
+var float  pendingRangeAtr = na
+var float  pendingMSS  = na
+var float  pendingFvgAtr = na
+var int    pendingOscCount = na
+var int    pendingScore = na
+
+if longEntrySignal
+    pendingDir      := 1
+    pendingType     := armedSetupType
+    pendingDay      := armedDayType
+    pendingHTF      := armedHTF
+    pendingSL       := longSL
+    pendingSweep    := armedSweepLevel
+    pendingWick     := armedWickRatio
+    pendingRangeAtr := armedRangeVsAtr
+    pendingMSS      := longMSS
+    pendingFvgAtr   := fvgSizeVsAtr
+    pendingOscCount := oscRawL
+    pendingScore    := totalL
+    pendingBarIndex := bar_index
+    strategy.entry("LONG", strategy.long, comment=armedSetupType)
+
+if shortEntrySignal
+    pendingDir      := -1
+    pendingType     := armedSetupType
+    pendingDay      := armedDayType
+    pendingHTF      := armedHTF
+    pendingSL       := shortSL
+    pendingSweep    := armedSweepLevel
+    pendingWick     := armedWickRatio
+    pendingRangeAtr := armedRangeVsAtr
+    pendingMSS      := shortMSS
+    pendingFvgAtr   := fvgSizeVsAtr
+    pendingOscCount := oscRawS
+    pendingScore    := totalS
+    pendingBarIndex := bar_index
+    strategy.entry("SHORT", strategy.short, comment=armedSetupType)
+
+if longEntrySignal or shortEntrySignal
+    setupState      := 0
+    setupTimer      := 0
+    armedBarIndex   := na
+    armedTimeMs     := na
+    armedFvgWindow  := 0
+    longMSS         := na
+    shortMSS        := na
+    longSL          := na
+    shortSL         := na
+    armedSweepLevel := na
+    armedWickRatio  := na
+    armedRangeVsAtr := na
+    armedSweepPenAtr := na
+    armedScore      := na
+    armedSetupType  := ""
+    armedDayType    := ""
+    armedHTF        := ""
+    armedVWAPSide   := ""
+    invReason       := ""
+    invBarsSurvived := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §15 TRADE MANAGEMENT — PINNED SL/TP, PARTIAL AT 1R, BE SHIFT
+// ═══════════════════════════════════════════════════════════════════════════
+
+var bool  longExitSet  = false
+var bool  shortExitSet = false
+var bool  longBEArmed  = false
+var bool  shortBEArmed = false
+var float tradeSL      = na
+var float tradeTP      = na
+var float tradeOneR    = na
+var float tradeRisk    = na
+var float tradeEntry   = na
+var float tradeQty     = na
+var int   tradeBarOpen = na
+var string tradeType   = ""
+var string tradeDay    = ""
+var string tradeHTF    = ""
+var float tradeSweep   = na
+var float tradeWick    = na
+var float tradeRangeAtr= na
+var float tradeMSS     = na
+var float tradeFvgAtr  = na
+var int   tradeOscCount= na
+var int   tradeScore   = na
+
+newLongFill  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShortFill = strategy.position_size < 0 and strategy.position_size[1] >= 0
+flatNow      = strategy.position_size == 0
+tradeClosed  = strategy.position_size == 0 and strategy.position_size[1] != 0
+eodForceClose = eodExitNow and barstate.isconfirmed and strategy.position_size != 0
+
+if newLongFill
+    tradeEntry    := strategy.position_avg_price
+    tradeSL       := pendingSL
+    tradeRisk     := math.max(tradeEntry - tradeSL, atr * 0.1)
+    tradeOneR     := tradeEntry + tradeRisk * i_partialRR
+    tradeTP       := tradeEntry + tradeRisk * i_rrRatio
+    tradeQty      := math.abs(strategy.position_size)
+    tradeBarOpen  := bar_index
+    tradeType     := pendingType
+    tradeDay      := pendingDay
+    tradeHTF      := pendingHTF
+    tradeSweep    := pendingSweep
+    tradeWick     := pendingWick
+    tradeRangeAtr := pendingRangeAtr
+    tradeMSS      := pendingMSS
+    tradeFvgAtr   := pendingFvgAtr
+    tradeOscCount := pendingOscCount
+    tradeScore    := pendingScore
+    longExitSet   := false
+    longBEArmed   := false
+    shortExitSet  := false
+    shortBEArmed  := false
+    pendingDir      := 0
+    pendingBarIndex := na
+
+if newShortFill
+    tradeEntry    := strategy.position_avg_price
+    tradeSL       := pendingSL
+    tradeRisk     := math.max(tradeSL - tradeEntry, atr * 0.1)
+    tradeOneR     := tradeEntry - tradeRisk * i_partialRR
+    tradeTP       := tradeEntry - tradeRisk * i_rrRatio
+    tradeQty      := math.abs(strategy.position_size)
+    tradeBarOpen  := bar_index
+    tradeType     := pendingType
+    tradeDay      := pendingDay
+    tradeHTF      := pendingHTF
+    tradeSweep    := pendingSweep
+    tradeWick     := pendingWick
+    tradeRangeAtr := pendingRangeAtr
+    tradeMSS      := pendingMSS
+    tradeFvgAtr   := pendingFvgAtr
+    tradeOscCount := pendingOscCount
+    tradeScore    := pendingScore
+    shortExitSet  := false
+    shortBEArmed  := false
+    longExitSet   := false
+    longBEArmed   := false
+    pendingDir      := 0
+    pendingBarIndex := na
+
+if strategy.position_size > 0 and not eodForceClose and not longExitSet and not na(tradeSL) and not na(tradeTP) and not na(tradeOneR)
+    strategy.exit("L_PT1", from_entry="LONG", limit=tradeOneR, stop=tradeSL, qty_percent=i_partialPct)
+    strategy.exit("L_PT2", from_entry="LONG", limit=tradeTP,   stop=tradeSL, qty_percent=100 - i_partialPct)
+    longExitSet := true
+
+if strategy.position_size < 0 and not eodForceClose and not shortExitSet and not na(tradeSL) and not na(tradeTP) and not na(tradeOneR)
+    strategy.exit("S_PT1", from_entry="SHORT", limit=tradeOneR, stop=tradeSL, qty_percent=i_partialPct)
+    strategy.exit("S_PT2", from_entry="SHORT", limit=tradeTP,   stop=tradeSL, qty_percent=100 - i_partialPct)
+    shortExitSet := true
+
+remainingFrac   = 1.0 - i_partialPct / 100.0
+longPartialHit  = strategy.position_size > 0 and longExitSet and not longBEArmed and not na(tradeQty) and math.abs(strategy.position_size) <= tradeQty * (remainingFrac + 0.05)
+shortPartialHit = strategy.position_size < 0 and shortExitSet and not shortBEArmed and not na(tradeQty) and math.abs(strategy.position_size) <= tradeQty * (remainingFrac + 0.05)
+
+if longPartialHit
+    strategy.cancel("L_PT2")
+    strategy.exit("L_PT2_BE", from_entry="LONG", limit=tradeTP, stop=tradeEntry, qty_percent=100)
+    longBEArmed := true
+
+if shortPartialHit
+    strategy.cancel("S_PT2")
+    strategy.exit("S_PT2_BE", from_entry="SHORT", limit=tradeTP, stop=tradeEntry, qty_percent=100)
+    shortBEArmed := true
+
+if eodForceClose
+    strategy.cancel_all()
+    strategy.close_all(comment="EOD")
+    longExitSet  := true
+    shortExitSet := true
+
+if tradeClosed
+    longExitSet   := false
+    shortExitSet  := false
+    longBEArmed   := false
+    shortBEArmed  := false
+    tradeSL       := na
+    tradeTP       := na
+    tradeOneR     := na
+    tradeRisk     := na
+    tradeEntry    := na
+    tradeQty      := na
+    tradeBarOpen  := na
+    tradeType     := ""
+    tradeDay      := ""
+    tradeHTF      := ""
+    tradeSweep    := na
+    tradeWick     := na
+    tradeRangeAtr := na
+    tradeMSS      := na
+    tradeFvgAtr   := na
+    tradeOscCount := na
+    tradeScore    := na
+
+// Failsafe: clear pending snapshot if order somehow does not fill by next bar.
+if pendingDir != 0 and flatNow and not na(pendingBarIndex) and bar_index > pendingBarIndex + 1 and not newLongFill and not newShortFill
+    pendingDir      := 0
+    pendingType     := ""
+    pendingDay      := ""
+    pendingHTF      := ""
+    pendingSL       := na
+    pendingSweep    := na
+    pendingWick     := na
+    pendingRangeAtr := na
+    pendingMSS      := na
+    pendingFvgAtr   := na
+    pendingOscCount := na
+    pendingScore    := na
+    pendingBarIndex := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §16 DYNAMIC ALERT PAYLOADS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fmt(v) => na(v) ? "na" : str.tostring(v, format.mintick)
+
+entrySigL = close
+entrySigS = close
+expTpL    = not na(pendingSL) and entrySigL > pendingSL ? entrySigL + (entrySigL - pendingSL) * i_rrRatio : na
+expTpS    = not na(pendingSL) and pendingSL > entrySigS ? entrySigS - (pendingSL - entrySigS) * i_rrRatio : na
+
+entryMsgL = (
+    "SMC_ENTRY|type:" + pendingType + "|sym:" + syminfo.ticker + "|tf:" + timeframe.period +
+    "|entry:" + fmt(entrySigL) + "|sl:" + fmt(pendingSL) + "|tp:" + fmt(expTpL) +
+    "|score:" + str.tostring(pendingScore) + "|day:" + pendingDay + "|htf:" + pendingHTF +
+    "|sweep:" + fmt(pendingSweep) + "|wick:" + str.tostring(pendingWick, "#.###") +
+    "|rngATR:" + str.tostring(pendingRangeAtr, "#.###") + "|mss:" + fmt(pendingMSS) +
+    "|fvgATR:" + str.tostring(pendingFvgAtr, "#.###") + "|osc:" + str.tostring(pendingOscCount) +
+    "|time:" + str.tostring(time)
+)
+
+entryMsgS = (
+    "SMC_ENTRY|type:" + pendingType + "|sym:" + syminfo.ticker + "|tf:" + timeframe.period +
+    "|entry:" + fmt(entrySigS) + "|sl:" + fmt(pendingSL) + "|tp:" + fmt(expTpS) +
+    "|score:" + str.tostring(pendingScore) + "|day:" + pendingDay + "|htf:" + pendingHTF +
+    "|sweep:" + fmt(pendingSweep) + "|wick:" + str.tostring(pendingWick, "#.###") +
+    "|rngATR:" + str.tostring(pendingRangeAtr, "#.###") + "|mss:" + fmt(pendingMSS) +
+    "|fvgATR:" + str.tostring(pendingFvgAtr, "#.###") + "|osc:" + str.tostring(pendingOscCount) +
+    "|time:" + str.tostring(time)
+)
+
+invalidMsg = (
+    "SMC_INVALID|dir:" + (setupState == 1 ? "LONG" : "SHORT") +
+    "|reason:" + invReason + "|sym:" + syminfo.ticker + "|tf:" + timeframe.period +
+    "|sweep_time:" + str.tostring(armedTimeMs) + "|bars:" + str.tostring(invBarsSurvived) +
+    "|score:" + str.tostring(armedScore) + "|type:" + armedSetupType + "|day:" + armedDayType + "|htf:" + armedHTF + "|vwap:" + armedVWAPSide +
+    "|time:" + str.tostring(time)
+)
+
+if i_sendDynamicAlerts and barstate.isconfirmed and isSweepLow
+    alert("SMC_SWEEP|dir:LONG|sym:" + syminfo.ticker + "|tf:" + timeframe.period + "|level:" + fmt(nearSup) + "|time:" + str.tostring(time), alert.freq_once_per_bar_close)
+if i_sendDynamicAlerts and barstate.isconfirmed and isSweepHigh
+    alert("SMC_SWEEP|dir:SHORT|sym:" + syminfo.ticker + "|tf:" + timeframe.period + "|level:" + fmt(nearRes) + "|time:" + str.tostring(time), alert.freq_once_per_bar_close)
+if i_sendDynamicAlerts and longEntrySignal
+    alert(entryMsgL, alert.freq_once_per_bar_close)
+if i_sendDynamicAlerts and shortEntrySignal
+    alert(entryMsgS, alert.freq_once_per_bar_close)
+if i_sendDynamicAlerts and barstate.isconfirmed and (longInvalidated or shortInvalidated)
+    alert(invalidMsg, alert.freq_once_per_bar_close)
+
+// Static alertconditions for UI selection.
+alertcondition(barstate.isconfirmed and isSweepLow,  "Sweep Low Detected",  "Sweep low detected on confirmed bar")
+alertcondition(barstate.isconfirmed and isSweepHigh, "Sweep High Detected", "Sweep high detected on confirmed bar")
+alertcondition(longEntrySignal,  "LONG Entry Signal",  "Long entry signal on confirmed bar")
+alertcondition(shortEntrySignal, "SHORT Entry Signal", "Short entry signal on confirmed bar")
+alertcondition(longEntrySignal and totalL >= 8,  "High-Score LONG",  "High-score long entry on confirmed bar")
+alertcondition(shortEntrySignal and totalS >= 8, "High-Score SHORT", "High-score short entry on confirmed bar")
+alertcondition(barstate.isconfirmed and longInvalidated,  "Long Setup Invalidated",  "Long setup invalidated on confirmed bar")
+alertcondition(barstate.isconfirmed and shortInvalidated, "Short Setup Invalidated", "Short setup invalidated on confirmed bar")
+
+// Apply invalidation reset *after* alerts can read the reason.
+if (longInvalidated or shortInvalidated) and barstate.isconfirmed
+    setupState      := 0
+    setupTimer      := 0
+    armedBarIndex   := na
+    armedTimeMs     := na
+    armedFvgWindow  := 0
+    longMSS         := na
+    shortMSS        := na
+    longSL          := na
+    shortSL         := na
+    armedSweepLevel := na
+    armedWickRatio  := na
+    armedRangeVsAtr := na
+    armedSweepPenAtr := na
+    armedScore      := na
+    armedSetupType  := ""
+    armedDayType    := ""
+    armedHTF        := ""
+    armedVWAPSide   := ""
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §17 VISUALS — LOW PLOT COUNT (UNDER 64)
+// ═══════════════════════════════════════════════════════════════════════════
+
+plot(vwapVal, "VWAP", color=color.new(color.white, 10), linewidth=2)
+plot(i_showLiq ? nearRes : na, "Near Resistance", color=color.new(color.red, 40), linewidth=1, style=plot.style_stepline)
+plot(i_showLiq ? nearSup : na, "Near Support", color=color.new(color.green, 40), linewidth=1, style=plot.style_stepline)
+plot(i_showMSS ? longMSS : na, "Long MSS", color=color.new(color.lime, 55), linewidth=1, style=plot.style_stepline)
+plot(i_showMSS ? shortMSS : na, "Short MSS", color=color.new(color.orange, 55), linewidth=1, style=plot.style_stepline)
+plot(i_showTradeLvls and strategy.position_size != 0 ? tradeSL : na, "Trade SL", color=color.new(color.red, 10), linewidth=2, style=plot.style_linebr)
+plot(i_showTradeLvls and strategy.position_size != 0 ? tradeTP : na, "Trade TP", color=color.new(color.green, 10), linewidth=2, style=plot.style_linebr)
+plot(i_showTradeLvls and strategy.position_size != 0 ? tradeOneR : na, "Trade 1R", color=color.new(color.blue, 20), linewidth=1, style=plot.style_linebr)
+
+bgcolor(setupState == 1 ? color.new(color.teal, 95) : setupState == -1 ? color.new(color.red, 95) : na)
+
+if i_showLabels and barstate.isconfirmed and isSweepLow
+    label.new(bar_index, low - atr * 0.25, "SWP ▲", style=label.style_label_up, color=color.new(color.teal, 10), textcolor=color.white, size=size.small)
+if i_showLabels and barstate.isconfirmed and isSweepHigh
+    label.new(bar_index, high + atr * 0.25, "SWP ▼", style=label.style_label_down, color=color.new(color.red, 10), textcolor=color.white, size=size.small)
+
+if i_showLabels and longEntrySignal
+    label.new(bar_index, low - atr * 0.55, "Long", style=label.style_label_up, color=color.new(color.green, 25), textcolor=color.white, size=size.small)
+if i_showLabels and shortEntrySignal
+    label.new(bar_index, high + atr * 0.55, "Short", style=label.style_label_down, color=color.new(color.red, 25), textcolor=color.white, size=size.small)
+if i_showLabels and barstate.isconfirmed and (longInvalidated or shortInvalidated)
+    label.new(bar_index, close, "✕ " + invReason, style=label.style_label_center, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+
+if i_showFVG and barstate.isconfirmed and fvgLong and (setupState == 1 or longEntrySignal)
+    box.new(bar_index - 1, high[2], bar_index + math.max(armedFvgWindow, 1), low, border_color=color.new(color.green, 45), bgcolor=color.new(color.green, 88))
+if i_showFVG and barstate.isconfirmed and fvgShort and (setupState == -1 or shortEntrySignal)
+    box.new(bar_index - 1, high, bar_index + math.max(armedFvgWindow, 1), low[2], border_color=color.new(color.red, 45), bgcolor=color.new(color.red, 88))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §18 DASHBOARD TABLE
+// ═══════════════════════════════════════════════════════════════════════════
+
+tablePos = switch i_tablePos
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    => position.top_right
+
+var table dash = table.new(tablePos, 2, 20, border_width=1, border_color=color.new(color.gray, 55), frame_width=1, frame_color=color.new(color.gray, 45))
+
+if i_showTable and barstate.islast
+    hdr  = color.new(#0d1117, 10)
+    rowA = color.new(#161b22, 15)
+    rowB = color.new(#21262d, 25)
+    bull = color.new(color.teal, 20)
+    bear = color.new(color.red, 20)
+    warn = color.new(color.orange, 20)
+    gray = color.new(color.gray, 60)
+    txt  = color.white
+    muted= color.new(color.white, 35)
+
+    htfStr  = f_biasStr(htfBull, htfBear)
+    vwapStr = close > vwapVal ? "ABOVE" : "BELOW"
+    setStr  = not instrumentOk ? "BLOCKED" : setupState == 1 ? "LONG (" + str.tostring(setupTimer) + ")" : setupState == -1 ? "SHORT (" + str.tostring(setupTimer) + ")" : strategy.position_size > 0 ? "IN LONG" : strategy.position_size < 0 ? "IN SHORT" : "FLAT"
+    setCol  = not instrumentOk ? warn : setupState == 1 ? bull : setupState == -1 ? bear : strategy.position_size > 0 ? bull : strategy.position_size < 0 ? bear : gray
+    actType = setupState != 0 ? setupType : strategy.position_size != 0 ? tradeType : "—"
+    actScr  = setupState == 1 ? str.tostring(totalL) : setupState == -1 ? str.tostring(totalS) : strategy.position_size != 0 ? str.tostring(tradeScore) : "—"
+    actMSS  = setupState == 1 ? fmt(longMSS) : setupState == -1 ? fmt(shortMSS) : fmt(tradeMSS)
+    actSL   = setupState == 1 ? fmt(longSL) : setupState == -1 ? fmt(shortSL) : fmt(tradeSL)
+    actOsc  = setupState == 1 ? str.tostring(oscRawL) : setupState == -1 ? str.tostring(oscRawS) : strategy.position_size != 0 ? str.tostring(tradeOscCount) : "—"
+    fvgStr  = (setupState == 1 and fvgLong) or (setupState == -1 and fvgShort) ? "YES" : "NO"
+    fvgCol  = fvgStr == "YES" ? bull : gray
+    buySigStr = not instrumentOk ? "BLOCKED" : longEntrySignal ? "YES" : "NO"
+    sellSigStr = not instrumentOk ? "BLOCKED" : shortEntrySignal ? "YES" : "NO"
+    buySigCol = not instrumentOk ? warn : longEntrySignal ? bull : gray
+    sellSigCol = not instrumentOk ? warn : shortEntrySignal ? bear : gray
+
+    table.cell(dash, 0, 0,  "SMC FRAMEWORK PRO", bgcolor=hdr, text_color=txt, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 1, 0,  syminfo.ticker + " " + timeframe.period, bgcolor=hdr, text_color=txt, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 0, 1,  "Day Type", bgcolor=rowA, text_color=muted)
+    table.cell(dash, 1, 1,  dayTypeStr, bgcolor=dayTrend ? bull : dayRange ? warn : color.new(color.purple, 35), text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 2,  "HTF Bias", bgcolor=rowB, text_color=muted)
+    table.cell(dash, 1, 2,  htfStr, bgcolor=htfBull ? bull : htfBear ? bear : gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 3,  "VWAP Side", bgcolor=rowA, text_color=muted)
+    table.cell(dash, 1, 3,  vwapStr, bgcolor=close > vwapVal ? bull : bear, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 4,  "Near Res", bgcolor=rowB, text_color=muted)
+    table.cell(dash, 1, 4,  fmt(nearRes), bgcolor=gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 5,  "Near Sup", bgcolor=rowA, text_color=muted)
+    table.cell(dash, 1, 5,  fmt(nearSup), bgcolor=gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 6,  "WaveTrend", bgcolor=rowB, text_color=muted)
+    table.cell(dash, 1, 6,  str.tostring(math.round(wt1, 1)), bgcolor=wt1 > wt2 ? bull : bear, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 7,  "RSI", bgcolor=rowA, text_color=muted)
+    table.cell(dash, 1, 7,  str.tostring(math.round(rsiVal, 1)), bgcolor=rsiVal < 35 ? bull : rsiVal > 65 ? bear : gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 8,  "MA Rank", bgcolor=rowB, text_color=muted)
+    table.cell(dash, 1, 8,  str.tostring(math.round(maSpreadRank, 1)) + "%", bgcolor=maStretchL ? bull : maStretchS ? bear : gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 9,  "State", bgcolor=rowA, text_color=muted)
+    table.cell(dash, 1, 9,  setStr, bgcolor=setCol, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 10, "Type", bgcolor=rowB, text_color=muted)
+    table.cell(dash, 1, 10, actType, bgcolor=gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 11, "Score", bgcolor=rowA, text_color=muted)
+    table.cell(dash, 1, 11, actScr, bgcolor=str.tonumber(actScr) >= 8 ? bull : str.tonumber(actScr) >= i_minScore ? warn : gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 12, "MSS", bgcolor=rowB, text_color=muted)
+    table.cell(dash, 1, 12, actMSS, bgcolor=gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 13, "SL", bgcolor=rowA, text_color=muted)
+    table.cell(dash, 1, 13, actSL, bgcolor=gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 14, "FVG", bgcolor=rowB, text_color=muted)
+    table.cell(dash, 1, 14, fvgStr, bgcolor=fvgCol, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 15, "Osc Count", bgcolor=rowA, text_color=muted)
+    table.cell(dash, 1, 15, actOsc, bgcolor=gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 16, "BUY", bgcolor=rowB, text_color=muted)
+    table.cell(dash, 1, 16, buySigStr, bgcolor=buySigCol, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 17, "SELL", bgcolor=rowA, text_color=muted)
+    table.cell(dash, 1, 17, sellSigStr, bgcolor=sellSigCol, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 18, "Timer", bgcolor=rowB, text_color=muted)
+    table.cell(dash, 1, 18, setupState != 0 ? str.tostring(setupTimer) : "—", bgcolor=gray, text_color=txt, text_halign=text.align_center)
+    table.cell(dash, 0, 19, "Last Invalidation", bgcolor=rowA, text_color=muted)
+    table.cell(dash, 1, 19, invReason == "" ? "—" : invReason, bgcolor=invReason == "" ? gray : warn, text_color=txt, text_halign=text.align_center)

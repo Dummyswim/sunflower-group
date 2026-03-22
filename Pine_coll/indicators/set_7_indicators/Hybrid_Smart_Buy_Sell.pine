@@ -1,0 +1,410 @@
+//@version=6
+indicator("Mobile Hybrid Smart Buy/Sell", shorttitle="HybridSmartLine", overlay=true, max_labels_count=300, max_lines_count=100)
+
+// =====================================================
+// INPUTS
+// =====================================================
+grpMap = "1) Value Map"
+rangeLen        = input.int(60, "Map Lookback", minval=20, maxval=300, group=grpMap)
+zonePct         = input.float(0.18, "Buyer / Seller Zone %", minval=0.05, maxval=0.40, step=0.01, group=grpMap)
+nearZoneATR     = input.float(0.20, "Near Zone Buffer x ATR", minval=0.0, maxval=2.0, step=0.05, group=grpMap)
+
+grpTrend = "2) Trend + Trigger"
+emaFastLen      = input.int(9, "Fast EMA", minval=2, maxval=100, group=grpTrend)
+emaSlowLen      = input.int(21, "Slow EMA", minval=5, maxval=200, group=grpTrend)
+emaTrendLen     = input.int(50, "Trend EMA", minval=10, maxval=300, group=grpTrend)
+atrLen          = input.int(14, "ATR Length", minval=5, maxval=100, group=grpTrend)
+unlockLookback  = input.int(3, "Unlock Pivot Lookback", minval=1, maxval=20, group=grpTrend)
+touchBufferATR  = input.float(0.08, "Retest Buffer x ATR", minval=0.0, maxval=1.0, step=0.01, group=grpTrend)
+wickBodyRatio   = input.float(1.30, "Rejection Wick / Body Ratio", minval=0.5, maxval=5.0, step=0.1, group=grpTrend)
+instVolMult     = input.float(1.40, "Institutional Volume Mult", minval=1.0, maxval=5.0, step=0.1, group=grpTrend)
+
+grpHTF = "3) Higher Timeframe Filter"
+useHTF          = input.bool(true, "Use HTF Bias", group=grpHTF)
+htfTf           = input.timeframe("15", "HTF Timeframe", group=grpHTF)
+htfRangeLen     = input.int(60, "HTF Range Lookback", minval=20, maxval=300, group=grpHTF)
+
+grpScore = "4) Score Engine"
+watchThreshold      = input.int(55, "Watch Threshold", minval=1, maxval=100, group=grpScore)
+prepThreshold       = input.int(64, "Prep Threshold", minval=1, maxval=100, group=grpScore)
+finalScoreThreshold = input.int(72, "Final Buy/Sell Threshold", minval=1, maxval=100, group=grpScore)
+edgeThreshold       = input.int(8, "Edge Threshold", minval=1, maxval=50, group=grpScore)
+cooldownBars        = input.int(5, "Cooldown Bars", minval=0, maxval=50, group=grpScore)
+minRoomATR          = input.float(0.80, "Minimum Room To Opposite Zone x ATR", minval=0.10, maxval=5.0, step=0.05, group=grpScore)
+
+grpTrail = "5) Smart Moving Lines"
+trailFastATR    = input.float(1.20, "Fast Trail x ATR", minval=0.20, maxval=10.0, step=0.05, group=grpTrail)
+trailSlowATR    = input.float(1.80, "Slow Trail x ATR", minval=0.20, maxval=10.0, step=0.05, group=grpTrail)
+exitOnOppPrep   = input.bool(true, "Book Profit On Opposite Core Signal", group=grpTrail)
+
+grpStyle = "6) Visuals"
+showZones       = input.bool(true, "Show Buyer / Seller Zones", group=grpStyle)
+showEMAs        = input.bool(false, "Show EMAs", group=grpStyle)
+showLabels      = input.bool(true, "Show Smart Labels", group=grpStyle)
+showTable       = input.bool(true, "Show Compact Table", group=grpStyle)
+tableLayout     = input.string("Mobile Compact", "Table Layout", options=["Mobile Compact", "Full"], group=grpStyle)
+tablePosition   = input.string("Top Right", "Table Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=grpStyle)
+showBarTint     = input.bool(true, "Tint Bars By Active State", group=grpStyle)
+showDebugTable  = input.bool(false, "Show Gate Debug", group=grpStyle)
+
+grpContext = "7) Underlying Context"
+useUnderlyingContext = input.bool(false, "Use Underlying Context", group=grpContext)
+underlyingTicker = input.symbol("NSE:NIFTY", "Underlying Symbol", group=grpContext)
+optionMode = input.string("NONE", "Instrument Mode", options=["NONE", "CALL", "PUT"], group=grpContext)
+
+// =====================================================
+// HELPERS
+// =====================================================
+sec_confirmed(tf, expr) =>
+    request.security(syminfo.tickerid, tf, expr[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+f_clamp(v, lo, hi) =>
+    math.max(lo, math.min(hi, v))
+
+f_bool_text(v) =>
+    v ? "Y" : "N"
+
+isCompactTable = tableLayout == "Mobile Compact"
+tableTextSize = isCompactTable ? size.tiny : size.small
+tableAnchor = tablePosition == "Top Left" ? position.top_left :
+     tablePosition == "Top Center" ? position.top_center :
+     tablePosition == "Top Right" ? position.top_right :
+     tablePosition == "Middle Left" ? position.middle_left :
+     tablePosition == "Middle Center" ? position.middle_center :
+     tablePosition == "Middle Right" ? position.middle_right :
+     tablePosition == "Bottom Left" ? position.bottom_left :
+     tablePosition == "Bottom Center" ? position.bottom_center : position.bottom_right
+
+// =====================================================
+// CORE SERIES
+// =====================================================
+atr = ta.atr(atrLen)
+rangeBar = math.max(high - low, syminfo.mintick)
+body = math.abs(close - open)
+bodyFrac = body / rangeBar
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+closePos = (close - low) / rangeBar
+
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+emaTrend = ta.ema(close, emaTrendLen)
+vwapVal = ta.vwap(hlc3)
+volMA = ta.sma(volume, 20)
+relVol = na(volMA) or volMA == 0.0 ? 1.0 : volume / volMA
+
+bullFlow = emaFast > emaSlow and close > emaTrend and close >= vwapVal
+bearFlow = emaFast < emaSlow and close < emaTrend and close <= vwapVal
+
+mapHigh = ta.highest(high, rangeLen)
+mapLow = ta.lowest(low, rangeLen)
+mapRange = math.max(mapHigh - mapLow, syminfo.mintick * 20)
+mapMid = (mapHigh + mapLow) * 0.5
+buyerZoneHigh = mapLow + mapRange * zonePct
+sellerZoneLow = mapHigh - mapRange * zonePct
+buyerZoneLow = mapLow
+sellerZoneHigh = mapHigh
+
+inBuyerZone = close <= buyerZoneHigh or low <= buyerZoneHigh + atr * nearZoneATR
+inSellerZone = close >= sellerZoneLow or high >= sellerZoneLow - atr * nearZoneATR
+inDiscount = close <= mapMid
+inPremium = close >= mapMid
+inMiddle = close > buyerZoneHigh and close < sellerZoneLow
+
+htfClose = useHTF ? sec_confirmed(htfTf, close) : close
+htfTrend = useHTF ? sec_confirmed(htfTf, ta.ema(close, emaTrendLen)) : emaTrend
+htfHigh = useHTF ? sec_confirmed(htfTf, ta.highest(high, htfRangeLen)) : mapHigh
+htfLow = useHTF ? sec_confirmed(htfTf, ta.lowest(low, htfRangeLen)) : mapLow
+htfMid = (htfHigh + htfLow) * 0.5
+htfBull = htfClose > htfTrend
+htfBear = htfClose < htfTrend
+
+ctxConfigured = underlyingTicker != ""
+ctxInvalid = useUnderlyingContext and optionMode != "NONE" and ctxConfigured and underlyingTicker == syminfo.tickerid
+ctxActive = useUnderlyingContext and ctxConfigured and not ctxInvalid
+ctxSymbol = ctxActive ? underlyingTicker : syminfo.tickerid
+ctxClose = request.security(ctxSymbol, timeframe.period, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+ctxTrend = request.security(ctxSymbol, timeframe.period, ta.ema(close, emaTrendLen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+ctxHtfClose = request.security(ctxSymbol, htfTf, close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+ctxHtfTrend = request.security(ctxSymbol, htfTf, ta.ema(close, emaTrendLen)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+ctxBull = ctxClose > ctxTrend and ctxHtfClose > ctxHtfTrend
+ctxBear = ctxClose < ctxTrend and ctxHtfClose < ctxHtfTrend
+ctxLongOk = not ctxActive ? true : optionMode == "CALL" ? ctxBull : optionMode == "PUT" ? ctxBear : true
+ctxShortOk = not ctxActive ? true : optionMode == "CALL" ? ctxBear : optionMode == "PUT" ? ctxBull : true
+
+bullReject = lowerWick > body * wickBodyRatio and closePos >= 0.60 and close > open
+bearReject = upperWick > body * wickBodyRatio and closePos <= 0.40 and close < open
+institutionalBuy = relVol >= instVolMult and close > open and bodyFrac >= 0.55
+institutionalSell = relVol >= instVolMult and close < open and bodyFrac >= 0.55
+
+longTouch = low <= math.max(emaFast, emaSlow) + atr * touchBufferATR and close > emaFast and closePos >= 0.55
+shortTouch = high >= math.min(emaFast, emaSlow) - atr * touchBufferATR and close < emaFast and closePos <= 0.45
+
+unlockLongPivot = ta.highest(high[1], unlockLookback)
+unlockShortPivot = ta.lowest(low[1], unlockLookback)
+unlockLong = close > unlockLongPivot
+unlockShort = close < unlockShortPivot
+
+longRoomOk = close < mapMid and (sellerZoneLow - close) > atr * minRoomATR
+shortRoomOk = close > mapMid and (close - buyerZoneHigh) > atr * minRoomATR
+
+// =====================================================
+// HYBRID SCORE ENGINE
+// =====================================================
+longTrendComp = bullFlow ? 100.0 : emaFast > emaSlow ? 76.0 : close > emaTrend ? 58.0 : 22.0
+shortTrendComp = bearFlow ? 100.0 : emaFast < emaSlow ? 76.0 : close < emaTrend ? 58.0 : 22.0
+
+longValueComp = inBuyerZone ? 96.0 : inDiscount ? 70.0 : inMiddle ? 26.0 : 12.0
+shortValueComp = inSellerZone ? 96.0 : inPremium ? 70.0 : inMiddle ? 26.0 : 12.0
+
+longTriggerComp = unlockLong and (longTouch or bullReject or institutionalBuy) ? 100.0 : longTouch ? 74.0 : bullReject ? 66.0 : institutionalBuy ? 82.0 : 20.0
+shortTriggerComp = unlockShort and (shortTouch or bearReject or institutionalSell) ? 100.0 : shortTouch ? 74.0 : bearReject ? 66.0 : institutionalSell ? 82.0 : 20.0
+
+longHTFComp = not useHTF ? 50.0 : htfBull ? (close <= htfMid ? 92.0 : 72.0) : inBuyerZone ? 58.0 : inDiscount ? 46.0 : 28.0
+shortHTFComp = not useHTF ? 50.0 : htfBear ? (close >= htfMid ? 92.0 : 72.0) : inSellerZone ? 58.0 : inPremium ? 46.0 : 28.0
+
+longFlowComp = institutionalBuy ? 94.0 : bullReject ? 62.0 : 28.0
+shortFlowComp = institutionalSell ? 94.0 : bearReject ? 62.0 : 28.0
+
+wTrend = 0.28
+wValue = 0.24
+wTrigger = 0.27
+wHTF = 0.10
+wFlow = 0.11
+
+pLong = longTrendComp * wTrend + longValueComp * wValue + longTriggerComp * wTrigger + longHTFComp * wHTF + longFlowComp * wFlow
+pShort = shortTrendComp * wTrend + shortValueComp * wValue + shortTriggerComp * wTrigger + shortHTFComp * wHTF + shortFlowComp * wFlow
+
+pLongRounded = int(math.round(f_clamp(pLong, 0.0, 100.0)))
+pShortRounded = int(math.round(f_clamp(pShort, 0.0, 100.0)))
+longEdge = pLongRounded - pShortRounded
+shortEdge = pShortRounded - pLongRounded
+dominantSide = pLongRounded > pShortRounded ? 1 : pShortRounded > pLongRounded ? -1 : 0
+
+watchEdgeMin = math.max(4, int(math.floor(edgeThreshold * 0.50)))
+prepEdgeMin = math.max(6, int(math.floor(edgeThreshold * 0.70)))
+
+longTriggerPresent = bullFlow or bullReject or institutionalBuy or longTouch
+shortTriggerPresent = bearFlow or bearReject or institutionalSell or shortTouch
+
+longWatchReady = ctxLongOk and dominantSide == 1 and pLongRounded >= watchThreshold and longEdge >= watchEdgeMin and longTriggerPresent and not inSellerZone
+shortWatchReady = ctxShortOk and dominantSide == -1 and pShortRounded >= watchThreshold and shortEdge >= watchEdgeMin and shortTriggerPresent and not inBuyerZone
+
+longCountertrendOk = htfBull or (inBuyerZone and bullReject and close > emaFast and close >= vwapVal) or institutionalBuy
+shortCountertrendOk = htfBear or (inSellerZone and bearReject and close < emaFast and close <= vwapVal) or institutionalSell
+
+longPrepReady = longWatchReady and pLongRounded >= prepThreshold and longEdge >= prepEdgeMin and longRoomOk and (longTouch or bullReject or institutionalBuy) and longCountertrendOk
+shortPrepReady = shortWatchReady and pShortRounded >= prepThreshold and shortEdge >= prepEdgeMin and shortRoomOk and (shortTouch or bearReject or institutionalSell) and shortCountertrendOk
+
+var int lastActionBar = na
+var int lastLongExitBar = na
+var int lastShortExitBar = na
+cooldownOk = na(lastActionBar) or (bar_index - lastActionBar > cooldownBars)
+
+longCorePass = longPrepReady and unlockLong and pLongRounded >= finalScoreThreshold and longEdge >= edgeThreshold and longRoomOk and (not useHTF or htfBull or inBuyerZone)
+shortCorePass = shortPrepReady and unlockShort and pShortRounded >= finalScoreThreshold and shortEdge >= edgeThreshold and shortRoomOk and (not useHTF or htfBear or inSellerZone)
+
+// True fast-track overrides: do not depend on prep readiness.
+longReversalPass = unlockLong and longRoomOk and inDiscount and bullReject and longEdge >= edgeThreshold + 4 and pLongRounded >= watchThreshold
+shortReversalPass = unlockShort and shortRoomOk and inPremium and bearReject and shortEdge >= edgeThreshold + 4 and pShortRounded >= watchThreshold
+
+barsSinceLongExit = na(lastLongExitBar) ? 100000 : bar_index - lastLongExitBar
+barsSinceShortExit = na(lastShortExitBar) ? 100000 : bar_index - lastShortExitBar
+longContinuationPass = barsSinceLongExit <= 15 and inDiscount and longRoomOk and unlockLong and longEdge >= edgeThreshold and pLongRounded >= watchThreshold and (bullReject or institutionalBuy or longTouch)
+shortContinuationPass = barsSinceShortExit <= 15 and inPremium and shortRoomOk and unlockShort and shortEdge >= edgeThreshold and pShortRounded >= watchThreshold and (bearReject or institutionalSell or shortTouch)
+
+buyOverride = longReversalPass or longContinuationPass
+sellOverride = shortReversalPass or shortContinuationPass
+
+rawBuySignal = barstate.isconfirmed and cooldownOk and ctxLongOk and (longCorePass or buyOverride)
+rawSellSignal = barstate.isconfirmed and cooldownOk and ctxShortOk and (shortCorePass or sellOverride)
+
+// =====================================================
+// CAMPAIGN STATE + SMART MOVING LINES
+// =====================================================
+var int state = 0
+var float trailFast = na
+var float trailSlow = na
+var float entryPrice = na
+
+longBaseFast = hl2 - atr * trailFastATR
+longBaseSlow = hl2 - atr * trailSlowATR
+shortBaseFast = hl2 + atr * trailFastATR
+shortBaseSlow = hl2 + atr * trailSlowATR
+
+if state == 1
+    trailFast := math.max(nz(trailFast, longBaseFast), longBaseFast)
+    trailSlow := math.max(nz(trailSlow, longBaseSlow), longBaseSlow)
+else if state == -1
+    trailFast := math.min(nz(trailFast, shortBaseFast), shortBaseFast)
+    trailSlow := math.min(nz(trailSlow, shortBaseSlow), shortBaseSlow)
+
+longTrailExit = state == 1 and close < trailFast and (close < emaFast or close < trailSlow)
+shortTrailExit = state == -1 and close > trailFast and (close > emaFast or close > trailSlow)
+longOppCoreExit = exitOnOppPrep and ctxShortOk and shortCorePass
+shortOppCoreExit = exitOnOppPrep and ctxLongOk and longCorePass
+
+longBookProfit = state == 1 and barstate.isconfirmed and (longTrailExit or longOppCoreExit)
+shortBookProfit = state == -1 and barstate.isconfirmed and (shortTrailExit or shortOppCoreExit)
+
+if longBookProfit
+    if showLabels
+        label.new(bar_index, high + atr * 0.20, "Book Profit", style=label.style_label_down, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+    lastLongExitBar := bar_index
+    state := 0
+    trailFast := na
+    trailSlow := na
+    entryPrice := na
+    lastActionBar := bar_index
+
+if shortBookProfit
+    if showLabels
+        label.new(bar_index, low - atr * 0.20, "Book Profit", style=label.style_label_up, color=color.new(color.orange, 0), textcolor=color.white, size=size.small)
+    lastShortExitBar := bar_index
+    state := 0
+    trailFast := na
+    trailSlow := na
+    entryPrice := na
+    lastActionBar := bar_index
+
+justExited = longBookProfit or shortBookProfit
+buySignal = rawBuySignal and state == 0 and not justExited
+sellSignal = rawSellSignal and state == 0 and not justExited
+
+if buySignal
+    state := 1
+    entryPrice := close
+    trailFast := longBaseFast
+    trailSlow := longBaseSlow
+    lastActionBar := bar_index
+    if showLabels
+        label.new(bar_index, low - atr * 0.25, "Smart Buy", style=label.style_label_up, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+
+if sellSignal
+    state := -1
+    entryPrice := close
+    trailFast := shortBaseFast
+    trailSlow := shortBaseSlow
+    lastActionBar := bar_index
+    if showLabels
+        label.new(bar_index, high + atr * 0.25, "Smart Sell", style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.white, size=size.small)
+
+// =====================================================
+// PLOTS
+// =====================================================
+plot(showEMAs ? emaFast : na, "EMA Fast", color=color.new(color.aqua, 0), linewidth=1)
+plot(showEMAs ? emaSlow : na, "EMA Slow", color=color.new(color.blue, 15), linewidth=1)
+plot(showEMAs ? emaTrend : na, "EMA Trend", color=color.new(color.yellow, 25), linewidth=1)
+
+buyZoneTopPlot = plot(showZones ? buyerZoneHigh : na, "Buyer Zone High", color=color.new(color.lime, 95), linewidth=1, style=plot.style_linebr)
+buyZoneBotPlot = plot(showZones ? buyerZoneLow : na, "Buyer Zone Low", color=color.new(color.lime, 100), linewidth=1, style=plot.style_linebr)
+fill(buyZoneTopPlot, buyZoneBotPlot, color=showZones ? color.new(color.lime, 92) : na, title="Buyer Zone Fill")
+
+sellZoneTopPlot = plot(showZones ? sellerZoneHigh : na, "Seller Zone High", color=color.new(color.red, 100), linewidth=1, style=plot.style_linebr)
+sellZoneBotPlot = plot(showZones ? sellerZoneLow : na, "Seller Zone Low", color=color.new(color.red, 95), linewidth=1, style=plot.style_linebr)
+fill(sellZoneTopPlot, sellZoneBotPlot, color=showZones ? color.new(color.red, 92) : na, title="Seller Zone Fill")
+
+plot(state == 1 ? trailFast : na, "Long Fast Trail", color=color.new(color.blue, 0), linewidth=2, style=plot.style_linebr)
+plot(state == 1 ? trailSlow : na, "Long Slow Trail", color=color.new(color.blue, 30), linewidth=2, style=plot.style_linebr)
+plot(state == -1 ? trailFast : na, "Short Fast Trail", color=color.new(color.red, 0), linewidth=2, style=plot.style_linebr)
+plot(state == -1 ? trailSlow : na, "Short Slow Trail", color=color.new(color.red, 30), linewidth=2, style=plot.style_linebr)
+
+barcolor(showBarTint ? state == 1 ? color.new(color.blue, 70) : state == -1 ? color.new(color.red, 70) : na : na)
+
+plotshape(buySignal, title="BUY", style=shape.labelup, location=location.belowbar, color=color.new(color.blue, 0), textcolor=color.white, text="BUY", size=size.tiny)
+plotshape(sellSignal, title="SELL", style=shape.labeldown, location=location.abovebar, color=color.new(color.orange, 0), textcolor=color.white, text="SELL", size=size.tiny)
+
+// =====================================================
+// COMPACT TABLE
+// =====================================================
+var table dash = table.new(position.top_right, 2, 19, bgcolor=color.new(color.black, 55), border_color=color.new(color.gray, 65), border_width=1)
+
+if barstate.islast
+    table.set_position(dash, tableAnchor)
+    if showTable
+        positionTxt = state == 1 ? "LONG" : state == -1 ? "SHORT" : "FLAT"
+        positionCol = state == 1 ? color.aqua : state == -1 ? color.red : color.gray
+        leanLongReady = dominantSide == 1 and pLongRounded >= watchThreshold - 2 and longEdge >= watchEdgeMin and longTriggerPresent
+        leanShortReady = dominantSide == -1 and pShortRounded >= watchThreshold - 2 and shortEdge >= watchEdgeMin and shortTriggerPresent
+        earlyWatchLong = ctxLongOk and bullReject and inDiscount and longEdge >= 2
+        earlyWatchShort = ctxShortOk and bearReject and inPremium and shortEdge >= 2
+        marketBiasTxt = ctxInvalid ? "CTX INVALID" :
+             rawBuySignal ? "SIGNAL BUY" :
+             rawSellSignal ? "SIGNAL SELL" :
+             longPrepReady ? (htfBull ? "PREP LONG" : "CT PREP LONG") :
+             shortPrepReady ? (htfBear ? "PREP SHORT" : "CT PREP SHORT") :
+             longWatchReady ? (htfBull ? "WATCH LONG" : "CT WATCH LONG") :
+             shortWatchReady ? (htfBear ? "WATCH SHORT" : "CT WATCH SHORT") :
+             earlyWatchLong ? "WATCH LONG" :
+             earlyWatchShort ? "WATCH SHORT" :
+             leanLongReady ? "LEAN LONG" :
+             leanShortReady ? "LEAN SHORT" : "WAIT"
+        isLongBias = marketBiasTxt == "SIGNAL BUY" or marketBiasTxt == "PREP LONG" or marketBiasTxt == "CT PREP LONG" or marketBiasTxt == "WATCH LONG" or marketBiasTxt == "CT WATCH LONG" or marketBiasTxt == "LEAN LONG"
+        isShortBias = marketBiasTxt == "SIGNAL SELL" or marketBiasTxt == "PREP SHORT" or marketBiasTxt == "CT PREP SHORT" or marketBiasTxt == "WATCH SHORT" or marketBiasTxt == "CT WATCH SHORT" or marketBiasTxt == "LEAN SHORT"
+        marketBiasCol = isLongBias ? color.aqua : isShortBias ? color.red : color.gray
+        compactBiasTxt = marketBiasTxt == "SIGNAL BUY" ? "BUY" :
+             marketBiasTxt == "SIGNAL SELL" ? "SELL" :
+             marketBiasTxt == "PREP LONG" ? "P LONG" :
+             marketBiasTxt == "PREP SHORT" ? "P SHORT" :
+             marketBiasTxt == "CT PREP LONG" ? "CT P LONG" :
+             marketBiasTxt == "CT PREP SHORT" ? "CT P SHORT" :
+             marketBiasTxt == "WATCH LONG" ? "W LONG" :
+             marketBiasTxt == "WATCH SHORT" ? "W SHORT" :
+             marketBiasTxt == "CT WATCH LONG" ? "CT W LONG" :
+             marketBiasTxt == "CT WATCH SHORT" ? "CT W SHORT" :
+             marketBiasTxt == "LEAN LONG" ? "LEAN L" :
+             marketBiasTxt == "LEAN SHORT" ? "LEAN S" : marketBiasTxt
+        table.cell(dash, 0, 0, "Position", text_color=color.white, text_size=tableTextSize)
+        table.cell(dash, 1, 0, positionTxt, text_color=positionCol, text_size=tableTextSize)
+        table.cell(dash, 0, 1, "Bias", text_color=color.white, text_size=tableTextSize)
+        table.cell(dash, 1, 1, isCompactTable ? compactBiasTxt : marketBiasTxt, text_color=marketBiasCol, text_size=tableTextSize)
+        table.cell(dash, 0, 2, isCompactTable ? "L Score" : "Long Score", text_color=color.white, text_size=tableTextSize)
+        table.cell(dash, 1, 2, str.tostring(pLongRounded), text_color=color.aqua, text_size=tableTextSize)
+        table.cell(dash, 0, 3, isCompactTable ? "S Score" : "Short Score", text_color=color.white, text_size=tableTextSize)
+        table.cell(dash, 1, 3, str.tostring(pShortRounded), text_color=color.red, text_size=tableTextSize)
+        table.cell(dash, 0, 4, "Edge", text_color=color.white, text_size=tableTextSize)
+        table.cell(dash, 1, 4, dominantSide == 1 ? "+" + str.tostring(longEdge) : dominantSide == -1 ? "+" + str.tostring(shortEdge) : "0", text_color=dominantSide == 1 ? color.aqua : dominantSide == -1 ? color.red : color.gray, text_size=tableTextSize)
+        table.cell(dash, 0, 5, "Unlock", text_color=color.white, text_size=tableTextSize)
+        table.cell(dash, 1, 5, dominantSide == 1 ? "> " + str.tostring(unlockLongPivot, format.mintick) : dominantSide == -1 ? "< " + str.tostring(unlockShortPivot, format.mintick) : "NA", text_color=color.yellow, text_size=tableTextSize)
+        table.cell(dash, 0, 6, "Location", text_color=color.white, text_size=tableTextSize)
+        table.cell(dash, 1, 6, inBuyerZone ? "BUYER ZONE" : inSellerZone ? "SELLER ZONE" : inDiscount ? "DISCOUNT" : inPremium ? "PREMIUM" : "MIDDLE", text_color=inBuyerZone ? color.aqua : inSellerZone ? color.red : color.silver, text_size=tableTextSize)
+        table.cell(dash, 0, 7, "HTF", text_color=color.white, text_size=tableTextSize)
+        table.cell(dash, 1, 7, not useHTF ? "OFF" : htfBull ? "BULL" : htfBear ? "BEAR" : "FLAT", text_color=htfBull ? color.aqua : htfBear ? color.red : color.gray, text_size=tableTextSize)
+        table.cell(dash, 0, 8, "Room", text_color=color.white, text_size=tableTextSize)
+        table.cell(dash, 1, 8, dominantSide == 1 ? (longRoomOk ? "OK" : "TIGHT") : dominantSide == -1 ? (shortRoomOk ? "OK" : "TIGHT") : "NA", text_color=(dominantSide == 1 and longRoomOk) or (dominantSide == -1 and shortRoomOk) ? color.lime : color.orange, text_size=tableTextSize)
+        ctxTxt = ctxInvalid ? "INVALID" : not ctxActive ? "OFF" : dominantSide == 1 ? (ctxLongOk ? "LONG OK" : "LONG BLOCK") : dominantSide == -1 ? (ctxShortOk ? "SHORT OK" : "SHORT BLOCK") : (ctxLongOk and ctxShortOk ? "OK" : "BLOCK")
+        ctxCol = ctxInvalid ? color.orange : not ctxActive ? color.gray : dominantSide == 1 ? (ctxLongOk ? color.lime : color.orange) : dominantSide == -1 ? (ctxShortOk ? color.lime : color.orange) : color.silver
+        table.cell(dash, 0, 9, "Ctx", text_color=color.white, text_size=tableTextSize)
+        table.cell(dash, 1, 9, ctxTxt, text_color=ctxCol, text_size=tableTextSize)
+        if showDebugTable
+            table.cell(dash, 0, 10, "State/Cool", text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 1, 10, "S " + str.tostring(state) + " | C " + f_bool_text(cooldownOk), text_color=color.silver, text_size=tableTextSize)
+            table.cell(dash, 0, 11, "Unlock L/S", text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 1, 11, f_bool_text(unlockLong) + " / " + f_bool_text(unlockShort), text_color=color.yellow, text_size=tableTextSize)
+            table.cell(dash, 0, 12, "Watch L/S", text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 1, 12, f_bool_text(longWatchReady) + " / " + f_bool_text(shortWatchReady), text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 0, 13, "Prep L/S", text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 1, 13, f_bool_text(longPrepReady) + " / " + f_bool_text(shortPrepReady), text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 0, 14, "Core L/S", text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 1, 14, f_bool_text(longCorePass) + " / " + f_bool_text(shortCorePass), text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 0, 15, "Ovr L/S", text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 1, 15, f_bool_text(buyOverride) + " / " + f_bool_text(sellOverride), text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 0, 16, "Raw L/S", text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 1, 16, f_bool_text(rawBuySignal) + " / " + f_bool_text(rawSellSignal), text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 0, 17, "Cont L/S", text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 1, 17, f_bool_text(longContinuationPass) + " / " + f_bool_text(shortContinuationPass), text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 0, 18, "Ctx L/S", text_color=color.white, text_size=tableTextSize)
+            table.cell(dash, 1, 18, f_bool_text(ctxLongOk) + " / " + f_bool_text(ctxShortOk), text_color=ctxCol, text_size=tableTextSize)
+        else
+            for row = 10 to 18
+                table.cell(dash, 0, row, "", text_color=color.white, text_size=tableTextSize)
+                table.cell(dash, 1, row, "", text_color=color.white, text_size=tableTextSize)
+    else
+        table.clear(dash, 0, 0, 1, 18)
+
+// =====================================================
+// ALERTS
+// =====================================================
+alertcondition(buySignal, title="Hybrid Smart Buy", message="Hybrid Smart Buy on {{ticker}} {{interval}}")
+alertcondition(sellSignal, title="Hybrid Smart Sell", message="Hybrid Smart Sell on {{ticker}} {{interval}}")
+alertcondition(longBookProfit or shortBookProfit, title="Hybrid Book Profit", message="Hybrid Book Profit on {{ticker}} {{interval}}")
