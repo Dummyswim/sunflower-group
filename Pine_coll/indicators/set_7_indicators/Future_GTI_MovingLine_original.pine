@@ -412,62 +412,6 @@ trapBottomConfirm = (
 trapTopFailed = trapTopRaw and close > high[1]
 trapBottomFailed = trapBottomRaw and close < low[1]
 
-fakeBearInBuyZone = (
-    inBuyerArea and
-    bearCandle and
-    lowerWickPct >= 0.42 and
-    bodyPct <= 0.35 and
-    low < low[1] and
-    close >= low[1]
-)
-
-fakeBullInSellZone = (
-    inSellerArea and
-    bullCandle and
-    upperWickPct >= 0.42 and
-    bodyPct <= 0.35 and
-    high > high[1] and
-    close <= high[1]
-)
-
-string candleTrapText = "None"
-if fakeBearInBuyZone
-    candleTrapText := "FAKE BEAR: red candle, but buyers absorbed selling"
-else if fakeBullInSellZone
-    candleTrapText := "FAKE BULL: green candle, but sellers absorbed buying"
-
-string candleStory = "Standard candle, no strong structural message"
-if fakeBearInBuyZone
-    candleStory := "Fake bear candle, sellers pushed lower but buyers took back control"
-else if fakeBullInSellZone
-    candleStory := "Fake bull candle, buyers pushed higher but sellers took back control"
-else if trapBottomConfirm
-    candleStory := "Bull trap reversal confirmed, buyer zone is responding"
-else if trapTopConfirm
-    candleStory := "Bear trap reversal confirmed, seller zone is responding"
-else if trapBottomRaw
-    candleStory := "Buyer zone trap forming, failed sell pressure is building"
-else if trapTopRaw
-    candleStory := "Seller zone trap forming, failed buy pressure is building"
-else if exhaustionBottom
-    candleStory := "Exhaustion low, sellers are losing pressure in the buyer zone"
-else if exhaustionTop
-    candleStory := "Exhaustion high, buyers are losing pressure in the seller zone"
-else if displacementBull and vol > volMA
-    candleStory := "Strong momentum up, buyers controlled this bar"
-else if displacementBear and vol > volMA
-    candleStory := "Strong momentum down, sellers controlled this bar"
-else if indecisionCandle
-    candleStory := "Indecision candle, neither side has clear control"
-else if lowerSweepStrong and inBuyerArea
-    candleStory := "Sell sweep in buyer zone, rejection came from below"
-else if upperSweepStrong and inSellerArea
-    candleStory := "Buy sweep in seller zone, rejection came from above"
-else if bullCandle and bodyPct >= 0.55
-    candleStory := "Bull body closed with control, buyers won the bar"
-else if bearCandle and bodyPct >= 0.55
-    candleStory := "Bear body closed with control, sellers won the bar"
-
 //====================================================
 // MOVING-LINE SCENARIOS
 //====================================================
@@ -974,13 +918,6 @@ freshFastShortReclaim = not na(barsSinceFastReclaimShort) and barsSinceFastRecla
 lowTfLongBounceOK = isLowTfBucket and freshFastLongReclaim and (longBodyStrong or displacementBull) and (not dominantBearCampaign or reversalLongAuthorized or bullBiasRepair) and (close > slowLine or close[1] <= slowLine[1])
 lowTfShortBounceOK = isLowTfBucket and freshFastShortReclaim and (shortBodyStrong or displacementBear) and (not dominantBullCampaign or reversalShortAuthorized or bearBiasRepair) and (close < slowLine or close[1] >= slowLine[1])
 
-nearEarlyLongReversalZone = inBuyerArea or (inBattle and close <= battleBot + atr * 0.35)
-nearEarlyShortReversalZone = inSellerArea or (inBattle and close >= battleTop - atr * 0.35)
-earlyLongReversalStructure = fakeBearInBuyZone or trapBottomRaw or exhaustionBottom or bullishDivergence or (lowerWickPct >= 0.45 and bodyPct <= 0.45 and close >= open)
-earlyShortReversalStructure = fakeBullInSellZone or trapTopRaw or exhaustionTop or bearishDivergence or (upperWickPct >= 0.45 and bodyPct <= 0.45 and close <= open)
-earlyLongReversalWatch = isLowTfBucket and not inLongCampaign and not rawInvalidLong and not braidedLines and not longReentryCooldownActive and nearEarlyLongReversalZone and earlyLongReversalStructure and (freshFastLongReclaim or reclaimLongState or reclaimFastLongEvent or (longBodyStrong and close > fastLine)) and (htfLongScalpAligned or inBuyerArea) and (not dominantBearCampaign or bullBiasRepair or bullishDivergence or trapBottomRaw)
-earlyShortReversalWatch = isLowTfBucket and not inShortCampaign and not rawInvalidShort and not braidedLines and not shortReentryCooldownActive and nearEarlyShortReversalZone and earlyShortReversalStructure and (freshFastShortReclaim or reclaimShortState or reclaimFastShortEvent or (shortBodyStrong and close < fastLine)) and (htfShortScalpAligned or inSellerArea) and (not dominantBullCampaign or bearBiasRepair or bearishDivergence or trapTopRaw)
-
 buyEarly = not inLongCampaign and not longVeto and not rawInvalidLong and not braidedLines and htfLongScalpAligned and longContinuationRoomOK and (
     lowTfLongBounceOK or
     (not isLowTfBucket and not dominantBearCampaign and reclaimFastLongEvent and fastUp and close > trendEMA) or
@@ -1048,43 +985,10 @@ sellFlip = recentLongCampaign and rawInvalidLong and setupShort and confirmShort
 buySignal = (buySignalBase or buyFlip) and not suppressScalpLong and longExecutionScoreOk
 sellSignal = (sellSignalBase or sellFlip) and not suppressScalpShort and shortExecutionScoreOk
 
-longArmedState = not longVeto and not suppressScalpLong and ((reclaimLongState and longContinuationRoomOK) or (continuationLongState and longContinuationRoomOK and (longTradeArchetype != ARCH_COUNTERTREND_BOUNCE or isLowTfBucket)) or failedBearReclaimLongState or (reversalLongAuthorized and longReversalRoomOK) or earlyLongReversalWatch)
-shortArmedState = not shortVeto and not suppressScalpShort and ((reclaimShortState and shortContinuationRoomOK) or (continuationShortState and shortContinuationRoomOK and (shortTradeArchetype != ARCH_COUNTERTREND_BOUNCE or isLowTfBucket)) or failedBullReclaimShortState or (reversalShortAuthorized and shortReversalRoomOK) or earlyShortReversalWatch)
+longArmedState = not longVeto and not suppressScalpLong and ((reclaimLongState and longContinuationRoomOK) or (continuationLongState and longContinuationRoomOK and (longTradeArchetype != ARCH_COUNTERTREND_BOUNCE or isLowTfBucket)) or failedBearReclaimLongState or (reversalLongAuthorized and longReversalRoomOK))
+shortArmedState = not shortVeto and not suppressScalpShort and ((reclaimShortState and shortContinuationRoomOK) or (continuationShortState and shortContinuationRoomOK and (shortTradeArchetype != ARCH_COUNTERTREND_BOUNCE or isLowTfBucket)) or failedBullReclaimShortState or (reversalShortAuthorized and shortReversalRoomOK))
 longArmedEvent = longArmedState and not longArmedState[1] and not buySignal
 shortArmedEvent = shortArmedState and not shortArmedState[1] and not sellSignal
-
-// Low-TF scalp protection: if price reaches support/resistance and prints an
-// early opposite rejection candle, protect the open campaign before a full flip
-// confirmation arrives.
-scalpUpperResistanceZone = inSellerArea or close >= sellerMid or (inBattle and close >= battleTop - atr * 0.15)
-scalpLowerSupportZone = inBuyerArea or close <= buyerMid or (inBattle and close <= battleBot + atr * 0.15)
-
-longScalpProtectExit = inLongCampaign and isLowTfBucket and scalpUpperResistanceZone and not displacementBull and (
-    fakeBullInSellZone or
-    exhaustionTop or
-    bearishDivergence or
-    trapTopRaw or
-    (inSellerArea and upperWickPct >= 0.45 and bodyPct <= 0.45)
-)
-shortScalpProtectExit = inShortCampaign and isLowTfBucket and scalpLowerSupportZone and not displacementBear and (
-    fakeBearInBuyZone or
-    exhaustionBottom or
-    bullishDivergence or
-    trapBottomRaw or
-    (inBuyerArea and lowerWickPct >= 0.45 and bodyPct <= 0.45)
-)
-
-displayLongInvalidReason = longInvalidReason
-displayLongInvalidPrice = longInvalidPrice
-displayShortInvalidReason = shortInvalidReason
-displayShortInvalidPrice = shortInvalidPrice
-
-if longScalpProtectExit and displayLongInvalidReason == "None"
-    displayLongInvalidReason := "Scalp reversal warning"
-    displayLongInvalidPrice := high
-if shortScalpProtectExit and displayShortInvalidReason == "None"
-    displayShortInvalidReason := "Scalp reversal warning"
-    displayShortInvalidPrice := low
 
 var string lastInvalidText = "None"
 var float lastInvalidPrice = na
@@ -1094,8 +998,7 @@ longSoftExit = inLongCampaign and (
     reclaimShortEvent or
     (close < fastLine and shortBodyStrong) or
     displacementBear or
-    fastCrossBelowSlow or
-    longScalpProtectExit
+    fastCrossBelowSlow
 )
 longHardExit = inLongCampaign and (
     close < slowLine or
@@ -1108,8 +1011,7 @@ shortSoftExit = inShortCampaign and (
     reclaimLongEvent or
     (close > fastLine and longBodyStrong) or
     displacementBull or
-    fastCrossAboveSlow or
-    shortScalpProtectExit
+    fastCrossAboveSlow
 )
 shortHardExit = inShortCampaign and (
     close > slowLine or
@@ -1130,18 +1032,18 @@ longInvalidEvent = longInvalidDisplay and not longInvalidDisplay[1]
 shortInvalidEvent = shortInvalidDisplay and not shortInvalidDisplay[1]
 
 if longInvalidEvent
-    lastInvalidText := "CUT LONG: " + displayLongInvalidReason
-    lastInvalidPrice := displayLongInvalidPrice
+    lastInvalidText := "CUT LONG: " + longInvalidReason
+    lastInvalidPrice := longInvalidPrice
     lastInvalidBar := bar_index
 if shortInvalidEvent
-    lastInvalidText := "COVER SHORT: " + displayShortInvalidReason
-    lastInvalidPrice := displayShortInvalidPrice
+    lastInvalidText := "COVER SHORT: " + shortInvalidReason
+    lastInvalidPrice := shortInvalidPrice
     lastInvalidBar := bar_index
 
 invalidationAge = not na(lastInvalidBar) ? bar_index - lastInvalidBar : na
 invalidationState =
-     longInvalidDisplay ? ("NOW CUT LONG: " + displayLongInvalidReason) :
-     shortInvalidDisplay ? ("NOW COVER SHORT: " + displayShortInvalidReason) :
+     longInvalidDisplay ? ("NOW CUT LONG: " + longInvalidReason) :
+     shortInvalidDisplay ? ("NOW COVER SHORT: " + shortInvalidReason) :
      (not na(invalidationAge) and invalidationAge <= 20) ? ("RECENT " + lastInvalidText + " (" + str.tostring(invalidationAge) + "b)") :
      "None"
 
@@ -1471,142 +1373,6 @@ signalState =
      shortArmedState or earlyShortBias ? shortWatchLabel :
      "WAIT"
 
-ACTION_WAIT = "WAIT"
-ACTION_ENTRY_BOUNCE = "ENTRY FOR BOUNCE"
-ACTION_ENTRY_SHORT = "ENTRY FOR SHORT BOUNCE"
-ACTION_LONG_ARMED = "LONG ARMED"
-ACTION_SHORT_ARMED = "SHORT ARMED"
-ACTION_BUY = "BUY SIGNAL"
-ACTION_SELL = "SELL SIGNAL"
-ACTION_HOLD_LONG = "HOLD LONG"
-ACTION_HOLD_SHORT = "HOLD SHORT"
-ACTION_TAKE = "DON'T CHASE / TAKE PROFIT"
-ACTION_EXIT_LONG = "EXIT LONG"
-ACTION_EXIT_SHORT = "EXIT SHORT"
-ACTION_BOUNDARY = "WAIT FOR BREAKOUT UP/DOWN"
-
-upperResistanceZone = inSellerArea or close >= sellerMid or (inBattle and close >= battleTop - atr * 0.15)
-lowerSupportZone = inBuyerArea or close <= buyerMid or (inBattle and close <= battleBot + atr * 0.15)
-lateLongExtension = upperResistanceZone and (distFromEqATR >= 0.8 or distFromLineClusterATR >= 1.0 or not linesExpanding)
-lateShortExtension = lowerSupportZone and (distFromEqATR >= 0.8 or distFromLineClusterATR >= 1.0 or not linesExpanding)
-
-longBounceStructureReady = trapBottomConfirm or buyBottomConfirm or reversalLongAuthorized or wBottomConfirm or bullishDivergence or fakeBearInBuyZone or exhaustionBottom
-shortBounceStructureReady = trapTopConfirm or mTopConfirm or reversalShortAuthorized or bearishDivergence or fakeBullInSellZone or exhaustionTop
-
-longBounceEntryReady = not inLongCampaign and not buySignal and not longInvalidDisplay and lowerSupportZone and htfLongAligned and not braidedLines and longExecutionScoreOk and longBounceStructureReady and (reclaimLongState or longArmedState or earlyLongBias)
-shortBounceEntryReady = not inShortCampaign and not sellSignal and not shortInvalidDisplay and upperResistanceZone and htfShortAligned and not braidedLines and shortExecutionScoreOk and shortBounceStructureReady and (reclaimShortState or shortArmedState or earlyShortBias)
-
-longTakeProfitState = (inLongCampaign or holdLongState or buySignal) and not longInvalidDisplay and lateLongExtension and (longScore >= shortScore or bullRideIntact or trendRideLong or strongBullState)
-shortTakeProfitState = (inShortCampaign or holdShortState or sellSignal) and not shortInvalidDisplay and lateShortExtension and (shortScore >= longScore or bearRideIntact or trendRideShort or strongBearState)
-
-boundaryPressureBalanced = math.abs(longScore - shortScore) < minExecutionEdge or (not linesExpanding and not linesContracting)
-boundaryWaitState = not buySignal and not sellSignal and not longInvalidDisplay and not shortInvalidDisplay and not longBounceEntryReady and not shortBounceEntryReady and not inLongCampaign and not inShortCampaign and inBattle and boundaryPressureBalanced
-
-string userActionState = ACTION_WAIT
-if longInvalidDisplay
-    userActionState := ACTION_EXIT_LONG
-else if shortInvalidDisplay
-    userActionState := ACTION_EXIT_SHORT
-else if inLongCampaign and earlyShortReversalWatch
-    userActionState := ACTION_TAKE
-else if inShortCampaign and earlyLongReversalWatch
-    userActionState := ACTION_TAKE
-else if sellSignal and (reversalShortAuthorized or earlyShortReversalWatch) and not lowerSupportZone
-    userActionState := ACTION_SELL
-else if buySignal and (reversalLongAuthorized or earlyLongReversalWatch) and not upperResistanceZone
-    userActionState := ACTION_BUY
-else if longTakeProfitState and earlyShortReversalWatch
-    userActionState := ACTION_SHORT_ARMED
-else if shortTakeProfitState and earlyLongReversalWatch
-    userActionState := ACTION_LONG_ARMED
-else if longTakeProfitState
-    userActionState := ACTION_TAKE
-else if shortTakeProfitState
-    userActionState := ACTION_TAKE
-else if buySignal and not upperResistanceZone
-    userActionState := ACTION_BUY
-else if sellSignal and not lowerSupportZone
-    userActionState := ACTION_SELL
-else if holdLongState
-    userActionState := ACTION_HOLD_LONG
-else if holdShortState
-    userActionState := ACTION_HOLD_SHORT
-else if longBounceEntryReady
-    userActionState := ACTION_ENTRY_BOUNCE
-else if shortBounceEntryReady
-    userActionState := ACTION_ENTRY_SHORT
-else if longArmedState or earlyLongBias
-    userActionState := ACTION_LONG_ARMED
-else if shortArmedState or earlyShortBias
-    userActionState := ACTION_SHORT_ARMED
-else if boundaryWaitState
-    userActionState := ACTION_BOUNDARY
-
-longStopNarrative = str.tostring(na(longEntryFailLevel) ? math.min(fastLine, slowLine) : longEntryFailLevel, format.mintick)
-shortStopNarrative = str.tostring(na(shortEntryFailLevel) ? math.max(fastLine, slowLine) : shortEntryFailLevel, format.mintick)
-
-string narrativeLine1 = "Market is between clear edges, wait for location or structure to improve."
-if inExtremeBuy and primaryBiasState == PRIMARY_BULL
-    narrativeLine1 := "Market is at the strongest buy zone and bull bias supports a move up."
-else if inExtremeBuy and primaryBiasState == PRIMARY_BEAR
-    narrativeLine1 := "Market is at the strongest buy zone, but the broader bias is still bearish."
-else if inBuyerArea and primaryBiasState == PRIMARY_BULL
-    narrativeLine1 := "Market is in the buyer zone with trend support behind it."
-else if inBuyerArea and primaryBiasState == PRIMARY_BEAR
-    narrativeLine1 := "Market is in the buyer zone, but this is still countertrend until bias repairs."
-else if inSellerArea and primaryBiasState == PRIMARY_BEAR
-    narrativeLine1 := "Market is in the seller zone with trend support behind it."
-else if inSellerArea and primaryBiasState == PRIMARY_BULL
-    narrativeLine1 := "Market is in the seller zone, but the broader bull bias can weaken shorts."
-else if inBattle and primaryBiasState == PRIMARY_NEUTRAL
-    narrativeLine1 := "Market is in the battleground with no clear edge yet."
-else if inBattle
-    narrativeLine1 := "Market is in the battleground, bias exists but price is still contested."
-
-string narrativeLine2 = candleStory
-if fakeBearInBuyZone
-    narrativeLine2 := "This red candle is structurally bullish. Sellers were absorbed in the buyer zone."
-else if fakeBullInSellZone
-    narrativeLine2 := "This green candle is structurally bearish. Buyers were absorbed in the seller zone."
-else if displacementBull
-    narrativeLine2 := "This candle shows strong upward displacement, buyer conviction is high."
-else if displacementBear
-    narrativeLine2 := "This candle shows strong downward displacement, seller conviction is high."
-else if indecisionCandle
-    narrativeLine2 := "This candle is indecisive. Let the next bar confirm direction."
-else if exhaustionTop
-    narrativeLine2 := "This candle shows exhaustion near the top, upside energy is fading."
-else if exhaustionBottom
-    narrativeLine2 := "This candle shows exhaustion near the bottom, downside energy is fading."
-
-string narrativeLine3 = "Action now: wait. " + waitReason
-if userActionState == ACTION_BUY
-    narrativeLine3 := "Action now: buy signal is active. Risk fails below " + longStopNarrative + "."
-else if userActionState == ACTION_SELL
-    narrativeLine3 := "Action now: sell signal is active. Risk fails above " + shortStopNarrative + "."
-else if userActionState == ACTION_ENTRY_BOUNCE
-    narrativeLine3 := "Action now: entry for bounce is allowed, but only while the reclaim structure holds."
-else if userActionState == ACTION_ENTRY_SHORT
-    narrativeLine3 := "Action now: short bounce entry is allowed, but only while rejection structure holds."
-else if userActionState == ACTION_HOLD_LONG
-    narrativeLine3 := "Action now: hold the long. The move is still structurally intact."
-else if userActionState == ACTION_HOLD_SHORT
-    narrativeLine3 := "Action now: hold the short. The move is still structurally intact."
-else if userActionState == ACTION_TAKE
-    narrativeLine3 := "Action now: do not chase here. Price is stretched into resistance/support, protect gains."
-else if userActionState == ACTION_EXIT_LONG
-    narrativeLine3 := "Action now: long is invalidated. Exit and do not add."
-else if userActionState == ACTION_EXIT_SHORT
-    narrativeLine3 := "Action now: short is invalidated. Cover and do not add."
-else if userActionState == ACTION_LONG_ARMED
-    narrativeLine3 := "Action now: long setup is armed. Wait for confirmation, do not jump early."
-else if userActionState == ACTION_SHORT_ARMED
-    narrativeLine3 := "Action now: short setup is armed. Wait for confirmation, do not jump early."
-else if userActionState == ACTION_BOUNDARY
-    narrativeLine3 := "Action now: wait for breakout up or down. The boundary is contested."
-else if braidedLines
-    narrativeLine3 := "Action now: no trade. The lines are braided and the market is undecided."
-
 //====================================================
 // PLOTS
 //====================================================
@@ -1715,59 +1481,11 @@ if showExecutionLabels
     if shortInvalidEvent
         label.new(bar_index, low - atr * 0.15, isExecutionMinimal ? "CS" : "COVER SHORT", style=label.style_label_up, color=color.new(color.orange, 0), textcolor=color.white, size=size.tiny)
 
-userActionChanged = userActionState != userActionState[1]
-showUserActionLabel = showSignals and userActionChanged and userActionState != ACTION_WAIT
-
-if showUserActionLabel
-    string userActionText = userActionState
-    if userActionState == ACTION_ENTRY_BOUNCE
-        userActionText := "BOUNCE"
-    else if userActionState == ACTION_ENTRY_SHORT
-        userActionText := "SHORT BOUNCE"
-    else if userActionState == ACTION_LONG_ARMED
-        userActionText := "LONG ARMED"
-    else if userActionState == ACTION_SHORT_ARMED
-        userActionText := "SHORT ARMED"
-    else if userActionState == ACTION_BUY
-        userActionText := "BUY SIGNAL"
-    else if userActionState == ACTION_SELL
-        userActionText := "SELL SIGNAL"
-    else if userActionState == ACTION_HOLD_LONG
-        userActionText := "HOLD LONG"
-    else if userActionState == ACTION_HOLD_SHORT
-        userActionText := "HOLD SHORT"
-    else if userActionState == ACTION_TAKE
-        userActionText := "TAKE PROFIT"
-    else if userActionState == ACTION_EXIT_LONG
-        userActionText := "EXIT LONG"
-    else if userActionState == ACTION_EXIT_SHORT
-        userActionText := "EXIT SHORT"
-    else if userActionState == ACTION_BOUNDARY
-        userActionText := "WAIT BREAK"
-
-    color userActionColor = color.new(color.gray, 10)
-    if userActionState == ACTION_ENTRY_BOUNCE or userActionState == ACTION_BUY or userActionState == ACTION_HOLD_LONG
-        userActionColor := color.new(color.lime, 0)
-    else if userActionState == ACTION_ENTRY_SHORT or userActionState == ACTION_SELL or userActionState == ACTION_HOLD_SHORT
-        userActionColor := color.new(color.red, 0)
-    else if userActionState == ACTION_TAKE or userActionState == ACTION_EXIT_LONG or userActionState == ACTION_EXIT_SHORT
-        userActionColor := color.new(color.orange, 0)
-    else if userActionState == ACTION_LONG_ARMED or userActionState == ACTION_SHORT_ARMED
-        userActionColor := color.new(color.blue, 10)
-
-    bool userActionBelow = userActionState == ACTION_ENTRY_BOUNCE or userActionState == ACTION_BUY or userActionState == ACTION_HOLD_LONG or userActionState == ACTION_LONG_ARMED
-    float userActionY = userActionBelow ? low - atr * 0.16 : high + atr * 0.16
-    label.new(bar_index, userActionY, userActionText, style=userActionBelow ? label.style_label_up : label.style_label_down, color=userActionColor, textcolor=color.white, size=size.small)
-
 if showSignals and isDetailed
     if setupLongEvent and not buySignal and not rawInvalidLong
         label.new(bar_index, low - atr * 0.10, longWatchLabel, style=label.style_label_up, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny)
     if setupShortEvent and not sellSignal and not rawInvalidShort
         label.new(bar_index, high + atr * 0.10, shortWatchLabel, style=label.style_label_down, color=color.new(color.maroon, 25), textcolor=color.white, size=size.tiny)
-    if fakeBearInBuyZone
-        label.new(bar_index, low - atr * 0.08, "FAKE BEAR", style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.white, size=size.tiny)
-    if fakeBullInSellZone
-        label.new(bar_index, high + atr * 0.08, "FAKE BULL", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.tiny)
 
 //====================================================
 // ZONE LABELS + STATE PANEL
@@ -1777,7 +1495,7 @@ var label lblSell = na
 var label lblBattle = na
 var label lblBuy = na
 var label lblExtremeBuy = na
-var table stateTbl = table.new(position.bottom_right, 1, 28, bgcolor=color.new(color.black, 8), frame_color=color.new(color.white, 80), frame_width=1, border_color=color.new(color.white, 90), border_width=1)
+var table stateTbl = table.new(position.bottom_right, 1, 23, bgcolor=color.new(color.black, 8), frame_color=color.new(color.white, 80), frame_width=1, border_color=color.new(color.white, 90), border_width=1)
 
 if barstate.islast
     table.set_position(stateTbl, panelAnchor)
@@ -1820,13 +1538,7 @@ if barstate.islast
             table.cell(stateTbl, 0, 14, "Why Wait: " + waitPanelText, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
             table.cell(stateTbl, 0, 15, "Invalid: " + invalidationState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
             table.cell(stateTbl, 0, 16, "Signal: " + signalState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 17, "User Action: " + userActionState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 18, "Candle Story: " + candleStory, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 19, "Candle Trap: " + candleTrapText, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 20, "What To Know: " + narrativeLine1, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 21, "This Candle: " + narrativeLine2, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 22, "Action Now: " + narrativeLine3, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            for row = 23 to 27
+            for row = 17 to 22
                 table.cell(stateTbl, 0, row, "", text_color=color.white, bgcolor=color.new(color.black, 100))
         else
             table.cell(stateTbl, 0, 0, "READING MAP", text_color=color.white, text_size=panelTextSize, text_halign=text.align_center, bgcolor=color.new(color.gray, 75))
@@ -1847,18 +1559,13 @@ if barstate.islast
             table.cell(stateTbl, 0, 15, "Latest Event: " + lineEventState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
             table.cell(stateTbl, 0, 16, "Touch Count: " + touchState + " | Bounce Attempts: " + str.tostring(bounceAttemptCount), text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
             table.cell(stateTbl, 0, 17, "HTF Bias: " + htfBiasPanelText, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 18, "User Action: " + userActionState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
+            table.cell(stateTbl, 0, 18, "Action Bias: " + actionBias, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
             table.cell(stateTbl, 0, 19, "Long Score: " + str.tostring(longScore) + " (" + longGrade + ") | Bias " + str.tostring(longBiasScore) + " / Setup " + str.tostring(longSetupScore), text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
             table.cell(stateTbl, 0, 20, "Short Score: " + str.tostring(shortScore) + " (" + shortGrade + ") | Bias " + str.tostring(shortBiasScore) + " / Setup " + str.tostring(shortSetupScore), text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
             table.cell(stateTbl, 0, 21, "Invalidation: " + invalidationState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
             table.cell(stateTbl, 0, 22, "Signal: " + signalState, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 23, "Candle Story: " + candleStory, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 24, "Candle Trap: " + candleTrapText, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 25, "What To Know: " + narrativeLine1, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 26, "This Candle: " + narrativeLine2, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
-            table.cell(stateTbl, 0, 27, "Action Now: " + narrativeLine3, text_color=color.white, text_size=panelTextSize, text_halign=text.align_left, bgcolor=color.new(color.black, 0))
     else
-        for row = 0 to 27
+        for row = 0 to 22
             table.cell(stateTbl, 0, row, "", text_color=color.white, bgcolor=color.new(color.black, 100))
 
 //====================================================

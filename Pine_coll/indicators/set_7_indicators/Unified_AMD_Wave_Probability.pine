@@ -546,8 +546,18 @@ bearReject = high > emaFast and close < emaFast and closePos <= (1.0 - closePosS
 
 institutionalBuy = relVol >= instVolMult and lowerWickFrac >= 0.35 and closePos >= closePosStrong and barDelta > 0 and (inBuyerZone or inBuyTrapZone)
 institutionalSell = relVol >= instVolMult and upperWickFrac >= 0.35 and closePos <= (1.0 - closePosStrong) and barDelta < 0 and (inSellerZone or inSellTrapZone)
+bullContinuationPattern = bullImpulse and close >= balMid and bodyFrac >= 0.55 and closePos >= closePosStrong and relVol >= math.max(0.95, trapMinRelVol) and not htfLongWallNear
+bearContinuationPattern = bearImpulse and close <= balMid and bodyFrac >= 0.55 and closePos <= (1.0 - closePosStrong) and relVol >= math.max(0.95, trapMinRelVol) and not htfShortWallNear
+bullPatternBaseContext = inBuyerZone or inBuyTrapZone or (nearBuyerZone and close <= balMid)
+bearPatternBaseContext = inSellerZone or inSellTrapZone or (nearSellerZone and close >= balMid)
+bullPatternTrendPenalty = trendDown and bearFlow and close < balMid and bullPatternBaseContext and not bullContinuationPattern ? 8 : 0
+bearPatternTrendPenalty = trendUp and bullFlow and close > balMid and bearPatternBaseContext and not bearContinuationPattern ? 8 : 0
+bullReversalSetup = bullPatternBaseContext and (bullHammer or bullEngulf or bullReclaim or institutionalBuy or buyTrap1Signal or buyTrap2Signal)
+bearReversalSetup = bearPatternBaseContext and (bearShooting or bearEngulf or bearReject or institutionalSell or sellTrap1Signal or sellTrap2Signal)
+bullContinuationSetup = bullContinuationPattern and close > emaFast and close >= vwapVal - atr * 0.05
+bearContinuationSetup = bearContinuationPattern and close < emaFast and close <= vwapVal + atr * 0.05
 
-bullPatternScore =
+bullReversalScore =
      (bullHammer ? 34 : 0) +
      (bullEngulf ? 30 : 0) +
      (bullReclaim ? 22 : 0) +
@@ -555,10 +565,12 @@ bullPatternScore =
      (inBuyTrapZone ? 18 : 0) +
      (bullFlow ? 12 : 0) +
      (institutionalBuy ? 12 : 0) +
+     (buyTrap1Signal or buyTrap2Signal ? 12 : 0) +
      (strongBearHTF ? -24 : 0) +
+     (-bullPatternTrendPenalty) +
      (inNoEntryZone ? -30 : 0)
 
-bearPatternScore =
+bearReversalScore =
      (bearShooting ? 34 : 0) +
      (bearEngulf ? 30 : 0) +
      (bearReject ? 22 : 0) +
@@ -566,13 +578,51 @@ bearPatternScore =
      (inSellTrapZone ? 18 : 0) +
      (bearFlow ? 12 : 0) +
      (institutionalSell ? 12 : 0) +
+     (sellTrap1Signal or sellTrap2Signal ? 12 : 0) +
+     (strongBullHTF ? -24 : 0) +
+     (-bearPatternTrendPenalty) +
+     (inNoEntryZone ? -30 : 0)
+
+bullContinuationScore =
+     (bullContinuationPattern ? 36 : 0) +
+     (trendUp and close >= balMid ? 12 : 0) +
+     (bullFlow ? 12 : 0) +
+     (close > emaFast and close >= vwapVal ? 10 : 0) +
+     (relVol >= math.max(0.95, trapMinRelVol) ? 8 : 0) +
+     (not htfLongWallNear ? 8 : 0) +
+     (strongBearHTF ? -24 : 0) +
+     (inNoEntryZone ? -30 : 0)
+
+bearContinuationScore =
+     (bearContinuationPattern ? 36 : 0) +
+     (trendDown and close <= balMid ? 12 : 0) +
+     (bearFlow ? 12 : 0) +
+     (close < emaFast and close <= vwapVal ? 10 : 0) +
+     (relVol >= math.max(0.95, trapMinRelVol) ? 8 : 0) +
+     (not htfShortWallNear ? 8 : 0) +
      (strongBullHTF ? -24 : 0) +
      (inNoEntryZone ? -30 : 0)
 
-bullPatternContext = (inBuyerZone or inBuyTrapZone or (nearBuyerZone and close <= balMid)) and not inNoEntryZone and not strongBearHTF
-bearPatternContext = (inSellerZone or inSellTrapZone or (nearSellerZone and close >= balMid)) and not inNoEntryZone and not strongBullHTF
-bullPatternConfirmed = bullPatternContext and bullPatternScore >= patternMinQuality and bullPatternScore > bearPatternScore
-bearPatternConfirmed = bearPatternContext and bearPatternScore >= patternMinQuality and bearPatternScore > bullPatternScore
+bullPatternContext = bullReversalSetup and not inNoEntryZone and not strongBearHTF
+bearPatternContext = bearReversalSetup and not inNoEntryZone and not strongBullHTF and not (trendUp and bullFlow and close > balMid and nearSellerZone and not inSellerZone and not inSellTrapZone and not bearContinuationPattern)
+bullContinuationContext = bullContinuationSetup and not inNoEntryZone and not strongBearHTF
+bearContinuationContext = bearContinuationSetup and not inNoEntryZone and not strongBullHTF
+bullReversalMinScore = math.max(54, patternMinQuality + 2)
+bearReversalMinScore = math.max(54, patternMinQuality + 2 + bearPatternTrendPenalty)
+bullContinuationMinScore = math.max(46, patternMinQuality - 6)
+bearContinuationMinScore = math.max(46, patternMinQuality - 6 + bearPatternTrendPenalty)
+bullPatternOpposition = math.max(bearReversalScore, bearContinuationScore)
+bearPatternOpposition = math.max(bullReversalScore, bullContinuationScore)
+bullReversalConfirmed = bullPatternContext and not bullContinuationSetup and bullReversalScore >= bullReversalMinScore and bullReversalScore > bullPatternOpposition
+bearReversalConfirmed = bearPatternContext and not bearContinuationSetup and bearReversalScore >= bearReversalMinScore and bearReversalScore > bearPatternOpposition
+bullContinuationConfirmed = bullContinuationContext and bullContinuationScore >= bullContinuationMinScore and bullContinuationScore > bullPatternOpposition
+bearContinuationConfirmed = bearContinuationContext and bearContinuationScore >= bearContinuationMinScore and bearContinuationScore > bearPatternOpposition
+bullPatternConfirmed = bullReversalConfirmed or bullContinuationConfirmed
+bearPatternConfirmed = bearReversalConfirmed or bearContinuationConfirmed
+bullPatternScore = bullReversalConfirmed ? bullReversalScore : bullContinuationConfirmed ? bullContinuationScore : math.max(bullReversalScore, bullContinuationScore)
+bearPatternScore = bearReversalConfirmed ? bearReversalScore : bearContinuationConfirmed ? bearContinuationScore : math.max(bearReversalScore, bearContinuationScore)
+bullPatternTypeTxt = bullReversalConfirmed ? "BUYER REVERSAL" : bullContinuationConfirmed ? "BUYER CONTINUATION" : "NONE"
+bearPatternTypeTxt = bearReversalConfirmed ? "SELLER REVERSAL" : bearContinuationConfirmed ? "SELLER CONTINUATION" : "NONE"
 
 patternLongNorm = bullPatternConfirmed ? f_clamp(bullPatternScore / 100.0, 0.35, 1.00) : 0.20
 patternShortNorm = bearPatternConfirmed ? f_clamp(bearPatternScore / 100.0, 0.35, 1.00) : 0.20
@@ -658,12 +708,12 @@ weakShortEdge = pShort < watchThreshold or shortEdge < watchEdgeMin
 longTradeClassTxt = antiChaseLong or buyClimaxRisk ? "AVOID CHASE" : weakLongEdge ? "LEAN LONG" : longCountertrend ? "CT LONG" : "TREND LONG"
 shortTradeClassTxt = antiChaseShort or sellClimaxRisk ? "AVOID CHASE" : weakShortEdge ? "LEAN SHORT" : shortCountertrend ? "CT SHORT" : "TREND SHORT"
 
-longTriggerPresent = bullFlow or institutionalBuy or bullPatternConfirmed or buyTrap1Signal or buyTrap2Signal
-shortTriggerPresent = bearFlow or institutionalSell or bearPatternConfirmed or sellTrap1Signal or sellTrap2Signal
+longTriggerPresent = bullFlow or institutionalBuy or bullPatternConfirmed or buyTrap1Signal or buyTrap2Signal or bullContinuationPattern
+shortTriggerPresent = bearFlow or institutionalSell or bearPatternConfirmed or sellTrap1Signal or sellTrap2Signal or bearContinuationPattern
 ctWatchBoost = ctProbBoost > 0 ? 1 : 0
 ctPrepBoost = int(math.ceil(ctProbBoost * 0.50))
-longCtQualifier = not longCountertrend or inBuyTrapZone or buyTrap1Signal or buyTrap2Signal or institutionalBuy
-shortCtQualifier = not shortCountertrend or inSellTrapZone or sellTrap1Signal or sellTrap2Signal or institutionalSell
+longCtQualifier = not longCountertrend or inBuyTrapZone or buyTrap1Signal or buyTrap2Signal or institutionalBuy or bullContinuationPattern
+shortCtQualifier = not shortCountertrend or inSellTrapZone or sellTrap1Signal or sellTrap2Signal or institutionalSell or bearContinuationPattern
 
 unlockLongPivot = ta.highest(high[1], unlockLookback)
 unlockShortPivot = ta.lowest(low[1], unlockLookback)
@@ -673,10 +723,12 @@ unlockLongLevel = f_clamp(math.max(math.max(emaFast, vwapVal), unlockLongPivot),
 unlockShortLevel = f_clamp(math.min(math.min(emaFast, vwapVal), unlockShortPivot), close - atr * 4.0, close + atr * 2.0)
 longRoomOk = not useHTFSRInProbabilities or (nearestHTFResistance - close) > atr * 0.80
 shortRoomOk = not useHTFSRInProbabilities or (close - nearestHTFSupport) > atr * 0.80
-longLocationNeedsReclaim = (inSellerZone or htfInPremium) and not longCountertrend
-shortLocationNeedsFail = (inBuyerZone or htfInDiscount) and not shortCountertrend
-longUnlockReady = close > unlockLongLevel and (longRetestReclaim or buyTrap1Signal or buyTrap2Signal or institutionalBuy)
-shortUnlockReady = close < unlockShortLevel and (shortRetestFail or sellTrap1Signal or sellTrap2Signal or institutionalSell)
+longContinuationReady = bullContinuationPattern and close > unlockLongPivot and close > emaFast and close >= vwapVal
+shortContinuationReady = bearContinuationPattern and close < unlockShortPivot and close < emaFast and close <= vwapVal
+longLocationNeedsReclaim = (inSellerZone or htfInPremium) and not longCountertrend and not bullContinuationPattern
+shortLocationNeedsFail = (inBuyerZone or htfInDiscount) and not shortCountertrend and not bearContinuationPattern
+longUnlockReady = (close > unlockLongLevel and (longRetestReclaim or buyTrap1Signal or buyTrap2Signal or institutionalBuy or bullContinuationPattern)) or longContinuationReady
+shortUnlockReady = (close < unlockShortLevel and (shortRetestFail or sellTrap1Signal or sellTrap2Signal or institutionalSell or bearContinuationPattern)) or shortContinuationReady
 
 longWatchReady = tradeWindowOk and dominantSide == 1 and not longHardVeto and not inNoEntryZone and not antiChaseLong and not buyClimaxRisk and pLong >= (watchThreshold + (longCountertrend ? ctWatchBoost : 0)) and longEdge >= (watchEdgeMin + (longCountertrend ? 1 : 0)) and longTriggerPresent and longCtQualifier
 shortWatchReady = tradeWindowOk and dominantSide == -1 and not shortHardVeto and not inNoEntryZone and not antiChaseShort and not sellClimaxRisk and pShort >= (watchThreshold + (shortCountertrend ? ctWatchBoost : 0)) and shortEdge >= (watchEdgeMin + (shortCountertrend ? 1 : 0)) and shortTriggerPresent and shortCtQualifier
@@ -693,10 +745,10 @@ if barstate.isconfirmed and (shortWatchReady or shortPrepReady)
 
 barsSinceLongBias = na(lastLongBiasBar) ? 100000 : bar_index - lastLongBiasBar
 barsSinceShortBias = na(lastShortBiasBar) ? 100000 : bar_index - lastShortBiasBar
-longOverrideTrigger = longRetestReclaim or bullPatternConfirmed or institutionalBuy or buyTrap1Signal or buyTrap2Signal
-shortOverrideTrigger = shortRetestFail or bearPatternConfirmed or institutionalSell or sellTrap1Signal or sellTrap2Signal
-longOverrideLocation = inBuyerZone or nearBuyerZone or inBuyTrapZone or htfInDiscount
-shortOverrideLocation = inSellerZone or nearSellerZone or inSellTrapZone or htfInPremium
+longOverrideTrigger = longRetestReclaim or bullPatternConfirmed or institutionalBuy or buyTrap1Signal or buyTrap2Signal or bullContinuationPattern
+shortOverrideTrigger = shortRetestFail or bearPatternConfirmed or institutionalSell or sellTrap1Signal or sellTrap2Signal or bearContinuationPattern
+longOverrideLocation = inBuyerZone or nearBuyerZone or inBuyTrapZone or htfInDiscount or bullContinuationPattern
+shortOverrideLocation = inSellerZone or nearSellerZone or inSellTrapZone or htfInPremium or bearContinuationPattern
 longReversalOverride = enableHybridOverrides and tradeWindowOk and dominantSide == 1 and pLong >= overrideScoreThreshold and longEdge >= overrideEdgeThreshold and longRoomOk and longUnlockReady and longOverrideTrigger and longOverrideLocation and longCtQualifier and not longHardVeto and not inNoEntryZone and not antiChaseLong and not buyClimaxRisk
 shortReversalOverride = enableHybridOverrides and tradeWindowOk and dominantSide == -1 and pShort >= overrideScoreThreshold and shortEdge >= overrideEdgeThreshold and shortRoomOk and shortUnlockReady and shortOverrideTrigger and shortOverrideLocation and shortCtQualifier and not shortHardVeto and not inNoEntryZone and not antiChaseShort and not sellClimaxRisk
 longContinuationOverride = enableHybridOverrides and tradeWindowOk and barsSinceLongBias <= overrideContinuationBars and dominantSide == 1 and pLong >= math.max(watchThreshold, overrideScoreThreshold - 2) and longEdge >= math.max(watchEdgeMin, overrideEdgeThreshold - 1) and longRoomOk and longUnlockReady and longOverrideTrigger and not longHardVeto and not inNoEntryZone and not antiChaseLong and not buyClimaxRisk
@@ -780,6 +832,11 @@ var float activePlanUnlock = na
 var int activePlanAge = 100000
 var int activePlanExpiry = 0
 var label activePlanLabel = na
+var int advisoryDir = 0
+var int advisoryAge = 100000
+var float advisoryEntryPx = na
+var string advisoryReason = "NONE"
+var label advisoryLabel = na
 
 longOpposingTooClose = useHTFSRInTargets and not na(longRisk) and nearestHTFResistance > longEntryAdj and (nearestHTFResistance - longEntryAdj) < longRisk * 0.80
 shortOpposingTooClose = useHTFSRInTargets and not na(shortRisk) and nearestHTFSupport < shortEntryAdj and (shortEntryAdj - nearestHTFSupport) < shortRisk * 0.80
@@ -804,14 +861,33 @@ newShortPlan = barstate.isconfirmed and rawPlanShortActive and signalTxt[1] != "
 if activePlanDir != 0
     activePlanAge += 1
 
+if advisoryDir != 0
+    advisoryAge += 1
+
 activePlanInvalid = activePlanDir == 1 ? low <= activePlanStop : activePlanDir == -1 ? high >= activePlanStop : false
 activePlanDone = activePlanDir == 1 ? high >= activePlanT2 : activePlanDir == -1 ? low <= activePlanT2 : false
 activePlanExpired = activePlanDir != 0 and activePlanAge > activePlanExpiry
+longPlanOpen = activePlanDir == 1 and not activePlanInvalid and not activePlanDone and not activePlanExpired
+shortPlanOpen = activePlanDir == -1 and not activePlanInvalid and not activePlanDone and not activePlanExpired
+buyerTakeoverStrong = barstate.isconfirmed and close > open and closePos >= 0.60 and close > math.max(emaFast, vwapVal) and (longRetestReclaim or bullPatternConfirmed or institutionalBuy or buyTrap1Signal or buyTrap2Signal or bullFlow or bullContinuationPattern) and pLong >= math.max(54.0, pShort - 4.0) and longEdge >= math.max(4.0, float(overrideEdgeThreshold - 2))
+sellerTakeoverStrong = barstate.isconfirmed and close < open and closePos <= 0.40 and close < math.min(emaFast, vwapVal) and (shortRetestFail or bearPatternConfirmed or institutionalSell or sellTrap1Signal or sellTrap2Signal or bearFlow or bearContinuationPattern) and pShort >= math.max(54.0, pLong - 4.0) and shortEdge >= math.max(4.0, float(overrideEdgeThreshold - 2))
+shortExitReclaim = shortPlanOpen and buyerTakeoverStrong
+longExitBreakdown = longPlanOpen and sellerTakeoverStrong
+shortBuyerTakeover = shortPlanOpen and buyerTakeoverStrong
+longSellerTakeover = longPlanOpen and sellerTakeoverStrong
+shortExitWarn = barstate.isconfirmed and shortPlanOpen and (buySignal or shortBuyerTakeover)
+longExitWarn = barstate.isconfirmed and longPlanOpen and (sellSignal or longSellerTakeover)
+shortExitReason = buySignal ? "REVERSE LONG" : buyTrap1Signal or buyTrap2Signal ? "BUYERS TRAPPED SELLERS" : institutionalBuy ? "BUYER ENTERED" : bullPatternConfirmed ? "BUYER PATTERN" : bullFlow ? "FLOW FLIP" : "BUYER RECLAIM"
+longExitReason = sellSignal ? "REVERSE SHORT" : sellTrap1Signal or sellTrap2Signal ? "SELLERS TRAPPED BUYERS" : institutionalSell ? "SELLER ENTERED" : bearPatternConfirmed ? "SELLER PATTERN" : bearFlow ? "FLOW FLIP" : "SELLER REJECT"
 
-if activePlanInvalid or activePlanDone or activePlanExpired or newLongPlan or newShortPlan
+if activePlanInvalid or activePlanDone or activePlanExpired or shortExitWarn or longExitWarn or newLongPlan or newShortPlan
+    if showSmartLabels and shortExitWarn
+        label.new(bar_index, low - atr * 0.25, "EXIT SHORT\n" + shortExitReason, style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.white, size=size.small)
+    if showSmartLabels and longExitWarn
+        label.new(bar_index, high + atr * 0.25, "EXIT LONG\n" + longExitReason, style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
     if not na(activePlanLabel)
         label.delete(activePlanLabel)
-    if activePlanInvalid or activePlanDone or activePlanExpired
+    if activePlanInvalid or activePlanDone or activePlanExpired or shortExitWarn or longExitWarn
         activePlanDir := 0
         activePlanClass := "NONE"
         activePlanSignal := "NONE"
@@ -857,6 +933,63 @@ planShortActive = activePlanDir == -1 and not activePlanInvalid and not activePl
 activePlanBarsLeft = activePlanDir == 0 ? na : math.max(activePlanExpiry - activePlanAge, 0)
 activeUnlockLevel = activePlanDir == 1 ? activePlanUnlock : activePlanDir == -1 ? activePlanUnlock : signalTxt == "WAIT" and dominantSide == 1 ? unlockLongLevel : signalTxt == "WAIT" and dominantSide == -1 ? unlockShortLevel : signalTxt == "PREP LONG" ? unlockLongLevel : signalTxt == "PREP SHORT" ? unlockShortLevel : na
 unlockTxt = signalTxt == "WAIT" and dominantSide == 1 ? "LONG > " + str.tostring(unlockLongLevel, format.mintick) + " reclaim" : signalTxt == "WAIT" and dominantSide == -1 ? "SHORT < " + str.tostring(unlockShortLevel, format.mintick) + " fail" : signalTxt == "PREP LONG" ? "LONG > " + str.tostring(unlockLongLevel, format.mintick) + " reclaim" : signalTxt == "PREP SHORT" ? "SHORT < " + str.tostring(unlockShortLevel, format.mintick) + " fail" : activePlanDir == 1 ? "LONG > " + str.tostring(activePlanUnlock, format.mintick) : activePlanDir == -1 ? "SHORT < " + str.tostring(activePlanUnlock, format.mintick) : "NA"
+longAdvisoryReason = buySignal ? "BUY CONFIRMED" : buyerTakeoverStrong ? "STRONG REVERSAL" : bullReversalConfirmed ? "BUYER REVERSAL" : bullContinuationConfirmed ? "BUYER CONTINUATION" : institutionalBuy ? "BUYER ENTERED" : bullFlow ? "BULL FLOW" : "BUY RECLAIM"
+shortAdvisoryReason = sellSignal ? "SELL CONFIRMED" : sellerTakeoverStrong ? "STRONG REVERSAL" : bearReversalConfirmed ? "SELLER REVERSAL" : bearContinuationConfirmed ? "SELLER CONTINUATION" : institutionalSell ? "SELLER ENTERED" : bearFlow ? "BEAR FLOW" : "SELL REJECT"
+longAdvisoryTrigger = barstate.isconfirmed and tradeWindowOk and dominantSide == 1 and not longHardVeto and not inNoEntryZone and not antiChaseLong and not buyClimaxRisk and longRoomOk and (buySignal or buyerTakeoverStrong or (pLong >= math.max(56.0, float(prepThreshold - 4)) and longEdge >= math.max(6.0, float(prepEdgeMin - 1)) and longUnlockReady and (longRetestReclaim or institutionalBuy or bullPatternConfirmed or bullContinuationPattern or bullFlow or buyTrap1Signal or buyTrap2Signal)))
+shortAdvisoryTrigger = barstate.isconfirmed and tradeWindowOk and dominantSide == -1 and not shortHardVeto and not inNoEntryZone and not antiChaseShort and not sellClimaxRisk and shortRoomOk and (sellSignal or sellerTakeoverStrong or (pShort >= math.max(56.0, float(prepThreshold - 4)) and shortEdge >= math.max(6.0, float(prepEdgeMin - 1)) and shortUnlockReady and (shortRetestFail or institutionalSell or bearPatternConfirmed or bearContinuationPattern or bearFlow or sellTrap1Signal or sellTrap2Signal)))
+longAdvisoryExit = barstate.isconfirmed and advisoryDir == 1 and (sellSignal or sellerTakeoverStrong or (close < emaFast and close < vwapVal and pShort >= math.max(50.0, pLong - 4.0) and shortEdge >= 2.0 and (shortRetestFail or bearPatternConfirmed or institutionalSell or bearFlow)))
+shortAdvisoryExit = barstate.isconfirmed and advisoryDir == -1 and (buySignal or buyerTakeoverStrong or (close > emaFast and close > vwapVal and pLong >= math.max(50.0, pShort - 4.0) and longEdge >= 2.0 and (longRetestReclaim or bullPatternConfirmed or institutionalBuy or bullFlow)))
+reverseToLong = longAdvisoryTrigger and advisoryDir == -1
+reverseToShort = shortAdvisoryTrigger and advisoryDir == 1
+enterLongAdvisory = longAdvisoryTrigger and advisoryDir == 0
+enterShortAdvisory = shortAdvisoryTrigger and advisoryDir == 0
+exitLongAdvisory = longAdvisoryExit and not reverseToShort
+exitShortAdvisory = shortAdvisoryExit and not reverseToLong
+
+if reverseToLong
+    advisoryDir := 1
+    advisoryAge := 0
+    advisoryEntryPx := close
+    advisoryReason := longAdvisoryReason
+else if reverseToShort
+    advisoryDir := -1
+    advisoryAge := 0
+    advisoryEntryPx := close
+    advisoryReason := shortAdvisoryReason
+else if exitLongAdvisory or exitShortAdvisory
+    advisoryDir := 0
+    advisoryAge := 100000
+    advisoryEntryPx := na
+    advisoryReason := exitLongAdvisory ? longExitReason : shortExitReason
+else if enterLongAdvisory
+    advisoryDir := 1
+    advisoryAge := 0
+    advisoryEntryPx := close
+    advisoryReason := longAdvisoryReason
+else if enterShortAdvisory
+    advisoryDir := -1
+    advisoryAge := 0
+    advisoryEntryPx := close
+    advisoryReason := shortAdvisoryReason
+
+bullFakeMove = barstate.isconfirmed and (bullReversalConfirmed[1] or bullContinuationConfirmed[1] or enterLongAdvisory[1] or reverseToLong[1]) and close < math.min(emaFast, vwapVal) and close < low[1] and pShort >= math.max(48.0, pLong - 2.0) and (shortRetestFail or institutionalSell or bearPatternConfirmed or bearFlow)
+bearFakeMove = barstate.isconfirmed and (bearReversalConfirmed[1] or bearContinuationConfirmed[1] or enterShortAdvisory[1] or reverseToShort[1]) and close > math.max(emaFast, vwapVal) and close > high[1] and pLong >= math.max(48.0, pShort - 2.0) and (longRetestReclaim or institutionalBuy or bullPatternConfirmed or bullFlow)
+
+if showSmartLabels and reverseToLong
+    advisoryLabel := label.new(bar_index, low - atr * 0.30, "REVERSE BUY\n" + longAdvisoryReason, style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.white, size=size.small)
+else if showSmartLabels and reverseToShort
+    advisoryLabel := label.new(bar_index, high + atr * 0.30, "REVERSE SELL\n" + shortAdvisoryReason, style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+else if showSmartLabels and enterLongAdvisory
+    advisoryLabel := label.new(bar_index, low - atr * 0.30, "ENTER BUY\n" + longAdvisoryReason, style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+else if showSmartLabels and enterShortAdvisory
+    advisoryLabel := label.new(bar_index, high + atr * 0.30, "ENTER SELL\n" + shortAdvisoryReason, style=label.style_label_down, color=color.new(color.maroon, 0), textcolor=color.white, size=size.small)
+else if showSmartLabels and exitLongAdvisory
+    advisoryLabel := label.new(bar_index, high + atr * 0.30, "EXIT BUY\n" + longExitReason, style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.white, size=size.small)
+else if showSmartLabels and exitShortAdvisory
+    advisoryLabel := label.new(bar_index, low - atr * 0.30, "EXIT SELL\n" + shortExitReason, style=label.style_label_up, color=color.new(color.orange, 0), textcolor=color.white, size=size.small)
+
+displaySignalTxt = reverseToLong ? "REVERSE BUY" : reverseToShort ? "REVERSE SELL" : enterLongAdvisory ? "ENTER BUY" : enterShortAdvisory ? "ENTER SELL" : exitLongAdvisory ? "EXIT BUY" : exitShortAdvisory ? "EXIT SELL" : bullFakeMove ? "FAKE BUY MOVE" : bearFakeMove ? "FAKE SELL MOVE" : advisoryDir == 1 ? "HOLD BUY" : advisoryDir == -1 ? "HOLD SELL" : shortExitWarn ? (buySignal ? "REVERSE LONG" : "EXIT SHORT") : longExitWarn ? (sellSignal ? "REVERSE SHORT" : "EXIT LONG") : signalTxt
+displaySignalCol = reverseToLong or enterLongAdvisory or advisoryDir == 1 ? color.lime : reverseToShort or enterShortAdvisory or advisoryDir == -1 ? color.red : exitLongAdvisory or exitShortAdvisory or bullFakeMove or bearFakeMove ? color.orange : shortExitWarn ? color.lime : longExitWarn ? color.red : buySignal ? color.lime : sellSignal ? color.red : signalTxt == "PREP LONG" or signalTxt == "PREP SHORT" ? color.yellow : signalTxt == "WATCH LONG" or signalTxt == "WATCH SHORT" ? color.aqua : color.gray
 
 
 // ============================================================================
@@ -867,12 +1000,20 @@ var int lastBearPatternLabelBar = na
 bullPatternLabelOk = na(lastBullPatternLabelBar) or (bar_index - lastBullPatternLabelBar > patternLabelSpacing)
 bearPatternLabelOk = na(lastBearPatternLabelBar) or (bar_index - lastBearPatternLabelBar > patternLabelSpacing)
 
+if showPatternLabels and barstate.isconfirmed and bullFakeMove
+    label.new(bar_index, high + atr * 0.20, "Fake Buy Move", style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.white, size=size.tiny)
+
+if showPatternLabels and barstate.isconfirmed and bearFakeMove
+    label.new(bar_index, low - atr * 0.20, "Fake Sell Move", style=label.style_label_up, color=color.new(color.orange, 0), textcolor=color.white, size=size.tiny)
+
 if showPatternLabels and barstate.isconfirmed and bullPatternConfirmed and bullPatternLabelOk
-    label.new(bar_index, low - atr * 0.20, "Buyer Pattern\n" + str.tostring(bullPatternScore) + "%", style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+    bullPatternLabelTxt = bullReversalConfirmed ? "Buyer Reversal\n" : bullContinuationConfirmed ? "Buyer Continuation\n" : "Buyer Pattern\n"
+    label.new(bar_index, low - atr * 0.20, bullPatternLabelTxt + str.tostring(bullPatternScore) + "%", style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
     lastBullPatternLabelBar := bar_index
 
 if showPatternLabels and barstate.isconfirmed and bearPatternConfirmed and bearPatternLabelOk
-    label.new(bar_index, high + atr * 0.20, "Seller Pattern\n" + str.tostring(bearPatternScore) + "%", style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    bearPatternLabelTxt = bearReversalConfirmed ? "Seller Reversal\n" : bearContinuationConfirmed ? "Seller Continuation\n" : "Seller Pattern\n"
+    label.new(bar_index, high + atr * 0.20, bearPatternLabelTxt + str.tostring(bearPatternScore) + "%", style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
     lastBearPatternLabelBar := bar_index
 
 if showInstLabels and barstate.isconfirmed and institutionalBuy and not institutionalBuy[1]
@@ -998,8 +1139,8 @@ if showTable and barstate.islast
     trapCol = activeBuyTrapAge < activeSellTrapAge ? color.lime : activeSellTrapAge < activeBuyTrapAge ? color.red : buyTrap1Signal or buyTrap2Signal ? color.lime : sellTrap1Signal or sellTrap2Signal ? color.red : color.gray
     flowTxt = bullFlow ? "BULL FLOW" : bearFlow ? "BEAR FLOW" : "NEUTRAL"
     flowCol = bullFlow ? color.lime : bearFlow ? color.red : color.gray
-    pattTxt = bullPatternConfirmed ? "BUYER PATTERN" : bearPatternConfirmed ? "SELLER PATTERN" : "NONE"
-    pattCol = bullPatternConfirmed ? color.lime : bearPatternConfirmed ? color.red : color.gray
+    pattTxt = bullFakeMove ? "FAKE BUY MOVE" : bearFakeMove ? "FAKE SELL MOVE" : bullPatternConfirmed ? bullPatternTypeTxt : bearPatternConfirmed ? bearPatternTypeTxt : "NONE"
+    pattCol = bullFakeMove or bearFakeMove ? color.orange : bullPatternConfirmed ? color.lime : bearPatternConfirmed ? color.red : color.gray
     huntLevelTxt = na(treasureLevel) ? "NA" : str.tostring(treasureLevel, format.mintick)
     entryTxt = activePlanDir != 0 ? str.tostring(activePlanEntry, format.mintick) : "NA"
     stopTxt = activePlanDir != 0 ? str.tostring(activePlanStop, format.mintick) : "NA"
@@ -1013,7 +1154,7 @@ if showTable and barstate.islast
     rrDisplay = activePlanDir != 0 ? (activePlanDir == 1 ? longT1RR : shortT1RR) : dominantSide == 1 ? longT1RR : dominantSide == -1 ? shortT1RR : na
     qualityDisplayTxt = qualityTxt + " | RR1 " + (na(rrDisplay) ? "NA" : str.tostring(rrDisplay, "#.##"))
 
-    sigCol = buySignal ? color.lime : sellSignal ? color.red : signalTxt == "PREP LONG" or signalTxt == "PREP SHORT" ? color.yellow : signalTxt == "WATCH LONG" or signalTxt == "WATCH SHORT" ? color.aqua : color.gray
+    sigCol = displaySignalCol
     classCol = str.contains(classTxt, "AVOID") ? color.orange : str.contains(classTxt, "LEAN") ? color.silver : str.contains(classTxt, "CT") ? color.orange : color.white
     huntTxt = treasureSideTxt == "NONE" ? "NONE" : treasureSideTxt + " @ " + huntLevelTxt
     unlockCol = signalTxt == "WAIT" or str.contains(signalTxt, "PREP") ? color.yellow : activePlanDir != 0 ? color.aqua : color.gray
@@ -1044,7 +1185,7 @@ if showTable and barstate.islast
         table.cell(dash, 1, 6, str.tostring(pLongRounded) + " / " + str.tostring(pShortRounded), text_color=color.white, text_size=tableTextSize)
 
         table.cell(dash, 0, 7, "Signal", text_color=color.gray, text_size=tableTextSize)
-        table.cell(dash, 1, 7, signalTxt, text_color=sigCol, text_size=tableTextSize)
+        table.cell(dash, 1, 7, displaySignalTxt, text_color=sigCol, text_size=tableTextSize)
 
         table.cell(dash, 0, 8, "Class", text_color=color.gray, text_size=tableTextSize)
         table.cell(dash, 1, 8, classTxt, text_color=classCol, text_size=tableTextSize)
@@ -1102,7 +1243,7 @@ if showTable and barstate.islast
         table.cell(dash, 1, 8, str.tostring(pLongRounded) + " / " + str.tostring(pShortRounded), text_color=color.white, text_size=tableTextSize)
 
         table.cell(dash, 0, 9, "Signal", text_color=color.gray, text_size=tableTextSize)
-        table.cell(dash, 1, 9, signalTxt, text_color=sigCol, text_size=tableTextSize)
+        table.cell(dash, 1, 9, displaySignalTxt, text_color=sigCol, text_size=tableTextSize)
 
         table.cell(dash, 0, 10, "Class", text_color=color.gray, text_size=tableTextSize)
         table.cell(dash, 1, 10, classTxt, text_color=classCol, text_size=tableTextSize)

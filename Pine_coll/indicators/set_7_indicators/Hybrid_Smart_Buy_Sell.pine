@@ -18,6 +18,10 @@ unlockLookback  = input.int(3, "Unlock Pivot Lookback", minval=1, maxval=20, gro
 touchBufferATR  = input.float(0.08, "Retest Buffer x ATR", minval=0.0, maxval=1.0, step=0.01, group=grpTrend)
 wickBodyRatio   = input.float(1.30, "Rejection Wick / Body Ratio", minval=0.5, maxval=5.0, step=0.1, group=grpTrend)
 instVolMult     = input.float(1.40, "Institutional Volume Mult", minval=1.0, maxval=5.0, step=0.1, group=grpTrend)
+expBreakoutLen  = input.int(5, "Momentum Breakout Lookback", minval=2, maxval=30, group=grpTrend)
+expRangeATR     = input.float(1.10, "Momentum Range x ATR", minval=0.5, maxval=5.0, step=0.05, group=grpTrend)
+expBodyFrac     = input.float(0.58, "Momentum Body Fraction", minval=0.30, maxval=0.95, step=0.01, group=grpTrend)
+expVolMult      = input.float(1.05, "Momentum Volume Mult", minval=0.50, maxval=5.0, step=0.05, group=grpTrend)
 
 grpHTF = "3) Higher Timeframe Filter"
 useHTF          = input.bool(true, "Use HTF Bias", group=grpHTF)
@@ -31,6 +35,7 @@ finalScoreThreshold = input.int(72, "Final Buy/Sell Threshold", minval=1, maxval
 edgeThreshold       = input.int(8, "Edge Threshold", minval=1, maxval=50, group=grpScore)
 cooldownBars        = input.int(5, "Cooldown Bars", minval=0, maxval=50, group=grpScore)
 minRoomATR          = input.float(0.80, "Minimum Room To Opposite Zone x ATR", minval=0.10, maxval=5.0, step=0.05, group=grpScore)
+expansionRoomATR    = input.float(0.50, "Momentum Room x ATR", minval=0.10, maxval=5.0, step=0.05, group=grpScore)
 
 grpTrail = "5) Smart Moving Lines"
 trailFastATR    = input.float(1.20, "Fast Trail x ATR", minval=0.20, maxval=10.0, step=0.05, group=grpTrail)
@@ -144,9 +149,23 @@ unlockLongPivot = ta.highest(high[1], unlockLookback)
 unlockShortPivot = ta.lowest(low[1], unlockLookback)
 unlockLong = close > unlockLongPivot
 unlockShort = close < unlockShortPivot
+expBreakoutHigh = ta.highest(high[1], expBreakoutLen)
+expBreakoutLow = ta.lowest(low[1], expBreakoutLen)
 
-longRoomOk = close < mapMid and (sellerZoneLow - close) > atr * minRoomATR
-shortRoomOk = close > mapMid and (close - buyerZoneHigh) > atr * minRoomATR
+// Expansion logic covers strong mid-range breakouts that the original pullback-only path misses.
+bullExpansion = bullFlow and close > expBreakoutHigh and emaFast > emaFast[1] and emaTrend >= emaTrend[1] and closePos >= 0.70 and bodyFrac >= expBodyFrac and rangeBar >= atr * expRangeATR and relVol >= expVolMult
+bearExpansion = bearFlow and close < expBreakoutLow and emaFast < emaFast[1] and emaTrend <= emaTrend[1] and closePos <= 0.30 and bodyFrac >= expBodyFrac and rangeBar >= atr * expRangeATR and relVol >= expVolMult
+
+longMeanRevertRoomOk = close < mapMid and (sellerZoneLow - close) > atr * minRoomATR
+shortMeanRevertRoomOk = close > mapMid and (close - buyerZoneHigh) > atr * minRoomATR
+longTrendRoomOk = close >= mapMid and (sellerZoneHigh - close) > atr * expansionRoomATR
+shortTrendRoomOk = close <= mapMid and (close - buyerZoneLow) > atr * expansionRoomATR
+longRoomOk = longMeanRevertRoomOk or (bullExpansion and longTrendRoomOk)
+shortRoomOk = shortMeanRevertRoomOk or (bearExpansion and shortTrendRoomOk)
+ctxBullFast = ctxClose > ctxTrend and ctxTrend >= ctxTrend[1]
+ctxBearFast = ctxClose < ctxTrend and ctxTrend <= ctxTrend[1]
+ctxLongEntryOk = not ctxActive ? true : optionMode == "CALL" ? (ctxBull or (bullExpansion and ctxBullFast)) : optionMode == "PUT" ? (ctxBear or (bearExpansion and ctxBearFast)) : true
+ctxShortEntryOk = not ctxActive ? true : optionMode == "CALL" ? (ctxBear or (bearExpansion and ctxBearFast)) : optionMode == "PUT" ? (ctxBull or (bullExpansion and ctxBullFast)) : true
 
 // =====================================================
 // HYBRID SCORE ENGINE
@@ -157,14 +176,14 @@ shortTrendComp = bearFlow ? 100.0 : emaFast < emaSlow ? 76.0 : close < emaTrend 
 longValueComp = inBuyerZone ? 96.0 : inDiscount ? 70.0 : inMiddle ? 26.0 : 12.0
 shortValueComp = inSellerZone ? 96.0 : inPremium ? 70.0 : inMiddle ? 26.0 : 12.0
 
-longTriggerComp = unlockLong and (longTouch or bullReject or institutionalBuy) ? 100.0 : longTouch ? 74.0 : bullReject ? 66.0 : institutionalBuy ? 82.0 : 20.0
-shortTriggerComp = unlockShort and (shortTouch or bearReject or institutionalSell) ? 100.0 : shortTouch ? 74.0 : bearReject ? 66.0 : institutionalSell ? 82.0 : 20.0
+longTriggerComp = unlockLong and (longTouch or bullReject or institutionalBuy or bullExpansion) ? 100.0 : bullExpansion ? 92.0 : longTouch ? 74.0 : bullReject ? 66.0 : institutionalBuy ? 82.0 : 20.0
+shortTriggerComp = unlockShort and (shortTouch or bearReject or institutionalSell or bearExpansion) ? 100.0 : bearExpansion ? 92.0 : shortTouch ? 74.0 : bearReject ? 66.0 : institutionalSell ? 82.0 : 20.0
 
 longHTFComp = not useHTF ? 50.0 : htfBull ? (close <= htfMid ? 92.0 : 72.0) : inBuyerZone ? 58.0 : inDiscount ? 46.0 : 28.0
 shortHTFComp = not useHTF ? 50.0 : htfBear ? (close >= htfMid ? 92.0 : 72.0) : inSellerZone ? 58.0 : inPremium ? 46.0 : 28.0
 
-longFlowComp = institutionalBuy ? 94.0 : bullReject ? 62.0 : 28.0
-shortFlowComp = institutionalSell ? 94.0 : bearReject ? 62.0 : 28.0
+longFlowComp = institutionalBuy ? 94.0 : bullExpansion ? 86.0 : bullReject ? 62.0 : 28.0
+shortFlowComp = institutionalSell ? 94.0 : bearExpansion ? 86.0 : bearReject ? 62.0 : 28.0
 
 wTrend = 0.28
 wValue = 0.24
@@ -184,40 +203,42 @@ dominantSide = pLongRounded > pShortRounded ? 1 : pShortRounded > pLongRounded ?
 watchEdgeMin = math.max(4, int(math.floor(edgeThreshold * 0.50)))
 prepEdgeMin = math.max(6, int(math.floor(edgeThreshold * 0.70)))
 
-longTriggerPresent = bullFlow or bullReject or institutionalBuy or longTouch
-shortTriggerPresent = bearFlow or bearReject or institutionalSell or shortTouch
+longTriggerPresent = bullFlow or bullReject or institutionalBuy or longTouch or bullExpansion
+shortTriggerPresent = bearFlow or bearReject or institutionalSell or shortTouch or bearExpansion
 
-longWatchReady = ctxLongOk and dominantSide == 1 and pLongRounded >= watchThreshold and longEdge >= watchEdgeMin and longTriggerPresent and not inSellerZone
-shortWatchReady = ctxShortOk and dominantSide == -1 and pShortRounded >= watchThreshold and shortEdge >= watchEdgeMin and shortTriggerPresent and not inBuyerZone
+longWatchReady = ctxLongEntryOk and dominantSide == 1 and pLongRounded >= watchThreshold and longEdge >= watchEdgeMin and longTriggerPresent and not inSellerZone
+shortWatchReady = ctxShortEntryOk and dominantSide == -1 and pShortRounded >= watchThreshold and shortEdge >= watchEdgeMin and shortTriggerPresent and not inBuyerZone
 
-longCountertrendOk = htfBull or (inBuyerZone and bullReject and close > emaFast and close >= vwapVal) or institutionalBuy
-shortCountertrendOk = htfBear or (inSellerZone and bearReject and close < emaFast and close <= vwapVal) or institutionalSell
+longCountertrendOk = htfBull or (inBuyerZone and bullReject and close > emaFast and close >= vwapVal) or institutionalBuy or bullExpansion
+shortCountertrendOk = htfBear or (inSellerZone and bearReject and close < emaFast and close <= vwapVal) or institutionalSell or bearExpansion
 
-longPrepReady = longWatchReady and pLongRounded >= prepThreshold and longEdge >= prepEdgeMin and longRoomOk and (longTouch or bullReject or institutionalBuy) and longCountertrendOk
-shortPrepReady = shortWatchReady and pShortRounded >= prepThreshold and shortEdge >= prepEdgeMin and shortRoomOk and (shortTouch or bearReject or institutionalSell) and shortCountertrendOk
+longPrepReady = longWatchReady and pLongRounded >= prepThreshold and longEdge >= prepEdgeMin and longRoomOk and (longTouch or bullReject or institutionalBuy or bullExpansion) and longCountertrendOk
+shortPrepReady = shortWatchReady and pShortRounded >= prepThreshold and shortEdge >= prepEdgeMin and shortRoomOk and (shortTouch or bearReject or institutionalSell or bearExpansion) and shortCountertrendOk
 
 var int lastActionBar = na
 var int lastLongExitBar = na
 var int lastShortExitBar = na
 cooldownOk = na(lastActionBar) or (bar_index - lastActionBar > cooldownBars)
 
-longCorePass = longPrepReady and unlockLong and pLongRounded >= finalScoreThreshold and longEdge >= edgeThreshold and longRoomOk and (not useHTF or htfBull or inBuyerZone)
-shortCorePass = shortPrepReady and unlockShort and pShortRounded >= finalScoreThreshold and shortEdge >= edgeThreshold and shortRoomOk and (not useHTF or htfBear or inSellerZone)
+longCorePass = longPrepReady and unlockLong and pLongRounded >= finalScoreThreshold and longEdge >= edgeThreshold and longRoomOk and (not useHTF or htfBull or inBuyerZone or bullExpansion)
+shortCorePass = shortPrepReady and unlockShort and pShortRounded >= finalScoreThreshold and shortEdge >= edgeThreshold and shortRoomOk and (not useHTF or htfBear or inSellerZone or bearExpansion)
 
 // True fast-track overrides: do not depend on prep readiness.
 longReversalPass = unlockLong and longRoomOk and inDiscount and bullReject and longEdge >= edgeThreshold + 4 and pLongRounded >= watchThreshold
 shortReversalPass = unlockShort and shortRoomOk and inPremium and bearReject and shortEdge >= edgeThreshold + 4 and pShortRounded >= watchThreshold
+longExpansionPass = bullExpansion and unlockLong and longRoomOk and longEdge >= watchEdgeMin and pLongRounded >= prepThreshold and ctxLongEntryOk
+shortExpansionPass = bearExpansion and unlockShort and shortRoomOk and shortEdge >= watchEdgeMin and pShortRounded >= prepThreshold and ctxShortEntryOk
 
 barsSinceLongExit = na(lastLongExitBar) ? 100000 : bar_index - lastLongExitBar
 barsSinceShortExit = na(lastShortExitBar) ? 100000 : bar_index - lastShortExitBar
 longContinuationPass = barsSinceLongExit <= 15 and inDiscount and longRoomOk and unlockLong and longEdge >= edgeThreshold and pLongRounded >= watchThreshold and (bullReject or institutionalBuy or longTouch)
 shortContinuationPass = barsSinceShortExit <= 15 and inPremium and shortRoomOk and unlockShort and shortEdge >= edgeThreshold and pShortRounded >= watchThreshold and (bearReject or institutionalSell or shortTouch)
 
-buyOverride = longReversalPass or longContinuationPass
-sellOverride = shortReversalPass or shortContinuationPass
+buyOverride = longReversalPass or longContinuationPass or longExpansionPass
+sellOverride = shortReversalPass or shortContinuationPass or shortExpansionPass
 
-rawBuySignal = barstate.isconfirmed and cooldownOk and ctxLongOk and (longCorePass or buyOverride)
-rawSellSignal = barstate.isconfirmed and cooldownOk and ctxShortOk and (shortCorePass or sellOverride)
+rawBuySignal = barstate.isconfirmed and cooldownOk and ctxLongEntryOk and (longCorePass or buyOverride)
+rawSellSignal = barstate.isconfirmed and cooldownOk and ctxShortEntryOk and (shortCorePass or sellOverride)
 
 // =====================================================
 // CAMPAIGN STATE + SMART MOVING LINES
@@ -278,7 +299,8 @@ if buySignal
     trailSlow := longBaseSlow
     lastActionBar := bar_index
     if showLabels
-        label.new(bar_index, low - atr * 0.25, "Smart Buy", style=label.style_label_up, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+        labelText = longExpansionPass ? "Momentum Buy" : "Smart Buy"
+        label.new(bar_index, low - atr * 0.25, labelText, style=label.style_label_up, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
 
 if sellSignal
     state := -1
@@ -287,7 +309,8 @@ if sellSignal
     trailSlow := shortBaseSlow
     lastActionBar := bar_index
     if showLabels
-        label.new(bar_index, high + atr * 0.25, "Smart Sell", style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.white, size=size.small)
+        labelText = shortExpansionPass ? "Momentum Sell" : "Smart Sell"
+        label.new(bar_index, high + atr * 0.25, labelText, style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.white, size=size.small)
 
 // =====================================================
 // PLOTS
@@ -326,11 +349,15 @@ if barstate.islast
         positionCol = state == 1 ? color.aqua : state == -1 ? color.red : color.gray
         leanLongReady = dominantSide == 1 and pLongRounded >= watchThreshold - 2 and longEdge >= watchEdgeMin and longTriggerPresent
         leanShortReady = dominantSide == -1 and pShortRounded >= watchThreshold - 2 and shortEdge >= watchEdgeMin and shortTriggerPresent
-        earlyWatchLong = ctxLongOk and bullReject and inDiscount and longEdge >= 2
-        earlyWatchShort = ctxShortOk and bearReject and inPremium and shortEdge >= 2
+        earlyWatchLong = ctxLongEntryOk and bullReject and inDiscount and longEdge >= 2
+        earlyWatchShort = ctxShortEntryOk and bearReject and inPremium and shortEdge >= 2
+        expWatchLong = ctxLongEntryOk and bullExpansion and longRoomOk
+        expWatchShort = ctxShortEntryOk and bearExpansion and shortRoomOk
         marketBiasTxt = ctxInvalid ? "CTX INVALID" :
              rawBuySignal ? "SIGNAL BUY" :
              rawSellSignal ? "SIGNAL SELL" :
+             expWatchLong ? "WATCH EXP LONG" :
+             expWatchShort ? "WATCH EXP SHORT" :
              longPrepReady ? (htfBull ? "PREP LONG" : "CT PREP LONG") :
              shortPrepReady ? (htfBear ? "PREP SHORT" : "CT PREP SHORT") :
              longWatchReady ? (htfBull ? "WATCH LONG" : "CT WATCH LONG") :
@@ -339,8 +366,8 @@ if barstate.islast
              earlyWatchShort ? "WATCH SHORT" :
              leanLongReady ? "LEAN LONG" :
              leanShortReady ? "LEAN SHORT" : "WAIT"
-        isLongBias = marketBiasTxt == "SIGNAL BUY" or marketBiasTxt == "PREP LONG" or marketBiasTxt == "CT PREP LONG" or marketBiasTxt == "WATCH LONG" or marketBiasTxt == "CT WATCH LONG" or marketBiasTxt == "LEAN LONG"
-        isShortBias = marketBiasTxt == "SIGNAL SELL" or marketBiasTxt == "PREP SHORT" or marketBiasTxt == "CT PREP SHORT" or marketBiasTxt == "WATCH SHORT" or marketBiasTxt == "CT WATCH SHORT" or marketBiasTxt == "LEAN SHORT"
+        isLongBias = marketBiasTxt == "SIGNAL BUY" or marketBiasTxt == "PREP LONG" or marketBiasTxt == "CT PREP LONG" or marketBiasTxt == "WATCH LONG" or marketBiasTxt == "CT WATCH LONG" or marketBiasTxt == "WATCH EXP LONG" or marketBiasTxt == "LEAN LONG"
+        isShortBias = marketBiasTxt == "SIGNAL SELL" or marketBiasTxt == "PREP SHORT" or marketBiasTxt == "CT PREP SHORT" or marketBiasTxt == "WATCH SHORT" or marketBiasTxt == "CT WATCH SHORT" or marketBiasTxt == "WATCH EXP SHORT" or marketBiasTxt == "LEAN SHORT"
         marketBiasCol = isLongBias ? color.aqua : isShortBias ? color.red : color.gray
         compactBiasTxt = marketBiasTxt == "SIGNAL BUY" ? "BUY" :
              marketBiasTxt == "SIGNAL SELL" ? "SELL" :
@@ -348,6 +375,8 @@ if barstate.islast
              marketBiasTxt == "PREP SHORT" ? "P SHORT" :
              marketBiasTxt == "CT PREP LONG" ? "CT P LONG" :
              marketBiasTxt == "CT PREP SHORT" ? "CT P SHORT" :
+             marketBiasTxt == "WATCH EXP LONG" ? "W EXP L" :
+             marketBiasTxt == "WATCH EXP SHORT" ? "W EXP S" :
              marketBiasTxt == "WATCH LONG" ? "W LONG" :
              marketBiasTxt == "WATCH SHORT" ? "W SHORT" :
              marketBiasTxt == "CT WATCH LONG" ? "CT W LONG" :
@@ -372,8 +401,8 @@ if barstate.islast
         table.cell(dash, 1, 7, not useHTF ? "OFF" : htfBull ? "BULL" : htfBear ? "BEAR" : "FLAT", text_color=htfBull ? color.aqua : htfBear ? color.red : color.gray, text_size=tableTextSize)
         table.cell(dash, 0, 8, "Room", text_color=color.white, text_size=tableTextSize)
         table.cell(dash, 1, 8, dominantSide == 1 ? (longRoomOk ? "OK" : "TIGHT") : dominantSide == -1 ? (shortRoomOk ? "OK" : "TIGHT") : "NA", text_color=(dominantSide == 1 and longRoomOk) or (dominantSide == -1 and shortRoomOk) ? color.lime : color.orange, text_size=tableTextSize)
-        ctxTxt = ctxInvalid ? "INVALID" : not ctxActive ? "OFF" : dominantSide == 1 ? (ctxLongOk ? "LONG OK" : "LONG BLOCK") : dominantSide == -1 ? (ctxShortOk ? "SHORT OK" : "SHORT BLOCK") : (ctxLongOk and ctxShortOk ? "OK" : "BLOCK")
-        ctxCol = ctxInvalid ? color.orange : not ctxActive ? color.gray : dominantSide == 1 ? (ctxLongOk ? color.lime : color.orange) : dominantSide == -1 ? (ctxShortOk ? color.lime : color.orange) : color.silver
+        ctxTxt = ctxInvalid ? "INVALID" : not ctxActive ? "OFF" : dominantSide == 1 ? (ctxLongEntryOk ? "LONG OK" : "LONG BLOCK") : dominantSide == -1 ? (ctxShortEntryOk ? "SHORT OK" : "SHORT BLOCK") : (ctxLongEntryOk and ctxShortEntryOk ? "OK" : "BLOCK")
+        ctxCol = ctxInvalid ? color.orange : not ctxActive ? color.gray : dominantSide == 1 ? (ctxLongEntryOk ? color.lime : color.orange) : dominantSide == -1 ? (ctxShortEntryOk ? color.lime : color.orange) : color.silver
         table.cell(dash, 0, 9, "Ctx", text_color=color.white, text_size=tableTextSize)
         table.cell(dash, 1, 9, ctxTxt, text_color=ctxCol, text_size=tableTextSize)
         if showDebugTable
@@ -394,7 +423,7 @@ if barstate.islast
             table.cell(dash, 0, 17, "Cont L/S", text_color=color.white, text_size=tableTextSize)
             table.cell(dash, 1, 17, f_bool_text(longContinuationPass) + " / " + f_bool_text(shortContinuationPass), text_color=color.white, text_size=tableTextSize)
             table.cell(dash, 0, 18, "Ctx L/S", text_color=color.white, text_size=tableTextSize)
-            table.cell(dash, 1, 18, f_bool_text(ctxLongOk) + " / " + f_bool_text(ctxShortOk), text_color=ctxCol, text_size=tableTextSize)
+            table.cell(dash, 1, 18, f_bool_text(ctxLongEntryOk) + " / " + f_bool_text(ctxShortEntryOk), text_color=ctxCol, text_size=tableTextSize)
         else
             for row = 10 to 18
                 table.cell(dash, 0, row, "", text_color=color.white, text_size=tableTextSize)

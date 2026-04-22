@@ -1,0 +1,1010 @@
+//@version=6
+indicator("AiRi-Brahmastra Unified Shield v7.2", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=200)
+
+// =========================================================================
+// 1) INPUTS
+// =========================================================================
+group_airi = "AiRi & RPZ Engine"
+eq_mode = input.string("Opening Range (15m)", "Equilibrium Mode", options=["First Candle (5m)", "Opening Range (15m)", "Manual Price"], group=group_airi)
+manual_eq_price = input.float(0.0, "Manual EQ Price", step=0.05, group=group_airi)
+chart_geometry = input.string("Auto", "Chart Geometry", options=["Auto", "Spot/Future", "Option"], group=group_airi)
+base_zone_width = input.float(15.0, "Minimum Zone Width", minval=0.1, step=0.1, group=group_airi)
+show_prev_day_levels = input.bool(true, "Show PDH / PDL / PCL", group=group_airi)
+show_or_levels = input.bool(true, "Show ORH / ORL", group=group_airi)
+
+group_eq_sessions = "EQ Session Settings"
+first_candle_session = input.session("0915-0920", "First Candle Window", group=group_eq_sessions)
+opening_range_session = input.session("0915-0930", "Opening Range Window", group=group_eq_sessions)
+
+group_brahm = "Brahmastra (Momentum & SNJ)"
+snj_len = input.int(20, "SNJ Length", minval=1, group=group_brahm)
+snj_color = input.color(color.gray, "SNJ Color", group=group_brahm)
+body_threshold = input.float(60.0, "Body Threshold %", minval=1, maxval=100, group=group_brahm)
+touch_lookback = input.int(6, "Zone Touch Lookback", minval=1, maxval=20, group=group_brahm)
+reclaim_lookback = input.int(3, "Reclaim Confirmation Window", minval=1, maxval=10, group=group_brahm)
+premium_watch_expiry_bars = input.int(6, "Premium Watch Expiry Bars", minval=1, maxval=30, group=group_brahm)
+premium_rearm_bars = input.int(3, "Premium Re-Arm Reset Bars", minval=1, maxval=10, group=group_brahm)
+discount_retouch_rearm_bars = input.int(8, "Discount Re-Arm On Re-Touch Bars", minval=1, maxval=30, group=group_brahm)
+hide_short_micro_in_bull = input.bool(true, "Hide Short Micro-Markers In Strong Bull Trend", group=group_brahm)
+
+group_targets = "Target Engine"
+show_targets = input.bool(true, "Show Station Targets", group=group_targets)
+target_offset = input.float(5.0, "Target Label Offset (Points)", step=0.05, group=group_targets)
+
+group_risk = "Risk Management"
+sl_buffer = input.float(2.0, "SL Buffer (Points)", step=0.05, group=group_risk)
+sl_atr_mult = input.float(0.35, "Adaptive SL ATR Mult", minval=0.0, step=0.05, group=group_risk)
+sl_wick_mult = input.float(0.30, "Adaptive SL Wick Mult", minval=0.0, step=0.05, group=group_risk)
+show_rr = input.bool(true, "Show R:R Visuals", group=group_risk)
+
+group_delta = "1. Delta-Sync (Spot vs Future Divergence)"
+use_delta_sync = input.bool(true, "Enable Delta-Sync", group=group_delta)
+spot_symbol = input.symbol("NSE:NIFTY", "Spot Symbol", group=group_delta)
+future_symbol = input.symbol("NSE:NIFTY1!", "Future Symbol", group=group_delta)
+delta_min_move_pct = input.float(0.03, "Min Move % for Divergence", minval=0.0, step=0.01, group=group_delta)
+block_on_divergence = input.bool(true, "Block TT During Divergence", group=group_delta)
+
+group_kz = "2. Kill Zones"
+use_kill_zones = input.bool(true, "Enable Kill Zones", group=group_kz)
+opening_kz_session = input.session("0915-1030", "Opening Volatility", group=group_kz)
+europe_kz_session = input.session("1230-1330", "European Open", group=group_kz)
+block_outside_kz = input.bool(false, "Block TT Outside Kill Zones", group=group_kz)
+
+group_be = "3. Break-Even Trigger"
+enable_be = input.bool(true, "Enable Break-Even Alert", group=group_be)
+be_mode = input.string("1R", "BE Trigger Mode", options=["1R", "Fixed Points"], group=group_be)
+be_points = input.float(10.0, "BE Trigger Points", step=0.05, group=group_be)
+
+group_vix = "4. VIX-Adjusted RPZ Width"
+use_vix_width = input.bool(true, "Enable VIX Width", group=group_vix)
+vix_symbol = input.symbol("NSE:INDIAVIX", "VIX Symbol", group=group_vix)
+vix_reference = input.float(15.0, "Reference VIX", minval=1.0, step=0.1, group=group_vix)
+vix_min_mult = input.float(0.70, "Min Width Multiplier", minval=0.1, step=0.05, group=group_vix)
+vix_max_mult = input.float(2.00, "Max Width Multiplier", minval=0.1, step=0.05, group=group_vix)
+
+group_trap = "5. Three-Strike Trap Detector"
+enable_trap_detector = input.bool(true, "Enable Trap Detector", group=group_trap)
+trap_wick_to_body = input.float(1.5, "Min Wick:Body Ratio", minval=0.1, step=0.1, group=group_trap)
+trap_use_rpz_only = input.bool(false, "Require Deep RPZ (P2/D2) Instead of P1/D1", group=group_trap)
+
+group_mtf = "6. MTF Momentum Cloud"
+use_mtf_filter = input.bool(true, "Enable MTF Filter", group=group_mtf)
+mtf_tf1 = input.timeframe("15", "MTF 1", group=group_mtf)
+mtf_tf2 = input.timeframe("60", "MTF 2", group=group_mtf)
+show_mtf_dashboard = input.bool(true, "Show MTF Dashboard", group=group_mtf)
+
+group_vwap = "7. Global Fair Value Anchor (VWAP)"
+use_vwap_filter = input.bool(true, "Enable VWAP + EQ Filter", group=group_vwap)
+plot_vwap_line = input.bool(true, "Plot VWAP", group=group_vwap)
+
+// =========================================================================
+// 2) HELPERS
+// =========================================================================
+safe_div(num, den) =>
+    den != 0 ? num / den : na
+
+is_recent(int bars_ago, int lookback) =>
+    not na(bars_ago) and bars_ago <= lookback
+
+get_target(bool is_long, float price, float eq_, float p1_, float p2_, float d1_, float d2_) =>
+    float t = na
+    string s = ""
+    if is_long
+        if price < eq_
+            t := eq_
+            s := "EQ"
+        else if price < p1_
+            t := p1_
+            s := "P1"
+        else
+            t := p2_
+            s := "P2"
+    else
+        if price > eq_
+            t := eq_
+            s := "EQ"
+        else if price > d1_
+            t := d1_
+            s := "D1"
+        else
+            t := d2_
+            s := "D2"
+    [t, s]
+
+update_level_label(label existing, float price, string txt, color bg, color txt_color) =>
+    label result = existing
+    if na(price)
+        if not na(result)
+            label.delete(result)
+        result := na
+    else
+        if na(result)
+            result := label.new(bar_index + 1, price, txt, style=label.style_label_left, color=bg, textcolor=txt_color, size=size.tiny)
+        else
+            label.set_xy(result, bar_index + 1, price)
+            label.set_text(result, txt)
+            label.set_color(result, bg)
+            label.set_textcolor(result, txt_color)
+    result
+
+// =========================================================================
+// 3) DAY / SESSION STATE
+// =========================================================================
+bool is_new_day = timeframe.change("D")
+
+string fc_session_full = first_candle_session + ":23456"
+string or_session_full = opening_range_session + ":23456"
+string open_kz_full = opening_kz_session + ":23456"
+string euro_kz_full = europe_kz_session + ":23456"
+
+bool in_fc_window = not na(time(timeframe.period, fc_session_full))
+bool in_or_window = not na(time(timeframe.period, or_session_full))
+bool in_open_kz = not na(time(timeframe.period, open_kz_full))
+bool in_euro_kz = not na(time(timeframe.period, euro_kz_full))
+bool in_kill_zone = use_kill_zones ? (in_open_kz or in_euro_kz) : true
+
+var int session_left_bar = na
+if na(session_left_bar) or is_new_day
+    session_left_bar := bar_index
+
+// =========================================================================
+// 4) EQUILIBRIUM ENGINE
+// =========================================================================
+var float eq = na
+var float fc_h = na
+var float fc_l = na
+var float fc_c = na
+var float or_h = na
+var float or_l = na
+
+if is_new_day
+    eq := na
+    fc_h := na
+    fc_l := na
+    fc_c := na
+    or_h := na
+    or_l := na
+
+if in_fc_window
+    fc_h := na(fc_h) ? high : math.max(fc_h, high)
+    fc_l := na(fc_l) ? low : math.min(fc_l, low)
+    fc_c := close
+
+if in_or_window
+    or_h := na(or_h) ? high : math.max(or_h, high)
+    or_l := na(or_l) ? low : math.min(or_l, low)
+
+if eq_mode == "Manual Price"
+    eq := manual_eq_price
+else if eq_mode == "First Candle (5m)"
+    eq := not na(fc_h) and not na(fc_l) and not na(fc_c) ? (fc_h + fc_l + fc_c) / 3.0 : eq
+else
+    eq := not na(or_h) and not na(or_l) ? (or_h + or_l) / 2.0 : eq
+
+bool eq_ready = switch eq_mode
+    "Manual Price" => not na(eq) and eq != 0
+    "First Candle (5m)" => not in_fc_window and not na(fc_h) and not na(fc_l) and not na(fc_c)
+    => not in_or_window and not na(or_h) and not na(or_l)
+
+// =========================================================================
+// 5) VIX WIDTH + STRUCTURAL ANCHORS
+// =========================================================================
+float vix_value = request.security(vix_symbol, timeframe.period, close)
+float width_mult_raw = safe_div(vix_value, vix_reference)
+float width_mult = use_vix_width ? math.min(vix_max_mult, math.max(vix_min_mult, nz(width_mult_raw, 1.0))) : 1.0
+
+float pdh = request.security(syminfo.tickerid, "D", high[1])
+float pdl = request.security(syminfo.tickerid, "D", low[1])
+float pdc = request.security(syminfo.tickerid, "D", close[1])
+
+// =========================================================================
+// 6) DYNAMIC LEVELS
+// =========================================================================
+float atr_val = ta.atr(14)
+float or_range = math.max(nz(or_h - or_l, atr_val), syminfo.mintick * 10)
+
+bool auto_option_chart = syminfo.type == "option"
+bool use_option_geometry = chart_geometry == "Option" or (chart_geometry == "Auto" and auto_option_chart)
+
+float station = eq_ready ? (use_option_geometry ? math.max(atr_val * 0.60, or_range * 0.75) : math.max(atr_val * 0.35, or_range * 0.50)) : na
+float zone_width = eq_ready ? math.max(base_zone_width * width_mult, station * 0.12) : base_zone_width * width_mult
+
+float p1 = eq_ready ? eq + station : na
+float p2 = eq_ready ? eq + station * 2.0 : na
+float d1 = eq_ready ? eq - station : na
+float d2 = eq_ready ? eq - station * 2.0 : na
+
+float sell_zone_top = eq_ready ? p2 + station * 0.80 : na
+float sell_zone_bottom = eq_ready ? p2 - station * 0.20 : na
+float premium_zone_top = eq_ready ? p2 + station * 0.25 : na
+float premium_zone_bottom = eq_ready ? p1 - station * 0.20 : na
+float eq_zone_top = eq_ready ? eq + station * 0.20 : na
+float eq_zone_bottom = eq_ready ? eq - station * 0.20 : na
+float discount_zone_top = eq_ready ? d1 + station * 0.20 : na
+float discount_zone_bottom = eq_ready ? d2 - station * 0.25 : na
+float inst_zone_top = eq_ready ? d2 + station * 0.20 : na
+float inst_zone_bottom = eq_ready ? d2 - station * 0.80 : na
+
+bool sell_zone_overlap = eq_ready and high >= sell_zone_bottom and low <= sell_zone_top
+bool premium_zone_overlap = eq_ready and high >= premium_zone_bottom and low <= premium_zone_top
+bool eq_zone_overlap = eq_ready and high >= eq_zone_bottom and low <= eq_zone_top
+bool discount_zone_overlap = eq_ready and high >= discount_zone_bottom and low <= discount_zone_top
+bool inst_zone_overlap = eq_ready and high >= inst_zone_bottom and low <= inst_zone_top
+bool close_in_eq_zone = eq_ready and close <= eq_zone_top and close >= eq_zone_bottom
+bool close_in_premium_zone = eq_ready and close <= premium_zone_top and close >= premium_zone_bottom
+bool close_in_discount_zone = eq_ready and close <= discount_zone_top and close >= discount_zone_bottom
+
+bool in_premium_zone = trap_use_rpz_only ? (sell_zone_overlap or (eq_ready and close <= sell_zone_top and close >= sell_zone_bottom)) : (premium_zone_overlap or sell_zone_overlap or close_in_premium_zone)
+bool in_discount_zone = trap_use_rpz_only ? (inst_zone_overlap or (eq_ready and close <= inst_zone_top and close >= inst_zone_bottom)) : (discount_zone_overlap or inst_zone_overlap or close_in_discount_zone)
+bool in_eq_band = eq_zone_overlap or close_in_eq_zone
+
+// =========================================================================
+// 7) CORE SNJ + BODY LOGIC
+// =========================================================================
+float snj = ta.ema(close, snj_len)
+plot(snj, "SNJ", color=snj_color, linewidth=2)
+
+float body_size = math.abs(close - open)
+float bar_range = high - low
+float avg_range = ta.sma(bar_range, 20)
+float body_pct = bar_range > 0 ? (body_size / bar_range) * 100.0 : 0.0
+float wick_body_base = math.max(body_size, syminfo.mintick)
+float upper_wick = high - math.max(open, close)
+float lower_wick = math.min(open, close) - low
+float avg_wick = ta.sma(math.max(upper_wick, lower_wick), 10)
+float adaptive_sl_buffer = math.max(sl_buffer, atr_val * sl_atr_mult, nz(avg_wick, 0.0) * sl_wick_mult)
+bool is_60 = body_pct >= body_threshold
+
+bool long_zone_touch = eq_ready and (discount_zone_overlap or inst_zone_overlap or close_in_discount_zone or (eq_zone_overlap and close >= eq_zone_bottom))
+bool short_zone_touch = eq_ready and (premium_zone_overlap or sell_zone_overlap or close_in_premium_zone or (eq_zone_overlap and close <= eq_zone_top))
+
+bool bullish_rejection_candle_raw = long_zone_touch and lower_wick >= wick_body_base * math.max(1.10, trap_wick_to_body * 0.85) and lower_wick > upper_wick * 1.10 and close >= low + bar_range * 0.55 and close <= discount_zone_top and close >= discount_zone_bottom
+bool premium_rejection_candle_raw = short_zone_touch and close < open and upper_wick >= wick_body_base * math.max(1.25, trap_wick_to_body) and upper_wick > lower_wick * 1.25 and close <= low + bar_range * 0.35 and close <= premium_zone_top and close >= premium_zone_bottom
+
+int bars_from_long_touch = ta.barssince(long_zone_touch)
+int bars_from_short_touch = ta.barssince(short_zone_touch)
+
+bool recent_long_touch = is_recent(bars_from_long_touch, touch_lookback)
+bool recent_short_touch = is_recent(bars_from_short_touch, touch_lookback)
+
+// =========================================================================
+// 8) DELTA-SYNC
+// =========================================================================
+float spot_pct = request.security(spot_symbol, timeframe.period, safe_div(ta.change(close), close[1]) * 100.0)
+float fut_pct = request.security(future_symbol, timeframe.period, safe_div(ta.change(close), close[1]) * 100.0)
+
+bool delta_divergence = use_delta_sync and not na(spot_pct) and not na(fut_pct) and math.abs(spot_pct) >= delta_min_move_pct and math.abs(fut_pct) >= delta_min_move_pct and spot_pct * fut_pct < 0
+bool new_delta_divergence = delta_divergence and not delta_divergence[1]
+bool delta_ok = not block_on_divergence or not delta_divergence
+
+plotshape(new_delta_divergence, title="Delta Divergence Warning", style=shape.triangledown, location=location.abovebar, color=color.orange, text="Δ", textcolor=color.white, size=size.tiny)
+
+// =========================================================================
+// 9) VWAP FAIR VALUE
+// =========================================================================
+float vwap_val = ta.vwap(hlc3)
+plot(plot_vwap_line ? vwap_val : na, "VWAP", color=color.new(color.aqua, 0), linewidth=2)
+
+bool vwap_long_ok = not use_vwap_filter or (eq_ready and close > vwap_val and close > eq_zone_bottom)
+bool vwap_short_ok = not use_vwap_filter or (eq_ready and close < vwap_val and close < eq_zone_top)
+
+// =========================================================================
+// 10) MTF MOMENTUM CLOUD
+// =========================================================================
+bool mtf1_bull = request.security(syminfo.tickerid, mtf_tf1, close[1] > ta.ema(close, snj_len)[1])
+bool mtf1_bear = request.security(syminfo.tickerid, mtf_tf1, close[1] < ta.ema(close, snj_len)[1])
+bool mtf2_bull = request.security(syminfo.tickerid, mtf_tf2, close[1] > ta.ema(close, snj_len)[1])
+bool mtf2_bear = request.security(syminfo.tickerid, mtf_tf2, close[1] < ta.ema(close, snj_len)[1])
+
+bool mtf_long_ok = not use_mtf_filter or (mtf1_bull and mtf2_bull)
+bool mtf_short_ok = not use_mtf_filter or (mtf1_bear and mtf2_bear)
+
+// =========================================================================
+// 11) DISCOUNT LONG + PREMIUM SHORT WORKFLOWS
+// =========================================================================
+bool discount_entry_this_bar = in_discount_zone and not (in_discount_zone[1] == true)
+bool discount_exit_this_bar = not in_discount_zone and (in_discount_zone[1] == true)
+bool discount_location_ok = discount_zone_overlap or inst_zone_overlap or (not na(d2) and low <= d2) or (not na(pdl) and low <= pdl)
+float discount_depth_mid = discount_zone_bottom + (discount_zone_top - discount_zone_bottom) * 0.45
+bool discount_lower_half_touch = inst_zone_overlap or (discount_zone_overlap and low <= discount_depth_mid) or close <= discount_depth_mid
+bool strong_bear_continuation = mtf_short_ok and close < snj and close < vwap_val and close <= low + bar_range * 0.30
+bool discount_context_ok = (close >= snj and close >= vwap_val) or mtf_long_ok or (not mtf_short_ok and close >= snj) or (not mtf_short_ok and close >= vwap_val)
+int discount_score_raw = (discount_location_ok ? 1 : 0) + (discount_lower_half_touch ? 1 : 0) + (bullish_rejection_candle_raw ? 1 : 0) + ((close >= snj and close >= vwap_val) ? 1 : 0) + ((mtf_long_ok or not mtf_short_ok) ? 1 : 0)
+int discount_setup_score = discount_score_raw >= 5 ? 3 : discount_score_raw >= 4 ? 2 : discount_score_raw == 3 ? 1 : 0
+bool bullish_rejection = bullish_rejection_candle_raw and discount_location_ok and discount_lower_half_touch and discount_context_ok and not strong_bear_continuation and discount_setup_score >= 1
+int bars_from_bull_reject = ta.barssince(bullish_rejection)
+bool recent_bull_reject = is_recent(bars_from_bull_reject, reclaim_lookback)
+float last_bull_reject_high = ta.valuewhen(bullish_rejection, high, 0)
+float last_bull_reject_low = ta.valuewhen(bullish_rejection, low, 0)
+
+bool premium_entry_this_bar = in_premium_zone and not (in_premium_zone[1] == true)
+bool premium_exit_this_bar = not in_premium_zone and (in_premium_zone[1] == true)
+bool premium_location_ok = premium_zone_overlap or sell_zone_overlap or (not na(p2) and high >= p2) or (not na(pdh) and high >= pdh)
+float premium_depth_mid = premium_zone_bottom + (premium_zone_top - premium_zone_bottom) * 0.55
+bool premium_upper_half_touch = sell_zone_overlap or (premium_zone_overlap and high >= premium_depth_mid) or close >= premium_depth_mid
+bool strong_bull_continuation = mtf_long_ok and close > snj and close > vwap_val and close >= high - bar_range * 0.30
+bool premium_context_ok = (close <= snj and close <= vwap_val) or mtf_short_ok or (not mtf_long_ok and close <= snj) or (not mtf_long_ok and close <= vwap_val)
+int premium_score_raw = (premium_location_ok ? 1 : 0) + (premium_upper_half_touch ? 1 : 0) + (premium_rejection_candle_raw ? 1 : 0) + ((close <= snj and close <= vwap_val) ? 1 : 0) + ((mtf_short_ok or not mtf_long_ok) ? 1 : 0)
+int premium_setup_score = premium_score_raw >= 5 ? 3 : premium_score_raw >= 4 ? 2 : premium_score_raw == 3 ? 1 : 0
+bool bearish_rejection = premium_rejection_candle_raw and premium_location_ok and premium_upper_half_touch and premium_context_ok and not strong_bull_continuation and premium_setup_score >= 1
+
+int bars_from_bear_reject = ta.barssince(bearish_rejection)
+bool recent_bear_reject = is_recent(bars_from_bear_reject, reclaim_lookback)
+float last_bear_reject_high = ta.valuewhen(bearish_rejection, high, 0)
+float last_bear_reject_low = ta.valuewhen(bearish_rejection, low, 0)
+
+var bool discount_watch_active = false
+var bool discount_reject_active = false
+var bool discount_confirmed = false
+var bool discount_invalidated = false
+var int discount_watch_bar = na
+var int discount_last_arm_bar = na
+var float discount_trigger = na
+var float discount_invalidation = na
+var float discount_mid = na
+var int discount_reject_bar = na
+var int discount_reject_score = 0
+var line discount_trigger_line = na
+var line discount_invalid_line = na
+
+var bool premium_watch_active = false
+var bool premium_reject_active = false
+var bool premium_confirmed = false
+var bool premium_invalidated = false
+var bool premium_arm_lock = false
+var int premium_watch_bar = na
+var int premium_reset_streak = 0
+var float premium_trigger = na
+var float premium_invalidation = na
+var float premium_mid = na
+var int premium_reject_bar = na
+var int premium_reject_score = 0
+var line premium_trigger_line = na
+var line premium_invalid_line = na
+
+if is_new_day
+    discount_watch_active := false
+    discount_reject_active := false
+    discount_confirmed := false
+    discount_invalidated := false
+    discount_watch_bar := na
+    discount_last_arm_bar := na
+    discount_trigger := na
+    discount_invalidation := na
+    discount_mid := na
+    discount_reject_bar := na
+    discount_reject_score := 0
+    if not na(discount_trigger_line)
+        line.delete(discount_trigger_line)
+    if not na(discount_invalid_line)
+        line.delete(discount_invalid_line)
+    discount_trigger_line := na
+    discount_invalid_line := na
+    premium_watch_active := false
+    premium_reject_active := false
+    premium_confirmed := false
+    premium_invalidated := false
+    premium_arm_lock := false
+    premium_watch_bar := na
+    premium_reset_streak := 0
+    premium_trigger := na
+    premium_invalidation := na
+    premium_mid := na
+    premium_reject_bar := na
+    premium_reject_score := 0
+    if not na(premium_trigger_line)
+        line.delete(premium_trigger_line)
+    if not na(premium_invalid_line)
+        line.delete(premium_invalid_line)
+    premium_trigger_line := na
+    premium_invalid_line := na
+
+int bars_since_discount_arm = na(discount_last_arm_bar) ? 100000 : bar_index - discount_last_arm_bar
+bool discount_rearm_ready = bars_since_discount_arm >= discount_retouch_rearm_bars
+bool show_discount_arm = discount_entry_this_bar and discount_rearm_ready and not discount_reject_active and not discount_confirmed
+
+if show_discount_arm
+    discount_watch_active := true
+    discount_invalidated := false
+    discount_watch_bar := bar_index
+    discount_last_arm_bar := bar_index
+
+bool discount_watch_expired = discount_watch_active and not discount_reject_active and not discount_confirmed and not na(discount_watch_bar) and (bar_index - discount_watch_bar >= premium_watch_expiry_bars)
+
+if discount_watch_expired
+    discount_watch_active := false
+
+if discount_exit_this_bar and not discount_reject_active and not discount_confirmed
+    discount_watch_active := false
+    discount_invalidated := false
+
+if bullish_rejection
+    discount_watch_active := true
+    discount_reject_active := true
+    discount_confirmed := false
+    discount_invalidated := false
+    discount_watch_bar := na
+    discount_last_arm_bar := bar_index
+    discount_trigger := high
+    discount_invalidation := low
+    discount_mid := (high + low) / 2.0
+    discount_reject_bar := bar_index
+    discount_reject_score := discount_setup_score
+    if na(discount_trigger_line)
+        discount_trigger_line := line.new(bar_index, discount_trigger, bar_index + 1, discount_trigger, color=color.new(color.green, 10), width=1, style=line.style_dashed, extend=extend.right)
+    else
+        line.set_xy1(discount_trigger_line, bar_index, discount_trigger)
+        line.set_xy2(discount_trigger_line, bar_index + 1, discount_trigger)
+        line.set_color(discount_trigger_line, color.new(color.green, 10))
+        line.set_style(discount_trigger_line, line.style_dashed)
+        line.set_extend(discount_trigger_line, extend.right)
+    if na(discount_invalid_line)
+        discount_invalid_line := line.new(bar_index, discount_invalidation, bar_index + 1, discount_invalidation, color=color.new(color.teal, 0), width=1, style=line.style_solid, extend=extend.right)
+    else
+        line.set_xy1(discount_invalid_line, bar_index, discount_invalidation)
+        line.set_xy2(discount_invalid_line, bar_index + 1, discount_invalidation)
+        line.set_color(discount_invalid_line, color.new(color.teal, 0))
+        line.set_style(discount_invalid_line, line.style_solid)
+        line.set_extend(discount_invalid_line, extend.right)
+
+bool discount_confirm = discount_reject_active and not discount_invalidated and bar_index > discount_reject_bar and close > discount_trigger and close > discount_mid and close >= snj and close >= vwap_val and (mtf_long_ok or not mtf_short_ok)
+bool discount_fail = discount_reject_active and not discount_invalidated and bar_index > discount_reject_bar and close < discount_invalidation
+bool discount_confirmed_reclaim_fail = discount_confirmed and not na(discount_invalidation) and close < discount_invalidation
+
+if discount_confirm
+    discount_confirmed := true
+    discount_reject_active := false
+    discount_watch_active := false
+    discount_watch_bar := na
+    if not na(discount_trigger_line)
+        line.set_color(discount_trigger_line, color.new(color.green, 0))
+        line.set_style(discount_trigger_line, line.style_solid)
+    if not na(discount_invalid_line)
+        line.set_color(discount_invalid_line, color.new(color.teal, 0))
+
+if discount_fail or discount_confirmed_reclaim_fail
+    discount_invalidated := true
+    discount_reject_active := false
+    discount_confirmed := false
+    discount_watch_active := false
+    discount_watch_bar := na
+    if not na(discount_trigger_line)
+        line.set_color(discount_trigger_line, color.new(color.gray, 40))
+        line.set_extend(discount_trigger_line, extend.none)
+        line.set_x2(discount_trigger_line, bar_index)
+    if not na(discount_invalid_line)
+        line.set_color(discount_invalid_line, color.new(color.gray, 35))
+        line.set_extend(discount_invalid_line, extend.none)
+        line.set_x2(discount_invalid_line, bar_index)
+
+if (discount_reject_active or discount_confirmed) and not na(discount_trigger_line)
+    line.set_x2(discount_trigger_line, bar_index + 1)
+
+if (discount_reject_active or discount_confirmed) and not na(discount_invalid_line)
+    line.set_x2(discount_invalid_line, bar_index + 1)
+
+bool premium_rearm_reset_condition = eq_ready and (close < p1 or close < eq_zone_top) and close < snj and close < vwap_val
+premium_reset_streak := premium_rearm_reset_condition ? nz(premium_reset_streak[1]) + 1 : 0
+
+bool premium_arm_reset = premium_reset_streak >= premium_rearm_bars
+
+if premium_arm_reset
+    premium_arm_lock := false
+
+bool show_premium_arm = premium_entry_this_bar and not premium_arm_lock and not premium_reject_active and not premium_confirmed
+
+if show_premium_arm
+    premium_watch_active := true
+    premium_invalidated := false
+    premium_arm_lock := true
+    premium_watch_bar := bar_index
+
+bool premium_watch_expired = premium_watch_active and not premium_reject_active and not premium_confirmed and not na(premium_watch_bar) and (bar_index - premium_watch_bar >= premium_watch_expiry_bars)
+
+if premium_watch_expired
+    premium_watch_active := false
+
+if premium_exit_this_bar and not premium_reject_active and not premium_confirmed
+    premium_watch_active := false
+    premium_invalidated := false
+
+if bearish_rejection
+    premium_watch_active := true
+    premium_reject_active := true
+    premium_confirmed := false
+    premium_invalidated := false
+    premium_arm_lock := true
+    premium_watch_bar := na
+    premium_trigger := low
+    premium_invalidation := high
+    premium_mid := (high + low) / 2.0
+    premium_reject_bar := bar_index
+    premium_reject_score := premium_setup_score
+    if na(premium_trigger_line)
+        premium_trigger_line := line.new(bar_index, premium_trigger, bar_index + 1, premium_trigger, color=color.new(color.red, 10), width=1, style=line.style_dashed, extend=extend.right)
+    else
+        line.set_xy1(premium_trigger_line, bar_index, premium_trigger)
+        line.set_xy2(premium_trigger_line, bar_index + 1, premium_trigger)
+        line.set_color(premium_trigger_line, color.new(color.red, 10))
+        line.set_style(premium_trigger_line, line.style_dashed)
+        line.set_extend(premium_trigger_line, extend.right)
+    if na(premium_invalid_line)
+        premium_invalid_line := line.new(bar_index, premium_invalidation, bar_index + 1, premium_invalidation, color=color.new(color.maroon, 0), width=1, style=line.style_solid, extend=extend.right)
+    else
+        line.set_xy1(premium_invalid_line, bar_index, premium_invalidation)
+        line.set_xy2(premium_invalid_line, bar_index + 1, premium_invalidation)
+        line.set_color(premium_invalid_line, color.new(color.maroon, 0))
+        line.set_style(premium_invalid_line, line.style_solid)
+        line.set_extend(premium_invalid_line, extend.right)
+
+bool premium_confirm = premium_reject_active and not premium_invalidated and bar_index > premium_reject_bar and close < premium_trigger and close < premium_mid and close <= snj and close <= vwap_val and (mtf_short_ok or not mtf_long_ok)
+bool premium_fail = premium_reject_active and not premium_invalidated and bar_index > premium_reject_bar and close > premium_invalidation
+bool premium_confirmed_reclaim_fail = premium_confirmed and not na(premium_invalidation) and close > premium_invalidation
+
+if premium_confirm
+    premium_confirmed := true
+    premium_reject_active := false
+    premium_watch_active := false
+    premium_watch_bar := na
+    if not na(premium_trigger_line)
+        line.set_color(premium_trigger_line, color.new(color.red, 0))
+        line.set_style(premium_trigger_line, line.style_solid)
+    if not na(premium_invalid_line)
+        line.set_color(premium_invalid_line, color.new(color.maroon, 0))
+
+if premium_fail or premium_confirmed_reclaim_fail
+    premium_invalidated := true
+    premium_reject_active := false
+    premium_confirmed := false
+    premium_watch_active := false
+    premium_watch_bar := na
+    if not na(premium_trigger_line)
+        line.set_color(premium_trigger_line, color.new(color.gray, 40))
+        line.set_extend(premium_trigger_line, extend.none)
+        line.set_x2(premium_trigger_line, bar_index)
+    if not na(premium_invalid_line)
+        line.set_color(premium_invalid_line, color.new(color.green, 25))
+        line.set_extend(premium_invalid_line, extend.none)
+        line.set_x2(premium_invalid_line, bar_index)
+
+if (premium_reject_active or premium_confirmed) and not na(premium_trigger_line)
+    line.set_x2(premium_trigger_line, bar_index + 1)
+
+if (premium_reject_active or premium_confirmed) and not na(premium_invalid_line)
+    line.set_x2(premium_invalid_line, bar_index + 1)
+
+// =========================================================================
+// 12) FINAL TT SIGNALS
+// =========================================================================
+bool bull_bias = eq_ready and close >= eq_zone_bottom and snj >= eq_zone_bottom and mtf_long_ok
+bool bear_bias = eq_ready and close <= eq_zone_top and snj <= eq_zone_top and mtf_short_ok
+
+float long_reclaim_trigger = math.max(high[1], nz(last_bull_reject_high, high[1]))
+float short_reclaim_trigger = math.min(low[1], nz(last_bear_reject_low, low[1]))
+
+bool long_tt_base = discount_confirm and discount_reject_score >= 2 and close > long_reclaim_trigger and close > snj and is_60
+bool short_tt_base = premium_confirm and premium_reject_score >= 2 and close < short_reclaim_trigger and close < snj and is_60
+
+bool long_filters_ok = eq_ready and delta_ok and vwap_long_ok and bull_bias
+bool short_filters_ok = eq_ready and delta_ok and vwap_short_ok and bear_bias
+
+var float demand_floor = na
+var float supply_ceiling = na
+var bool demand_active = false
+var bool supply_active = false
+
+var bool long_leg_locked = false
+var bool short_leg_locked = false
+
+bool long_leg_reset = (short_tt_base and short_filters_ok) or (demand_active and not na(demand_floor) and close < demand_floor) or (close < snj and close < eq_zone_bottom and not long_zone_touch)
+bool short_leg_reset = (long_tt_base and long_filters_ok) or (supply_active and not na(supply_ceiling) and close > supply_ceiling) or (close > snj and close > eq_zone_top and not short_zone_touch)
+
+if is_new_day
+    long_leg_locked := false
+    short_leg_locked := false
+else
+    if long_leg_locked and long_leg_reset
+        long_leg_locked := false
+    if short_leg_locked and short_leg_reset
+        short_leg_locked := false
+
+bool long_tt = long_tt_base and long_filters_ok and in_kill_zone and not long_leg_locked
+bool short_tt = short_tt_base and short_filters_ok and in_kill_zone and not short_leg_locked
+
+if long_tt
+    long_leg_locked := true
+    short_leg_locked := false
+
+if short_tt
+    short_leg_locked := true
+    long_leg_locked := false
+
+bool low_prob_long = discount_confirm and long_filters_ok and not long_leg_locked and ((discount_reject_score == 1) or (not in_kill_zone and not block_outside_kz))
+bool low_prob_short = premium_confirm and short_filters_ok and not short_leg_locked and ((premium_reject_score == 1) or (not in_kill_zone and not block_outside_kz))
+bool suppress_short_micro = hide_short_micro_in_bull and strong_bull_continuation
+bool bullish_continuation_ready = bull_bias and delta_ok and vwap_long_ok and mtf_long_ok and close > snj and close > vwap_val and close > high[1] and body_pct >= math.max(45.0, body_threshold * 0.75) and (low <= snj + atr_val * 0.20 or low <= vwap_val + atr_val * 0.20 or discount_confirmed or demand_active)
+bool bullish_continuation_label = bullish_continuation_ready and not bullish_continuation_ready[1] and not long_tt
+bool bearish_continuation_ready = bear_bias and delta_ok and vwap_short_ok and mtf_short_ok and close < snj and close < vwap_val and close < low[1] and body_pct >= math.max(45.0, body_threshold * 0.75) and (high >= snj - atr_val * 0.20 or high >= vwap_val - atr_val * 0.20 or premium_confirmed or supply_active)
+bool bearish_continuation_label = bearish_continuation_ready and not bearish_continuation_ready[1] and not short_tt
+
+plotshape(show_discount_arm, title="Discount Armed", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 10), text="L-ARM", textcolor=color.white, size=size.tiny)
+plotshape(show_premium_arm, title="Premium Armed", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 10), text="S-ARM", textcolor=color.white, size=size.tiny)
+plotshape(bullish_rejection and discount_setup_score == 1, title="Bullish Rejection L1", style=shape.labelup, location=location.belowbar, color=color.new(color.teal, 5), text="L1", textcolor=color.white, size=size.tiny)
+plotshape(bullish_rejection and discount_setup_score == 2, title="Bullish Rejection L2", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 5), text="L2", textcolor=color.white, size=size.tiny)
+plotshape(bullish_rejection and discount_setup_score == 3, title="Bullish Rejection L3", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 0), text="L3", textcolor=color.black, size=size.tiny)
+plotshape(bearish_rejection and premium_setup_score == 1, title="Bearish Rejection S1", style=shape.labeldown, location=location.abovebar, color=color.new(color.orange, 5), text="R1", textcolor=color.white, size=size.tiny)
+plotshape(bearish_rejection and premium_setup_score == 2, title="Bearish Rejection S2", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 5), text="R2", textcolor=color.white, size=size.tiny)
+plotshape(bearish_rejection and premium_setup_score == 3, title="Bearish Rejection S3", style=shape.labeldown, location=location.abovebar, color=color.new(color.maroon, 0), text="R3", textcolor=color.white, size=size.tiny)
+plotshape(long_tt, title="Long TT", style=shape.arrowup, location=location.belowbar, color=color.lime, size=size.small)
+plotshape(short_tt, title="Short TT", style=shape.arrowdown, location=location.abovebar, color=color.red, size=size.small)
+plotshape(low_prob_long, title="Low Probability Long", style=shape.circle, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(low_prob_short and not suppress_short_micro, title="Low Probability Short", style=shape.circle, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(bullish_continuation_label, title="Bullish Continuation", style=shape.labelup, location=location.belowbar, color=color.new(color.blue, 0), text="L-CONT", textcolor=color.white, size=size.tiny)
+plotshape(bearish_continuation_label and not suppress_short_micro, title="Bearish Continuation", style=shape.labeldown, location=location.abovebar, color=color.new(color.rgb(110, 110, 110), 0), text="S-CONT", textcolor=color.white, size=size.tiny)
+
+// =========================================================================
+// 12) TARGETS + RR VISUALS
+// =========================================================================
+if show_targets and long_tt
+    [tp_val_l, tp_txt_l] = get_target(true, close, eq, p1, p2, d1, d2)
+    label.new(bar_index, high + target_offset, "Target: " + tp_txt_l, color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+if show_targets and short_tt
+    [tp_val_s, tp_txt_s] = get_target(false, close, eq, p1, p2, d1, d2)
+    label.new(bar_index, low - target_offset, "Target: " + tp_txt_s, color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if show_rr and long_tt
+    float sl_price_l = low - adaptive_sl_buffer
+    [tp_price_l_raw, tp_txt_l] = get_target(true, close, eq, p1, p2, d1, d2)
+    float tp_price_l = math.max(tp_price_l_raw, close + syminfo.mintick)
+    float risk_l = math.max(close - sl_price_l, syminfo.mintick)
+    float reward_l = math.max(tp_price_l - close, syminfo.mintick)
+    float rr_l = safe_div(reward_l, risk_l)
+
+    line.new(bar_index, sl_price_l, bar_index + 5, sl_price_l, color=color.red, width=2, style=line.style_dashed)
+    line.new(bar_index, tp_price_l, bar_index + 5, tp_price_l, color=color.green, width=2, style=line.style_dashed)
+    label.new(bar_index, sl_price_l, "SL", color=color.red, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+    label.new(bar_index, high + target_offset + 5, "Target: " + tp_txt_l + "\nR:R: " + str.tostring(rr_l, "#.##"), color=color.green, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+if show_rr and short_tt
+    float sl_price_s = high + adaptive_sl_buffer
+    [tp_price_s_raw, tp_txt_s] = get_target(false, close, eq, p1, p2, d1, d2)
+    float tp_price_s = math.min(tp_price_s_raw, close - syminfo.mintick)
+    float risk_s = math.max(sl_price_s - close, syminfo.mintick)
+    float reward_s = math.max(close - tp_price_s, syminfo.mintick)
+    float rr_s = safe_div(reward_s, risk_s)
+
+    line.new(bar_index, sl_price_s, bar_index + 5, sl_price_s, color=color.red, width=2, style=line.style_dashed)
+    line.new(bar_index, tp_price_s, bar_index + 5, tp_price_s, color=color.green, width=2, style=line.style_dashed)
+    label.new(bar_index, sl_price_s, "SL", color=color.red, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+    label.new(bar_index, low - target_offset - 5, "Target: " + tp_txt_s + "\nR:R: " + str.tostring(rr_s, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+// =========================================================================
+// 13) BREAK-EVEN ENGINE
+// =========================================================================
+var int active_dir = 0
+var float active_entry = na
+var float active_sl = na
+var float active_tp = na
+var bool active_be_done = false
+var int active_entry_bar = na
+
+bool be_long_signal = false
+bool be_short_signal = false
+
+if is_new_day
+    active_dir := 0
+    active_entry := na
+    active_sl := na
+    active_tp := na
+    active_be_done := false
+    active_entry_bar := na
+
+if long_tt
+    float long_sl = low - adaptive_sl_buffer
+    [long_tp_raw, _] = get_target(true, close, eq, p1, p2, d1, d2)
+    active_dir := 1
+    active_entry := close
+    active_sl := long_sl
+    active_tp := math.max(long_tp_raw, close + syminfo.mintick)
+    active_be_done := false
+    active_entry_bar := bar_index
+
+if short_tt
+    float short_sl = high + adaptive_sl_buffer
+    [short_tp_raw, _] = get_target(false, close, eq, p1, p2, d1, d2)
+    active_dir := -1
+    active_entry := close
+    active_sl := short_sl
+    active_tp := math.min(short_tp_raw, close - syminfo.mintick)
+    active_be_done := false
+    active_entry_bar := bar_index
+
+if enable_be and active_dir == 1 and not na(active_entry) and not na(active_sl)
+    float one_r_long = active_entry + math.max(active_entry - active_sl, syminfo.mintick)
+    float be_trigger_long = be_mode == "1R" ? one_r_long : active_entry + be_points
+    bool long_trade_live = not na(active_entry_bar) and bar_index > active_entry_bar
+
+    if long_trade_live and not active_be_done and high >= be_trigger_long
+        active_be_done := true
+        active_sl := active_entry
+        be_long_signal := true
+        label.new(bar_index, high + target_offset + 10, "MOVE SL TO BE", color=color.new(color.blue, 0), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+    if long_trade_live and (low <= active_sl or high >= active_tp or short_tt)
+        active_dir := 0
+        active_entry := na
+        active_sl := na
+        active_tp := na
+        active_be_done := false
+        active_entry_bar := na
+
+if enable_be and active_dir == -1 and not na(active_entry) and not na(active_sl)
+    float one_r_short = active_entry - math.max(active_sl - active_entry, syminfo.mintick)
+    float be_trigger_short = be_mode == "1R" ? one_r_short : active_entry - be_points
+    bool short_trade_live = not na(active_entry_bar) and bar_index > active_entry_bar
+
+    if short_trade_live and not active_be_done and low <= be_trigger_short
+        active_be_done := true
+        active_sl := active_entry
+        be_short_signal := true
+        label.new(bar_index, low - target_offset - 10, "MOVE SL TO BE", color=color.new(color.blue, 0), textcolor=color.white, style=label.style_label_up, size=size.small)
+
+    if short_trade_live and (high >= active_sl or low <= active_tp or long_tt)
+        active_dir := 0
+        active_entry := na
+        active_sl := na
+        active_tp := na
+        active_be_done := false
+        active_entry_bar := na
+
+// =========================================================================
+// 14) THREE-STRIKE TRAP DETECTOR
+// =========================================================================
+bool bull_trap = enable_trap_detector and in_discount_zone and close > open and lower_wick >= wick_body_base * trap_wick_to_body and close >= low + bar_range * 0.55
+bool bear_trap = enable_trap_detector and in_premium_zone and close < open and upper_wick >= wick_body_base * trap_wick_to_body and close <= high - bar_range * 0.55
+
+var int bull_trap_streak = 0
+var int bear_trap_streak = 0
+
+bull_trap_streak := bull_trap ? nz(bull_trap_streak[1]) + 1 : 0
+bear_trap_streak := bear_trap ? nz(bear_trap_streak[1]) + 1 : 0
+
+bool mega_long = bull_trap_streak >= 3 and bull_trap_streak[1] < 3
+bool mega_short = bear_trap_streak >= 3 and bear_trap_streak[1] < 3
+
+plotshape(bull_trap, title="Bull Trap", style=shape.circle, location=location.belowbar, color=color.yellow, size=size.tiny)
+plotshape(bear_trap and not suppress_short_micro, title="Bear Trap", style=shape.circle, location=location.abovebar, color=color.yellow, size=size.tiny)
+
+if mega_long
+    label.new(bar_index, low - target_offset - 15, "3-Strike Accumulation\nHero Long Watch", color=color.new(color.lime, 0), textcolor=color.black, style=label.style_label_up, size=size.small)
+
+if mega_short
+    label.new(bar_index, high + target_offset + 15, "3-Strike Distribution\nHero Short Watch", color=color.new(color.orange, 0), textcolor=color.black, style=label.style_label_down, size=size.small)
+
+// =========================================================================
+// 15) DEMAND / SUPPLY BOXES
+// =========================================================================
+var box demand_box = na
+var box supply_box = na
+if is_new_day
+    if not na(demand_box)
+        box.delete(demand_box)
+    if not na(supply_box)
+        box.delete(supply_box)
+    demand_box := na
+    supply_box := na
+    demand_floor := na
+    supply_ceiling := na
+    demand_active := false
+    supply_active := false
+
+if long_tt and recent_bull_reject and not na(last_bull_reject_high) and not na(last_bull_reject_low)
+    if not na(demand_box)
+        box.delete(demand_box)
+    demand_box := box.new(bar_index, last_bull_reject_high, bar_index + 1, last_bull_reject_low, border_color=color.new(color.green, 0), bgcolor=color.new(color.lime, 78), extend=extend.right)
+    demand_floor := last_bull_reject_low
+    demand_active := true
+
+if short_tt and recent_bear_reject and not na(last_bear_reject_high) and not na(last_bear_reject_low)
+    if not na(supply_box)
+        box.delete(supply_box)
+    supply_box := box.new(bar_index, last_bear_reject_high, bar_index + 1, last_bear_reject_low, border_color=color.new(color.red, 0), bgcolor=color.new(color.red, 82), extend=extend.right)
+    supply_ceiling := last_bear_reject_high
+    supply_active := true
+
+if demand_active and not na(demand_box)
+    box.set_right(demand_box, bar_index + 1)
+    if close < demand_floor
+        box.set_extend(demand_box, extend.none)
+        box.set_right(demand_box, bar_index)
+        demand_active := false
+
+if supply_active and not na(supply_box)
+    box.set_right(supply_box, bar_index + 1)
+    if close > supply_ceiling
+        box.set_extend(supply_box, extend.none)
+        box.set_right(supply_box, bar_index)
+        supply_active := false
+
+// =========================================================================
+// 17) KILL ZONE BACKGROUND + CANDLE LANGUAGE
+// =========================================================================
+color kz_bg = na
+kz_bg := in_open_kz ? color.new(color.teal, 90) : kz_bg
+kz_bg := not in_open_kz and in_euro_kz ? color.new(color.rgb(209, 148, 213), 88) : kz_bg
+bgcolor(use_kill_zones ? kz_bg : na, title="Kill Zones")
+
+bool bullish_impulse = close > open and close > snj and bar_range > avg_range * 1.2 and body_pct >= math.max(55.0, body_threshold * 0.85)
+bool bearish_impulse = close < open and close < snj and bar_range > avg_range * 1.2 and body_pct >= math.max(55.0, body_threshold * 0.85)
+
+color candle_color = close >= open ? color.rgb(34, 179, 131) : color.rgb(232, 82, 88)
+candle_color := bullish_impulse ? color.rgb(76, 126, 255) : candle_color
+candle_color := bearish_impulse ? color.rgb(16, 16, 16) : candle_color
+candle_color := bull_trap or bear_trap ? color.rgb(245, 213, 59) : candle_color
+barcolor(candle_color)
+
+// =========================================================================
+// 18) LEVEL RENDERING
+// =========================================================================
+plot(eq_ready ? eq : na, "EQ", color=color.rgb(83, 173, 166), linewidth=2, style=plot.style_linebr)
+plot(eq_ready ? p1 : na, "P1", color=color.new(color.rgb(124, 79, 196), 15), linewidth=1, style=plot.style_linebr)
+plot(eq_ready ? p2 : na, "P2", color=color.new(color.red, 40), linewidth=1, style=plot.style_linebr)
+plot(eq_ready ? d1 : na, "D1", color=color.new(color.rgb(68, 131, 219), 15), linewidth=1, style=plot.style_linebr)
+plot(eq_ready ? d2 : na, "D2", color=color.new(color.green, 35), linewidth=1, style=plot.style_linebr)
+
+plot(show_prev_day_levels ? pdh : na, "PDH", color=color.new(color.red, 35), linewidth=1, style=plot.style_linebr)
+plot(show_prev_day_levels ? pdl : na, "PDL", color=color.new(color.blue, 35), linewidth=1, style=plot.style_linebr)
+plot(show_prev_day_levels ? pdc : na, "PCL", color=color.new(color.gray, 20), linewidth=1, style=plot.style_linebr)
+plot(show_or_levels and eq_mode == "Opening Range (15m)" ? or_h : na, "ORH", color=color.new(color.orange, 10), linewidth=1, style=plot.style_linebr)
+plot(show_or_levels and eq_mode == "Opening Range (15m)" ? or_l : na, "ORL", color=color.new(color.orange, 10), linewidth=1, style=plot.style_linebr)
+
+var box sell_box = na
+var box premium_box = na
+var box eq_box = na
+var box discount_box = na
+var box inst_box = na
+
+bool discount_workflow_hot = discount_watch_active or discount_reject_active or discount_confirmed
+bool premium_workflow_hot = premium_watch_active or premium_reject_active or premium_confirmed
+color sell_box_bg = premium_workflow_hot ? color.new(color.red, 82) : color.new(color.red, 88)
+color premium_box_bg = premium_workflow_hot ? color.new(color.rgb(221, 146, 164), 80) : color.new(color.rgb(221, 146, 164), 88)
+color discount_box_bg = discount_workflow_hot ? color.new(color.rgb(238, 227, 145), 82) : color.new(color.rgb(238, 227, 145), 88)
+color inst_box_bg = discount_workflow_hot ? color.new(color.lime, 74) : color.new(color.lime, 80)
+
+if is_new_day
+    if not na(sell_box)
+        box.delete(sell_box)
+    if not na(premium_box)
+        box.delete(premium_box)
+    if not na(eq_box)
+        box.delete(eq_box)
+    if not na(discount_box)
+        box.delete(discount_box)
+    if not na(inst_box)
+        box.delete(inst_box)
+    sell_box := na
+    premium_box := na
+    eq_box := na
+    discount_box := na
+    inst_box := na
+
+if eq_ready
+    if na(sell_box)
+        sell_box := box.new(session_left_bar, sell_zone_top, bar_index + 1, sell_zone_bottom, border_color=color.new(color.red, 35), bgcolor=sell_box_bg, extend=extend.right)
+    else
+        box.set_left(sell_box, session_left_bar)
+        box.set_right(sell_box, bar_index + 1)
+        box.set_top(sell_box, sell_zone_top)
+        box.set_bottom(sell_box, sell_zone_bottom)
+        box.set_bgcolor(sell_box, sell_box_bg)
+        box.set_extend(sell_box, extend.right)
+
+    if na(premium_box)
+        premium_box := box.new(session_left_bar, premium_zone_top, bar_index + 1, premium_zone_bottom, border_color=color.new(color.rgb(198, 110, 133), 25), bgcolor=premium_box_bg, extend=extend.right)
+    else
+        box.set_left(premium_box, session_left_bar)
+        box.set_right(premium_box, bar_index + 1)
+        box.set_top(premium_box, premium_zone_top)
+        box.set_bottom(premium_box, premium_zone_bottom)
+        box.set_bgcolor(premium_box, premium_box_bg)
+        box.set_extend(premium_box, extend.right)
+
+    if na(eq_box)
+        eq_box := box.new(session_left_bar, eq_zone_top, bar_index + 1, eq_zone_bottom, border_color=color.new(color.rgb(91, 178, 165), 20), bgcolor=color.new(color.rgb(145, 222, 212), 86), extend=extend.right)
+    else
+        box.set_left(eq_box, session_left_bar)
+        box.set_right(eq_box, bar_index + 1)
+        box.set_top(eq_box, eq_zone_top)
+        box.set_bottom(eq_box, eq_zone_bottom)
+        box.set_extend(eq_box, extend.right)
+
+    if na(discount_box)
+        discount_box := box.new(session_left_bar, discount_zone_top, bar_index + 1, discount_zone_bottom, border_color=color.new(color.rgb(214, 192, 82), 25), bgcolor=discount_box_bg, extend=extend.right)
+    else
+        box.set_left(discount_box, session_left_bar)
+        box.set_right(discount_box, bar_index + 1)
+        box.set_top(discount_box, discount_zone_top)
+        box.set_bottom(discount_box, discount_zone_bottom)
+        box.set_bgcolor(discount_box, discount_box_bg)
+        box.set_extend(discount_box, extend.right)
+
+    if na(inst_box)
+        inst_box := box.new(session_left_bar, inst_zone_top, bar_index + 1, inst_zone_bottom, border_color=color.new(color.green, 25), bgcolor=inst_box_bg, extend=extend.right)
+    else
+        box.set_left(inst_box, session_left_bar)
+        box.set_right(inst_box, bar_index + 1)
+        box.set_top(inst_box, inst_zone_top)
+        box.set_bottom(inst_box, inst_zone_bottom)
+        box.set_bgcolor(inst_box, inst_box_bg)
+        box.set_extend(inst_box, extend.right)
+
+var label eq_lbl = na
+var label p1_lbl = na
+var label p2_lbl = na
+var label d1_lbl = na
+var label d2_lbl = na
+var label pdh_lbl = na
+var label pdl_lbl = na
+var label pcl_lbl = na
+var label orh_lbl = na
+var label orl_lbl = na
+var label discount_state_lbl = na
+var label premium_state_lbl = na
+
+if barstate.islast
+    eq_lbl := update_level_label(eq_lbl, eq_ready ? eq : na, "EQ", color.new(color.rgb(83, 173, 166), 5), color.white)
+    p1_lbl := update_level_label(p1_lbl, eq_ready ? p1 : na, "P1", color.new(color.rgb(124, 79, 196), 10), color.white)
+    p2_lbl := update_level_label(p2_lbl, eq_ready ? p2 : na, "P2", color.new(color.red, 15), color.white)
+    d1_lbl := update_level_label(d1_lbl, eq_ready ? d1 : na, "D1", color.new(color.rgb(68, 131, 219), 10), color.white)
+    d2_lbl := update_level_label(d2_lbl, eq_ready ? d2 : na, "D2", color.new(color.green, 15), color.white)
+    pdh_lbl := update_level_label(pdh_lbl, show_prev_day_levels ? pdh : na, "PDH", color.new(color.red, 12), color.white)
+    pdl_lbl := update_level_label(pdl_lbl, show_prev_day_levels ? pdl : na, "PDL", color.new(color.blue, 12), color.white)
+    pcl_lbl := update_level_label(pcl_lbl, show_prev_day_levels ? pdc : na, "PCL", color.new(color.gray, 12), color.white)
+    orh_lbl := update_level_label(orh_lbl, show_or_levels and eq_mode == "Opening Range (15m)" ? or_h : na, "ORH", color.new(color.orange, 12), color.white)
+    orl_lbl := update_level_label(orl_lbl, show_or_levels and eq_mode == "Opening Range (15m)" ? or_l : na, "ORL", color.new(color.orange, 12), color.white)
+    string discount_state_text = discount_invalidated ? "Discount: Invalidated" : discount_confirmed ? "Discount: Confirmed L" + str.tostring(discount_reject_score) : discount_reject_active ? "Discount: Rejection L" + str.tostring(discount_reject_score) : discount_watch_active ? "Discount: Watch" : ""
+    color discount_state_bg = discount_invalidated ? color.new(color.gray, 10) : discount_confirmed ? color.new(color.green, 8) : discount_reject_active ? color.new(color.teal, 8) : discount_watch_active ? color.new(color.lime, 22) : color.new(color.black, 100)
+    discount_state_lbl := update_level_label(discount_state_lbl, (discount_state_text != "" and eq_ready) ? inst_zone_bottom : na, discount_state_text, discount_state_bg, color.white)
+    string premium_state_text = premium_invalidated ? "Premium: Invalidated" : premium_confirmed ? "Premium: Confirmed S" + str.tostring(premium_reject_score) : premium_reject_active ? "Premium: Rejection S" + str.tostring(premium_reject_score) : premium_watch_active ? "Premium: Watch" : ""
+    color premium_state_bg = premium_invalidated ? color.new(color.gray, 10) : premium_confirmed ? color.new(color.red, 10) : premium_reject_active ? color.new(color.orange, 10) : premium_watch_active ? color.new(color.red, 25) : color.new(color.black, 100)
+    premium_state_lbl := update_level_label(premium_state_lbl, (premium_state_text != "" and eq_ready) ? sell_zone_top : na, premium_state_text, premium_state_bg, color.white)
+
+// =========================================================================
+// 19) MTF DASHBOARD
+// =========================================================================
+var table mtf_tbl = table.new(position.bottom_right, 3, 3)
+
+if show_mtf_dashboard and barstate.islast
+    table.cell(mtf_tbl, 0, 0, "TF", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(mtf_tbl, 1, 0, mtf_tf1, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(mtf_tbl, 2, 0, mtf_tf2, text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(mtf_tbl, 0, 1, "SNJ", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(mtf_tbl, 1, 1, mtf1_bull ? "Bull" : mtf1_bear ? "Bear" : "Flat", text_color=color.white, bgcolor=mtf1_bull ? color.new(color.green, 10) : mtf1_bear ? color.new(color.red, 10) : color.new(color.gray, 40))
+    table.cell(mtf_tbl, 2, 1, mtf2_bull ? "Bull" : mtf2_bear ? "Bear" : "Flat", text_color=color.white, bgcolor=mtf2_bull ? color.new(color.green, 10) : mtf2_bear ? color.new(color.red, 10) : color.new(color.gray, 40))
+
+    table.cell(mtf_tbl, 0, 2, "TT", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(mtf_tbl, 1, 2, bull_bias ? "L OK" : "L NO", text_color=color.white, bgcolor=bull_bias ? color.new(color.green, 20) : color.new(color.red, 20))
+    table.cell(mtf_tbl, 2, 2, bear_bias ? "S OK" : "S NO", text_color=color.white, bgcolor=bear_bias ? color.new(color.green, 20) : color.new(color.red, 20))
+
+// =========================================================================
+// 20) ALERTS
+// =========================================================================
+alertcondition(long_tt, title="Long TT Confirmed", message="AiRi-Brahmastra: Long TT confirmed")
+alertcondition(short_tt, title="Short TT Confirmed", message="AiRi-Brahmastra: Short TT confirmed")
+alertcondition(show_discount_arm, title="Discount Long Armed", message="AiRi-Brahmastra: Discount zone armed for long watch")
+alertcondition(bullish_rejection, title="Discount Rejection Detected", message="AiRi-Brahmastra: Genuine discount rejection candle detected")
+alertcondition(discount_confirm, title="Discount Long Confirmed", message="AiRi-Brahmastra: Discount long confirmed above rejection trigger")
+alertcondition(discount_fail or discount_confirmed_reclaim_fail, title="Discount Long Invalidated", message="AiRi-Brahmastra: Discount long workflow invalidated")
+alertcondition(show_premium_arm, title="Premium Short Armed", message="AiRi-Brahmastra: Premium zone armed for short watch")
+alertcondition(bearish_rejection, title="Premium Rejection Detected", message="AiRi-Brahmastra: Genuine premium rejection candle detected")
+alertcondition(premium_confirm, title="Premium Short Confirmed", message="AiRi-Brahmastra: Premium short confirmed below rejection trigger")
+alertcondition(premium_fail or premium_confirmed_reclaim_fail, title="Premium Short Invalidated", message="AiRi-Brahmastra: Premium short workflow invalidated")
+alertcondition(new_delta_divergence, title="Delta Divergence Warning", message="Spot and futures are diverging")
+alertcondition(be_long_signal, title="Move Long SL To BE", message="Long trade reached BE trigger. Move SL to break-even.")
+alertcondition(be_short_signal, title="Move Short SL To BE", message="Short trade reached BE trigger. Move SL to break-even.")
+alertcondition(mega_long, title="3-Strike Hero Long", message="Three-strike accumulation detected")
+alertcondition(mega_short, title="3-Strike Hero Short", message="Three-strike distribution detected")
+alertcondition(bullish_continuation_label, title="Bullish Continuation Entry", message="AiRi-Brahmastra: Bullish continuation entry label")
+alertcondition(bearish_continuation_label, title="Bearish Continuation Entry", message="AiRi-Brahmastra: Bearish continuation entry label")

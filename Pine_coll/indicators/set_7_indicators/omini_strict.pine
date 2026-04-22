@@ -1,0 +1,428 @@
+//@version=6
+indicator("AiRi-Brahmastra Unified Shield v7.0", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// =========================================================================
+// 1) INPUTS
+// =========================================================================
+group_airi = "AiRi & RPZ Engine"
+eq_mode = input.string("Opening Range (15m)", "Equilibrium Mode", options=["First Candle (5m)", "Opening Range (15m)", "Manual Price"], group=group_airi)
+manual_eq_price = input.float(0.0, "Manual EQ Price", step=0.05, group=group_airi)
+is_option_chart = input.bool(true, "Is this an Option Chart?", group=group_airi)
+base_zone_width = input.float(15.0, "Base RPZ Cloud Width", minval=0.1, step=0.1, group=group_airi)
+
+group_eq_sessions = "EQ Session Settings"
+first_candle_session = input.session("0915-0920", "First Candle Window", group=group_eq_sessions)
+opening_range_session = input.session("0915-0930", "Opening Range Window", group=group_eq_sessions)
+
+group_brahm = "Brahmastra (Momentum & SNJ)"
+snj_len = input.int(20, "SNJ Length", minval=1, group=group_brahm)
+snj_color = input.color(color.gray, "SNJ Color", group=group_brahm)
+body_threshold = input.float(60.0, "Body Threshold %", minval=1, maxval=100, group=group_brahm)
+
+group_targets = "Target Engine"
+show_targets = input.bool(true, "Show Station Targets", group=group_targets)
+target_offset = input.float(5.0, "Target Label Offset (Points)", step=0.05, group=group_targets)
+
+group_risk = "Risk Management"
+sl_buffer = input.float(2.0, "SL Buffer (Points)", step=0.05, group=group_risk)
+show_rr = input.bool(true, "Show R:R Visuals", group=group_risk)
+
+group_delta = "1. Delta-Sync (Spot vs Future Divergence)"
+use_delta_sync = input.bool(true, "Enable Delta-Sync", group=group_delta)
+spot_symbol = input.symbol("NSE:NIFTY", "Spot Symbol", group=group_delta)
+future_symbol = input.symbol("NSE:NIFTY1!", "Future Symbol", group=group_delta)
+delta_min_move_pct = input.float(0.03, "Min Move % for Divergence", minval=0.0, step=0.01, group=group_delta)
+block_on_divergence = input.bool(true, "Block TT During Divergence", group=group_delta)
+
+group_kz = "2. Kill Zones"
+use_kill_zones = input.bool(true, "Enable Kill Zones", group=group_kz)
+opening_kz_session = input.session("0915-1030", "Opening Volatility", group=group_kz)
+europe_kz_session = input.session("1230-1330", "European Open", group=group_kz)
+block_outside_kz = input.bool(false, "Block TT Outside Kill Zones", group=group_kz)
+
+group_be = "3. Break-Even Trigger"
+enable_be = input.bool(true, "Enable Break-Even Alert", group=group_be)
+be_mode = input.string("1R", "BE Trigger Mode", options=["1R", "Fixed Points"], group=group_be)
+be_points = input.float(10.0, "BE Trigger Points", step=0.05, group=group_be)
+
+group_vix = "4. VIX-Adjusted RPZ Width"
+use_vix_width = input.bool(true, "Enable VIX Width", group=group_vix)
+vix_symbol = input.symbol("NSE:INDIAVIX", "VIX Symbol", group=group_vix)
+vix_reference = input.float(15.0, "Reference VIX", minval=1.0, step=0.1, group=group_vix)
+vix_min_mult = input.float(0.70, "Min Width Multiplier", minval=0.1, step=0.05, group=group_vix)
+vix_max_mult = input.float(2.00, "Max Width Multiplier", minval=0.1, step=0.05, group=group_vix)
+
+group_trap = "5. Three-Strike Trap Detector"
+enable_trap_detector = input.bool(true, "Enable Trap Detector", group=group_trap)
+trap_wick_to_body = input.float(1.5, "Min Wick:Body Ratio", minval=0.1, step=0.1, group=group_trap)
+trap_use_rpz_only = input.bool(false, "Require Deep RPZ (P2/D2) Instead of P1/D1", group=group_trap)
+
+group_mtf = "6. MTF Momentum Cloud"
+use_mtf_filter = input.bool(true, "Enable MTF Filter", group=group_mtf)
+mtf_tf1 = input.timeframe("15", "MTF 1", group=group_mtf)
+mtf_tf2 = input.timeframe("60", "MTF 2", group=group_mtf)
+show_mtf_dashboard = input.bool(true, "Show MTF Dashboard", group=group_mtf)
+
+group_vwap = "7. Global Fair Value Anchor (VWAP)"
+use_vwap_filter = input.bool(true, "Enable VWAP + EQ Filter", group=group_vwap)
+plot_vwap_line = input.bool(true, "Plot VWAP", group=group_vwap)
+
+// =========================================================================
+// 2) HELPERS
+// =========================================================================
+safe_div(num, den) =>
+    den != 0 ? num / den : na
+
+get_target(bool is_long, float price, float eq_, float p1_, float p2_, float d1_, float d2_) =>
+    float t = na
+    string s = ""
+    if is_long
+        if price < eq_
+            t := eq_
+            s := "EQ"
+        else if price < p1_
+            t := p1_
+            s := "P1"
+        else
+            t := p2_
+            s := "P2"
+    else
+        if price > eq_
+            t := eq_
+            s := "EQ"
+        else if price > d1_
+            t := d1_
+            s := "D1"
+        else
+            t := d2_
+            s := "D2"
+    [t, s]
+
+// =========================================================================
+// 3) DAY / SESSION STATE
+// =========================================================================
+bool is_new_day = timeframe.change("D")
+
+string fc_session_full = first_candle_session + ":23456"
+string or_session_full = opening_range_session + ":23456"
+string open_kz_full = opening_kz_session + ":23456"
+string euro_kz_full = europe_kz_session + ":23456"
+
+bool in_fc_window = not na(time(timeframe.period, fc_session_full))
+bool in_or_window = not na(time(timeframe.period, or_session_full))
+bool in_open_kz = not na(time(timeframe.period, open_kz_full))
+bool in_euro_kz = not na(time(timeframe.period, euro_kz_full))
+bool in_kill_zone = use_kill_zones ? (in_open_kz or in_euro_kz) : true
+
+// =========================================================================
+// 4) EQUILIBRIUM ENGINE
+// =========================================================================
+var float eq = na
+var float fc_h = na
+var float fc_l = na
+var float fc_c = na
+var float or_h = na
+var float or_l = na
+
+if is_new_day
+    eq := na
+    fc_h := na
+    fc_l := na
+    fc_c := na
+    or_h := na
+    or_l := na
+
+if in_fc_window
+    fc_h := na(fc_h) ? high : math.max(fc_h, high)
+    fc_l := na(fc_l) ? low : math.min(fc_l, low)
+    fc_c := close
+
+if in_or_window
+    or_h := na(or_h) ? high : math.max(or_h, high)
+    or_l := na(or_l) ? low : math.min(or_l, low)
+
+if eq_mode == "Manual Price"
+    eq := manual_eq_price
+else if eq_mode == "First Candle (5m)"
+    eq := not na(fc_h) and not na(fc_l) and not na(fc_c) ? (fc_h + fc_l + fc_c) / 3.0 : eq
+else
+    eq := not na(or_h) and not na(or_l) ? (or_h + or_l) / 2.0 : eq
+
+bool eq_ready = switch eq_mode
+    "Manual Price" => not na(eq) and eq != 0
+    "First Candle (5m)" => not in_fc_window and not na(fc_h) and not na(fc_l) and not na(fc_c)
+    => not in_or_window and not na(or_h) and not na(or_l)
+
+// =========================================================================
+// 5) VIX-ADJUSTED RPZ WIDTH
+// =========================================================================
+float vix_value = request.security(vix_symbol, timeframe.period, close)
+float width_mult_raw = safe_div(vix_value, vix_reference)
+float width_mult = use_vix_width ? math.min(vix_max_mult, math.max(vix_min_mult, nz(width_mult_raw, 1.0))) : 1.0
+float zone_width = base_zone_width * width_mult
+
+// =========================================================================
+// 6) DYNAMIC LEVELS
+// =========================================================================
+float offset_1 = is_option_chart ? nz(eq) * 0.05 : 50.0
+float offset_2 = is_option_chart ? nz(eq) * 0.10 : 100.0
+
+float p1 = eq_ready ? eq + offset_1 : na
+float p2 = eq_ready ? eq + offset_2 : na
+float d1 = eq_ready ? eq - offset_1 : na
+float d2 = eq_ready ? eq - offset_2 : na
+
+bool in_premium_zone = trap_use_rpz_only ? (eq_ready and high >= p2 - zone_width) : (eq_ready and high >= p1)
+bool in_discount_zone = trap_use_rpz_only ? (eq_ready and low <= d2 + zone_width) : (eq_ready and low <= d1)
+
+// =========================================================================
+// 7) CORE SNJ + BODY LOGIC
+// =========================================================================
+float snj = ta.ema(close, snj_len)
+plot(snj, "SNJ", color=snj_color, linewidth=2)
+
+float body_size = math.abs(close - open)
+float bar_range = high - low
+float body_pct = bar_range > 0 ? (body_size / bar_range) * 100.0 : 0.0
+bool is_60 = body_pct >= body_threshold
+
+bool long_tt_base = ta.crossover(close, snj) and is_60
+bool short_tt_base = ta.crossunder(close, snj) and is_60
+
+// =========================================================================
+// 8) DELTA-SYNC
+// =========================================================================
+float spot_pct = request.security(spot_symbol, timeframe.period, safe_div(ta.change(close), close[1]) * 100.0)
+float fut_pct = request.security(future_symbol, timeframe.period, safe_div(ta.change(close), close[1]) * 100.0)
+
+bool delta_divergence = use_delta_sync and not na(spot_pct) and not na(fut_pct) and math.abs(spot_pct) >= delta_min_move_pct and math.abs(fut_pct) >= delta_min_move_pct and spot_pct * fut_pct < 0
+bool new_delta_divergence = delta_divergence and not delta_divergence[1]
+bool delta_ok = not block_on_divergence or not delta_divergence
+
+plotshape(new_delta_divergence, title="Delta Divergence Warning", style=shape.triangledown, location=location.abovebar, color=color.orange, text="Δ", textcolor=color.white, size=size.tiny)
+
+// =========================================================================
+// 9) VWAP FAIR VALUE
+// =========================================================================
+float vwap_val = ta.vwap(hlc3)
+plot(plot_vwap_line ? vwap_val : na, "VWAP", color=color.new(color.aqua, 0), linewidth=2)
+
+bool vwap_long_ok = not use_vwap_filter or (eq_ready and close > vwap_val and close > eq)
+bool vwap_short_ok = not use_vwap_filter or (eq_ready and close < vwap_val and close < eq)
+
+// =========================================================================
+// 10) MTF MOMENTUM CLOUD
+// =========================================================================
+bool mtf1_bull = request.security(syminfo.tickerid, mtf_tf1, close > ta.ema(close, snj_len))
+bool mtf1_bear = request.security(syminfo.tickerid, mtf_tf1, close < ta.ema(close, snj_len))
+bool mtf2_bull = request.security(syminfo.tickerid, mtf_tf2, close > ta.ema(close, snj_len))
+bool mtf2_bear = request.security(syminfo.tickerid, mtf_tf2, close < ta.ema(close, snj_len))
+
+bool mtf_long_ok = not use_mtf_filter or (mtf1_bull and mtf2_bull)
+bool mtf_short_ok = not use_mtf_filter or (mtf1_bear and mtf2_bear)
+
+// =========================================================================
+// 11) FINAL TT SIGNALS
+// =========================================================================
+bool kz_ok = in_kill_zone or not block_outside_kz
+
+bool long_filters_ok = eq_ready and delta_ok and vwap_long_ok and mtf_long_ok
+bool short_filters_ok = eq_ready and delta_ok and vwap_short_ok and mtf_short_ok
+
+bool long_tt = long_tt_base and long_filters_ok and kz_ok
+bool short_tt = short_tt_base and short_filters_ok and kz_ok
+
+bool low_prob_long = long_tt_base and long_filters_ok and not in_kill_zone and not block_outside_kz
+bool low_prob_short = short_tt_base and short_filters_ok and not in_kill_zone and not block_outside_kz
+
+plotshape(long_tt, title="Long TT", style=shape.labelup, location=location.belowbar, color=color.green, text="TT", textcolor=color.white, size=size.small)
+plotshape(short_tt, title="Short TT", style=shape.labeldown, location=location.abovebar, color=color.red, text="TT", textcolor=color.white, size=size.small)
+
+plotshape(low_prob_long, title="Low Probability Long", style=shape.labelup, location=location.belowbar, color=color.new(color.orange, 0), text="LP", textcolor=color.white, size=size.tiny)
+plotshape(low_prob_short, title="Low Probability Short", style=shape.labeldown, location=location.abovebar, color=color.new(color.orange, 0), text="LP", textcolor=color.white, size=size.tiny)
+
+// =========================================================================
+// 12) TARGETS + RR VISUALS
+// =========================================================================
+if show_targets and long_tt
+    [tp_val_l, tp_txt_l] = get_target(true, close, eq, p1, p2, d1, d2)
+    label.new(bar_index, high + target_offset, "Target: " + tp_txt_l, color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+if show_targets and short_tt
+    [tp_val_s, tp_txt_s] = get_target(false, close, eq, p1, p2, d1, d2)
+    label.new(bar_index, low - target_offset, "Target: " + tp_txt_s, color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if show_rr and long_tt
+    float sl_price_l = low - sl_buffer
+    [tp_price_l_raw, tp_txt_l] = get_target(true, close, eq, p1, p2, d1, d2)
+    float tp_price_l = math.max(tp_price_l_raw, close + syminfo.mintick)
+    float risk_l = math.max(close - sl_price_l, syminfo.mintick)
+    float reward_l = math.max(tp_price_l - close, syminfo.mintick)
+    float rr_l = safe_div(reward_l, risk_l)
+
+    line.new(bar_index, sl_price_l, bar_index + 5, sl_price_l, color=color.red, width=2, style=line.style_dashed)
+    line.new(bar_index, tp_price_l, bar_index + 5, tp_price_l, color=color.green, width=2, style=line.style_dashed)
+    label.new(bar_index, sl_price_l, "SL", color=color.red, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+    label.new(bar_index, high + target_offset + 5, "Target: " + tp_txt_l + "\nR:R: " + str.tostring(rr_l, "#.##"), color=color.green, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+if show_rr and short_tt
+    float sl_price_s = high + sl_buffer
+    [tp_price_s_raw, tp_txt_s] = get_target(false, close, eq, p1, p2, d1, d2)
+    float tp_price_s = math.min(tp_price_s_raw, close - syminfo.mintick)
+    float risk_s = math.max(sl_price_s - close, syminfo.mintick)
+    float reward_s = math.max(close - tp_price_s, syminfo.mintick)
+    float rr_s = safe_div(reward_s, risk_s)
+
+    line.new(bar_index, sl_price_s, bar_index + 5, sl_price_s, color=color.red, width=2, style=line.style_dashed)
+    line.new(bar_index, tp_price_s, bar_index + 5, tp_price_s, color=color.green, width=2, style=line.style_dashed)
+    label.new(bar_index, sl_price_s, "SL", color=color.red, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+    label.new(bar_index, low - target_offset - 5, "Target: " + tp_txt_s + "\nR:R: " + str.tostring(rr_s, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+// =========================================================================
+// 13) BREAK-EVEN ENGINE
+// =========================================================================
+var int active_dir = 0
+var float active_entry = na
+var float active_sl = na
+var float active_tp = na
+var bool active_be_done = false
+
+bool be_long_signal = false
+bool be_short_signal = false
+
+if is_new_day
+    active_dir := 0
+    active_entry := na
+    active_sl := na
+    active_tp := na
+    active_be_done := false
+
+if long_tt
+    float long_sl = low - sl_buffer
+    [long_tp_raw, _] = get_target(true, close, eq, p1, p2, d1, d2)
+    active_dir := 1
+    active_entry := close
+    active_sl := long_sl
+    active_tp := math.max(long_tp_raw, close + syminfo.mintick)
+    active_be_done := false
+
+if short_tt
+    float short_sl = high + sl_buffer
+    [short_tp_raw, _] = get_target(false, close, eq, p1, p2, d1, d2)
+    active_dir := -1
+    active_entry := close
+    active_sl := short_sl
+    active_tp := math.min(short_tp_raw, close - syminfo.mintick)
+    active_be_done := false
+
+if enable_be and active_dir == 1 and not na(active_entry) and not na(active_sl)
+    float one_r_long = active_entry + math.max(active_entry - active_sl, syminfo.mintick)
+    float be_trigger_long = be_mode == "1R" ? one_r_long : active_entry + be_points
+
+    if not active_be_done and high >= be_trigger_long
+        active_be_done := true
+        active_sl := active_entry
+        be_long_signal := true
+        label.new(bar_index, high + target_offset + 10, "MOVE SL TO BE", color=color.new(color.blue, 0), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+    if low <= active_sl or high >= active_tp or short_tt
+        active_dir := 0
+        active_entry := na
+        active_sl := na
+        active_tp := na
+        active_be_done := false
+
+if enable_be and active_dir == -1 and not na(active_entry) and not na(active_sl)
+    float one_r_short = active_entry - math.max(active_sl - active_entry, syminfo.mintick)
+    float be_trigger_short = be_mode == "1R" ? one_r_short : active_entry - be_points
+
+    if not active_be_done and low <= be_trigger_short
+        active_be_done := true
+        active_sl := active_entry
+        be_short_signal := true
+        label.new(bar_index, low - target_offset - 10, "MOVE SL TO BE", color=color.new(color.blue, 0), textcolor=color.white, style=label.style_label_up, size=size.small)
+
+    if high >= active_sl or low <= active_tp or long_tt
+        active_dir := 0
+        active_entry := na
+        active_sl := na
+        active_tp := na
+        active_be_done := false
+
+// =========================================================================
+// 14) THREE-STRIKE TRAP DETECTOR
+// =========================================================================
+float upper_wick = high - math.max(open, close)
+float lower_wick = math.min(open, close) - low
+bool bull_trap = enable_trap_detector and in_discount_zone and close > open and lower_wick >= body_size * trap_wick_to_body
+bool bear_trap = enable_trap_detector and in_premium_zone and close < open and upper_wick >= body_size * trap_wick_to_body
+
+var int bull_trap_streak = 0
+var int bear_trap_streak = 0
+
+bull_trap_streak := bull_trap ? nz(bull_trap_streak[1]) + 1 : 0
+bear_trap_streak := bear_trap ? nz(bear_trap_streak[1]) + 1 : 0
+
+bool mega_long = bull_trap_streak >= 3 and bull_trap_streak[1] < 3
+bool mega_short = bear_trap_streak >= 3 and bear_trap_streak[1] < 3
+
+plotshape(bull_trap, title="Bull Trap", style=shape.circle, location=location.belowbar, color=color.yellow, text="YT", textcolor=color.black, size=size.tiny)
+plotshape(bear_trap, title="Bear Trap", style=shape.circle, location=location.abovebar, color=color.yellow, text="YT", textcolor=color.black, size=size.tiny)
+
+if mega_long
+    label.new(bar_index, low - target_offset - 15, "3-Strike Accumulation\nHero Long Watch", color=color.new(color.lime, 0), textcolor=color.black, style=label.style_label_up, size=size.small)
+
+if mega_short
+    label.new(bar_index, high + target_offset + 15, "3-Strike Distribution\nHero Short Watch", color=color.new(color.orange, 0), textcolor=color.black, style=label.style_label_down, size=size.small)
+
+// =========================================================================
+// 15) KILL ZONE BACKGROUND
+// =========================================================================
+color kz_bg = na
+kz_bg := in_open_kz ? color.new(color.teal, 90) : kz_bg
+kz_bg := not in_open_kz and in_euro_kz ? color.new(color.purple, 90) : kz_bg
+bgcolor(use_kill_zones ? kz_bg : na, title="Kill Zones")
+
+// =========================================================================
+// 16) LEVEL RENDERING
+// =========================================================================
+plot(eq_ready ? eq : na, "EQ", color=color.yellow, linewidth=2, style=plot.style_linebr)
+plot(eq_ready ? p1 : na, "P1", color=color.new(color.blue, 50), linewidth=1, style=plot.style_linebr)
+plot(eq_ready ? d1 : na, "D1", color=color.new(color.blue, 50), linewidth=1, style=plot.style_linebr)
+
+p_t = plot(eq_ready ? p2 + zone_width : na, title="Sell RPZ Top", color=color.new(color.red, 100))
+p_b = plot(eq_ready ? p2 - zone_width : na, title="Sell RPZ Bottom", color=color.new(color.red, 100))
+fill(p_t, p_b, color.new(color.red, 90), title="Sell RPZ")
+
+d_t = plot(eq_ready ? d2 + zone_width : na, title="Buy RPZ Top", color=color.new(color.green, 100))
+d_b = plot(eq_ready ? d2 - zone_width : na, title="Buy RPZ Bottom", color=color.new(color.green, 100))
+fill(d_t, d_b, color.new(color.green, 90), title="Buy RPZ")
+
+// =========================================================================
+// 17) MTF DASHBOARD
+// =========================================================================
+var table mtf_tbl = table.new(position.bottom_right, 3, 3)
+
+if show_mtf_dashboard and barstate.islast
+    table.cell(mtf_tbl, 0, 0, "TF", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(mtf_tbl, 1, 0, mtf_tf1, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(mtf_tbl, 2, 0, mtf_tf2, text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(mtf_tbl, 0, 1, "SNJ", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(mtf_tbl, 1, 1, mtf1_bull ? "Bull" : mtf1_bear ? "Bear" : "Flat", text_color=color.white, bgcolor=mtf1_bull ? color.new(color.green, 10) : mtf1_bear ? color.new(color.red, 10) : color.new(color.gray, 40))
+    table.cell(mtf_tbl, 2, 1, mtf2_bull ? "Bull" : mtf2_bear ? "Bear" : "Flat", text_color=color.white, bgcolor=mtf2_bull ? color.new(color.green, 10) : mtf2_bear ? color.new(color.red, 10) : color.new(color.gray, 40))
+
+    table.cell(mtf_tbl, 0, 2, "TT", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(mtf_tbl, 1, 2, mtf_long_ok ? "L OK" : "L NO", text_color=color.white, bgcolor=mtf_long_ok ? color.new(color.green, 20) : color.new(color.red, 20))
+    table.cell(mtf_tbl, 2, 2, mtf_short_ok ? "S OK" : "S NO", text_color=color.white, bgcolor=mtf_short_ok ? color.new(color.green, 20) : color.new(color.red, 20))
+
+// =========================================================================
+// 18) ALERTS
+// =========================================================================
+alertcondition(long_tt, title="Long TT Confirmed", message="AiRi-Brahmastra: Long TT confirmed")
+alertcondition(short_tt, title="Short TT Confirmed", message="AiRi-Brahmastra: Short TT confirmed")
+alertcondition(new_delta_divergence, title="Delta Divergence Warning", message="Spot and futures are diverging")
+alertcondition(be_long_signal, title="Move Long SL To BE", message="Long trade reached BE trigger. Move SL to break-even.")
+alertcondition(be_short_signal, title="Move Short SL To BE", message="Short trade reached BE trigger. Move SL to break-even.")
+alertcondition(mega_long, title="3-Strike Hero Long", message="Three-strike accumulation detected")
+alertcondition(mega_short, title="3-Strike Hero Short", message="Three-strike distribution detected")
